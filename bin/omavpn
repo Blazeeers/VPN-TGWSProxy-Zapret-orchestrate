@@ -1,0 +1,999 @@
+#!/usr/bin/env python3
+"""omavpn — управление Xray-подпиской с системным TUN через sing-box.
+
+Одна команда управляет всем: парсит подписку Happ-формата (Xray full JSON),
+генерирует конфиги Xray + sing-box (TUN), запускает/останавливает процессы,
+отдаёт статус в JSON для виджета панели Omarchy.
+
+Работает от обычного пользователя. TUN требует CAP_NET_ADMIN на бинаре
+sing-box (ставится один раз установщиком через setcap).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import copy
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+USER_AGENT = "Happ/1.0"
+HTTP_TIMEOUT = 40
+
+HOME = Path(os.path.expanduser("~"))
+SHARE = HOME / ".local/share/omavpn"
+BIN = SHARE / "bin"
+CONF = HOME / ".config/omavpn"
+STATE = HOME / ".local/state/omavpn"
+CACHE = HOME / ".cache/omavpn"
+
+XRAY_BIN = BIN / "xray"
+SB_BIN = BIN / "sing-box"
+SETTINGS = CONF / "settings.json"
+SUBFILE = CACHE / "sub.json"
+XRAY_CFG = STATE / "xray.json"
+SB_CFG = STATE / "singbox.json"
+XRAY_LOG = STATE / "xray.log"
+SB_LOG = STATE / "singbox.log"
+XRAY_PID = STATE / "xray.pid"
+SB_PID = STATE / "singbox.pid"
+RUNTIME = STATE / "state.json"
+
+SOCKS_PORT = 10808
+HTTP_PORT = 10809
+TUN_IFACE = "omavpn0"
+TUN_ADDR = "172.19.0.1/30"
+
+PROXY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "wireguard"}
+
+# Telegram Desktop и локальный MTProto/WS-прокси (tg-ws-proxy) не туннелируем —
+# идут напрямую. Bot API (api.telegram.org) при этом остаётся в VPN: прямой
+# доступ к нему у провайдера блокируется, а tg-ws-proxy его не обслуживает.
+TELEGRAM_PROCESSES = ["tg-ws-proxy", "TgWsProxy", "Telegram", "telegram-desktop"]
+
+# Сервисы, которые не туннелируем — ходим напрямую. MAX работает без VPN;
+# Discord/YouTube идут напрямую, а блокировку снимает zapret (nfqws).
+# Список можно переопределить файлом ~/.config/omavpn/direct_domains.txt
+# (по одному домену на строку, '#' — комментарий). Этим пользуется
+# zapret-autotune: если обход в сети не работает, он убирает Discord/YouTube
+# из этого файла, и они идут через VPN.
+DEFAULT_DIRECT_DOMAINS = [
+    "max.ru",
+    # Discord
+    "discord.com",
+    "discord.gg",
+    "discordapp.com",
+    "discordapp.net",
+    "discord.co",
+    "discord.dev",
+    "discord.new",
+    "discord.media",
+    "discordmerch.com",
+    "discordstatus.com",
+    "discord-activities.com",
+    "discordactivities.com",
+    "discordpartygames.com",
+    "discordapp.io",
+    "discordcdn.com",
+    # YouTube
+    "youtube.com",
+    "youtu.be",
+    "ytimg.com",
+    "googlevideo.com",
+    "youtube-nocookie.com",
+    "youtubekids.com",
+    "youtubegaming.com",
+    "youtubeeducation.com",
+    "youtubemusic.com",
+    "ytstatic.com",
+    "youtube.googleapis.com",
+    "youtubei.googleapis.com",
+]
+DIRECT_DOMAINS_FILE = CONF / "direct_domains.txt"
+
+
+def direct_domains() -> list:
+    try:
+        lines = DIRECT_DOMAINS_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return DEFAULT_DIRECT_DOMAINS
+    doms = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+    return doms or DEFAULT_DIRECT_DOMAINS
+
+DEFAULT_SETTINGS = {
+    "profile_index": 0,
+    "node_index": -1,
+    "mode": "tun",
+    "strict_route": False,
+}
+
+
+# --------------------------------------------------------------------------- #
+# утилиты
+# --------------------------------------------------------------------------- #
+
+def ensure_dirs() -> None:
+    for d in (BIN, CONF, STATE, CACHE):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def load_json(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError, OSError):
+        return default
+
+
+def save_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def settings() -> dict:
+    s = dict(DEFAULT_SETTINGS)
+    s.update(load_json(SETTINGS, {}))
+    return s
+
+
+def set_settings(**kw) -> dict:
+    s = settings()
+    s.update(kw)
+    save_json(SETTINGS, s)
+    return s
+
+
+def fail(msg: str, code: int = 1):
+    print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False) if JSON_OUT else msg,
+          file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- #
+# подписка
+# --------------------------------------------------------------------------- #
+
+def subscription_url() -> str:
+    """URL подписки: сначала OMAVPN_SUB_URL, затем ~/.config/omavpn/subscription."""
+    url = os.environ.get("OMAVPN_SUB_URL", "").strip()
+    if url:
+        return url
+    try:
+        return (CONF / "subscription").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+# --------------------------------------------------------------------------- #
+# парсер share-link подписок (vless / vmess / trojan / shadowsocks / socks)
+# --------------------------------------------------------------------------- #
+
+def _b64decode_text(text: str) -> str:
+    try:
+        return base64.b64decode(text + "=" * (-len(text) % 4)).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _default_inbounds() -> list:
+    return [
+        {"tag": "socks-in", "listen": "127.0.0.1", "port": SOCKS_PORT,
+         "protocol": "socks", "settings": {"udp": True}},
+        {"tag": "http-in", "listen": "127.0.0.1", "port": HTTP_PORT, "protocol": "http"},
+    ]
+
+
+def _default_outbounds() -> list:
+    return [
+        {"tag": "direct", "protocol": "freedom"},
+        {"tag": "block", "protocol": "blackhole"},
+    ]
+
+
+def _qs(query: str) -> dict:
+    return {k: v[0] for k, v in urllib.parse.parse_qs(query, keep_blank_values=True).items()}
+
+
+def _truthy(value) -> bool:
+    return str(value).lower() in ("1", "true", "yes")
+
+
+def _stream_settings(net, security, p: dict, host: str) -> dict:
+    net = (net or "tcp").lower()
+    if net == "h2":
+        net = "http"
+    security = (security or "none").lower()
+    sni = p.get("sni") or p.get("peer") or host
+    ss: dict = {"network": net, "security": security}
+    if security == "tls":
+        tls: dict = {"serverName": sni}
+        if _truthy(p.get("allowinsecure") or p.get("allowInsecure")):
+            tls["allowInsecure"] = True
+        if p.get("fp"):
+            tls["fingerprint"] = p["fp"]
+        if p.get("alpn"):
+            tls["alpn"] = [a for a in p["alpn"].split(",") if a]
+        ss["tlsSettings"] = tls
+    elif security in ("reality", "xtls"):
+        rs: dict = {"serverName": sni}
+        if p.get("pbk"):
+            rs["publicKey"] = p["pbk"]
+        if p.get("sid"):
+            rs["shortId"] = p["sid"]
+        if p.get("fp"):
+            rs["fingerprint"] = p["fp"]
+        if p.get("spx"):
+            rs["spiderX"] = p["spx"]
+        ss["security"] = "reality"
+        ss["realitySettings"] = rs
+
+    path = p.get("path") or "/"
+    hdr_host = p.get("host") or sni
+    service = p.get("servicename") or p.get("service") or ""
+    if net == "ws":
+        ws: dict = {"path": path}
+        if hdr_host:
+            ws["headers"] = {"Host": hdr_host}
+        ss["wsSettings"] = ws
+    elif net == "grpc":
+        gs: dict = {"serviceName": service}
+        if p.get("mode") == "multi":
+            gs["multiMode"] = True
+        ss["grpcSettings"] = gs
+    elif net == "httpupgrade":
+        hu: dict = {"path": path}
+        if hdr_host:
+            hu["host"] = hdr_host
+        ss["httpupgradeSettings"] = hu
+    elif net == "xhttp":
+        xs: dict = {"path": path}
+        if hdr_host:
+            xs["host"] = hdr_host
+        if p.get("mode"):
+            xs["mode"] = p["mode"]
+        ss["xhttpSettings"] = xs
+    elif net == "http":
+        hs: dict = {}
+        if path:
+            hs["path"] = path
+        if hdr_host:
+            hs["host"] = [hdr_host]
+        ss["httpSettings"] = hs
+    elif net == "tcp" and p.get("headertype") in ("http", "1"):
+        ss["tcpSettings"] = {"header": {"type": "http", "request": {
+            "path": [path], "headers": {"Host": [hdr_host]}}}}
+    return ss
+
+
+def _config(remarks: str, outbound: dict) -> dict:
+    return {
+        "remarks": remarks,
+        "inbounds": _default_inbounds(),
+        "outbounds": [outbound, *_default_outbounds()],
+    }
+
+
+def _parse_vless(url: str) -> dict:
+    u = urllib.parse.urlsplit(url)
+    p = _qs(u.query)
+    host = u.hostname or ""
+    port = u.port or 443
+    user = {"id": urllib.parse.unquote(u.username or ""), "encryption": "none"}
+    if p.get("flow"):
+        user["flow"] = p["flow"]
+    out = {
+        "tag": "proxy", "protocol": "vless",
+        "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
+        "streamSettings": _stream_settings(p.get("type"), p.get("security"), p, host),
+    }
+    return _config(urllib.parse.unquote(u.fragment) or f"vless-{host}", out)
+
+
+def _parse_trojan(url: str) -> dict:
+    u = urllib.parse.urlsplit(url)
+    p = _qs(u.query)
+    host = u.hostname or ""
+    port = u.port or 443
+    out = {
+        "tag": "proxy", "protocol": "trojan",
+        "settings": {"servers": [{"address": host, "port": port,
+                                  "password": urllib.parse.unquote(u.username or "")}]},
+        "streamSettings": _stream_settings(p.get("type"), p.get("security") or "tls", p, host),
+    }
+    return _config(urllib.parse.unquote(u.fragment) or f"trojan-{host}", out)
+
+
+def _parse_vmess(url: str) -> dict:
+    raw = url[len("vmess://"):].strip()
+    try:
+        data = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"не разобран vmess: {exc}") from exc
+    host = str(data.get("add") or "")
+    port = int(data.get("port") or 443)
+    tls = str(data.get("tls") or "")
+    p = {
+        "type": str(data.get("net") or "tcp"),
+        "path": data.get("path"),
+        "host": data.get("host"),
+        "sni": data.get("sni") or data.get("host"),
+        "headertype": str(data.get("type") or ""),
+    }
+    out = {
+        "tag": "proxy", "protocol": "vmess",
+        "settings": {"vnext": [{"address": host, "port": port, "users": [
+            {"id": str(data.get("id") or ""), "alterId": int(data.get("aid") or 0),
+             "security": str(data.get("scy") or "auto")}]}]},
+        "streamSettings": _stream_settings(p["type"], "tls" if tls in ("tls", "true", "1") else "none", p, host),
+    }
+    return _config(str(data.get("ps") or f"vmess-{host}"), out)
+
+
+def _parse_ss(url: str) -> dict:
+    body = url[len("ss://"):]
+    name = ""
+    if "#" in body:
+        body, frag = body.split("#", 1)
+        name = urllib.parse.unquote(frag)
+    body = body.split("?", 1)[0]
+    if "@" in body:
+        userinfo, hostpart = body.rsplit("@", 1)
+        decoded = _b64decode_text(userinfo)
+        method, password = (decoded if ":" in decoded else urllib.parse.unquote(userinfo)).split(":", 1)
+    else:
+        decoded = _b64decode_text(body)
+        creds, hostpart = decoded.rsplit("@", 1)
+        method, password = creds.split(":", 1)
+    host, port = hostpart.rsplit(":", 1)
+    out = {
+        "tag": "proxy", "protocol": "shadowsocks",
+        "settings": {"servers": [{"address": host, "port": int(port),
+                                  "method": method, "password": password}]},
+        "streamSettings": {"network": "tcp", "security": "none"},
+    }
+    return _config(name or f"ss-{host}", out)
+
+
+def _parse_socks(url: str) -> dict:
+    u = urllib.parse.urlsplit(url)
+    host = u.hostname or ""
+    port = u.port or 1080
+    entry: dict = {"address": host, "port": port}
+    user = urllib.parse.unquote(u.username or "")
+    if user:
+        entry["users"] = [{"user": user, "pass": urllib.parse.unquote(u.password or "")}]
+    out = {
+        "tag": "proxy", "protocol": "socks",
+        "settings": {"servers": [entry]},
+        "streamSettings": {"network": "tcp", "security": "none"},
+    }
+    return _config(urllib.parse.unquote(u.fragment) or f"socks-{host}", out)
+
+
+_SHARE_PARSERS = {
+    "vless": _parse_vless,
+    "vmess": _parse_vmess,
+    "trojan": _parse_trojan,
+    "ss": _parse_ss,
+    "shadowsocks": _parse_ss,
+    "socks": _parse_socks,
+    "socks5": _parse_socks,
+}
+
+SHARE_LINK_UNSUPPORTED = {"hysteria2", "hy2", "hysteria", "tuic", "wireguard", "wg"}
+
+
+def parse_share_links(text: str) -> list:
+    """Разбирает подписку из share-ссылок в список Xray-конфигов."""
+    configs, unsupported = [], set()
+    for line in text.replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#") or "://" not in line:
+            continue
+        scheme = line.split("://", 1)[0].lower()
+        if scheme in SHARE_LINK_UNSUPPORTED:
+            unsupported.add(scheme)
+            continue
+        parser = _SHARE_PARSERS.get(scheme)
+        if not parser:
+            unsupported.add(scheme)
+            continue
+        configs.append(parser(line))
+    if not configs and unsupported:
+        raise RuntimeError(
+            "не удалось разобрать ссылки; неподдерживаемые схемы: "
+            + ", ".join(sorted(unsupported))
+        )
+    return configs
+
+
+def fetch_sub() -> list:
+    url = subscription_url()
+    if not url:
+        raise RuntimeError(
+            "не задан URL подписки: положи его в ~/.config/omavpn/subscription "
+            "или задай переменную OMAVPN_SUB_URL"
+        )
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": USER_AGENT,
+                 "Accept": "application/json, text/plain, */*"},
+    )
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        raw = resp.read()
+    txt = raw.decode("utf-8", "replace").strip()
+
+    # 1) Happ-формат: JSON (в т.ч. в base64)
+    for candidate in (txt, _b64decode_text(txt)):
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            data = data.get("data") or data.get("configs") or [data]
+        if (isinstance(data, list) and data and all(isinstance(x, dict) for x in data)
+                and any("outbounds" in x for x in data)):
+            return data
+
+    # 2) обычные share-ссылки (в т.ч. в base64)
+    for candidate in (txt, _b64decode_text(txt)):
+        if candidate and "://" in candidate:
+            configs = parse_share_links(candidate)
+            if configs:
+                return configs
+
+    raise RuntimeError("подписка не распознана (ни Happ-JSON, ни share-link)")
+
+
+
+def get_configs() -> list:
+    cache = load_json(SUBFILE, None)
+    if cache and cache.get("configs"):
+        return cache["configs"]
+    raise RuntimeError("нет данных подписки — выполните `omavpn update`")
+
+
+def update_sub() -> list:
+    configs = fetch_sub()
+    save_json(SUBFILE, {"updated": time.time(), "configs": configs})
+    s = settings()
+    save_json(SETTINGS, s)
+    return configs
+
+
+# --------------------------------------------------------------------------- #
+# разбор профилей и нод
+# --------------------------------------------------------------------------- #
+
+def outbounds(cfg: dict) -> list:
+    return cfg.get("outbounds", []) or []
+
+
+def node_outbounds(cfg: dict) -> list:
+    return [o for o in outbounds(cfg) if o.get("protocol") in PROXY_PROTOCOLS]
+
+
+def node_meta(o: dict) -> tuple[str, str, str]:
+    """(tag, server, detail)."""
+    tag = o.get("tag", "proxy")
+    st = o.get("settings", {}) or {}
+    address, port = "", ""
+    for key in ("vnext", "servers"):
+        seq = st.get(key)
+        if isinstance(seq, list) and seq:
+            address = str(seq[0].get("address") or seq[0].get("server") or "")
+            port = str(seq[0].get("port") or "")
+            break
+    stream = o.get("streamSettings", {}) or {}
+    tls = stream.get("realitySettings", {}) or {}
+    tls2 = stream.get("tlsSettings", {}) or {}
+    detail = (tls.get("serverName") or tls2.get("serverName")
+              or (stream.get("xhttpSettings", {}) or {}).get("host") or address)
+    if port and not str(detail).endswith(port):
+        detail = f"{detail}:{port}"
+    return tag, address, str(detail)
+
+
+def profiles() -> list:
+    out = []
+    configs = get_configs()
+    for i, cfg in enumerate(configs):
+        nodes = node_outbounds(cfg)
+        out.append({
+            "index": i,
+            "name": str(cfg.get("remarks") or f"Профиль {i + 1}").strip(),
+            "node_count": len(nodes),
+        })
+    return out
+
+
+def nodes(profile_index: int) -> list:
+    configs = get_configs()
+    if profile_index < 0 or profile_index >= len(configs):
+        return []
+    out = []
+    for i, o in enumerate(node_outbounds(configs[profile_index])):
+        tag, address, detail = node_meta(o)
+        out.append({"index": i, "tag": tag, "address": address, "detail": detail})
+    return out
+
+
+def server_endpoints(profile_index: int) -> tuple[list, list]:
+    """(ip_cidr, domains) — куда Xray может дозваниваться напрямую."""
+    configs = get_configs()
+    ips, domains = [], []
+    for o in node_outbounds(configs[profile_index]):
+        _, address, _ = node_meta(o)
+        if not address:
+            continue
+        try:
+            import ipaddress
+            ip = ipaddress.ip_address(address)
+            ips.append(str(ip) + ("/32" if ip.version == 4 else "/128"))
+        except ValueError:
+            domains.append(address)
+    return sorted(set(ips)), sorted(set(domains))
+
+
+# --------------------------------------------------------------------------- #
+# генерация конфигов
+# --------------------------------------------------------------------------- #
+
+def build_xray(profile_index: int, node_index: int) -> dict:
+    configs = get_configs()
+    if not (0 <= profile_index < len(configs)):
+        raise RuntimeError("профиль не найден")
+    cfg = copy.deepcopy(configs[profile_index])
+
+    for inb in cfg.get("inbounds", []):
+        inb["listen"] = "127.0.0.1"
+        if inb.get("protocol") == "socks":
+            inb["port"] = SOCKS_PORT
+        elif inb.get("protocol") == "http":
+            inb["port"] = HTTP_PORT
+
+    # ручной выбор ноды: заменяем правило с балансировщиком на outboundTag
+    if node_index is not None and node_index >= 0:
+        tag = nodes(profile_index)[node_index]["tag"]
+        for rule in cfg.get("routing", {}).get("rules", []):
+            if "balancerTag" in rule:
+                rule.pop("balancerTag", None)
+                rule["outboundTag"] = tag
+
+    cfg["log"] = {"loglevel": "warning", "error": str(XRAY_LOG), "access": "none"}
+    return cfg
+
+
+def build_singbox(profile_index: int, strict: bool) -> dict:
+    ips, domains = server_endpoints(profile_index)
+    bypass = []
+    if ips:
+        bypass.append({"ip_cidr": ips, "outbound": "direct"})
+    if domains:
+        bypass.append({"domain": domains, "outbound": "direct"})
+    return {
+        "log": {"level": "warn", "timestamp": True},
+        "dns": {
+            "servers": [
+                {"type": "udp", "tag": "remote", "server": "1.1.1.1", "detour": "proxy"},
+            ],
+            "final": "remote",
+            "strategy": "ipv4_only",
+        },
+        "inbounds": [{
+            "type": "tun",
+            "tag": "tun-in",
+            "interface_name": TUN_IFACE,
+            "address": [TUN_ADDR],
+            "mtu": 9000,
+            "stack": "mixed",
+            "auto_route": True,
+            "strict_route": bool(strict),
+        }],
+        "outbounds": [
+            {"type": "socks", "tag": "proxy", "server": "127.0.0.1",
+             "server_port": SOCKS_PORT, "version": "5"},
+            {"type": "direct", "tag": "direct"},
+            {"type": "block", "tag": "block"},
+        ],
+        "route": {
+            "auto_detect_interface": True,
+            "final": "proxy",
+            "default_domain_resolver": {"server": "remote"},
+            "rules": [
+                {"action": "sniff"},
+                {"protocol": "dns", "action": "hijack-dns"},
+                {"ip_is_private": True, "outbound": "direct"},
+                {"domain_suffix": direct_domains(), "outbound": "direct"},
+                {"process_name": TELEGRAM_PROCESSES, "outbound": "direct"},
+                *bypass,
+                {"port": [25, 465, 587], "outbound": "direct"},
+                {"process_name": ["xray"], "outbound": "direct"},
+                {"ip_version": 6, "outbound": "block"},
+            ],
+        },
+    }
+
+
+def validate(cmd: list, path: Path) -> str:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return str(exc)
+    if p.returncode != 0:
+        return (p.stderr or p.stdout or "ошибка конфигурации").strip()
+    return ""
+
+
+# --------------------------------------------------------------------------- #
+# процессы
+# --------------------------------------------------------------------------- #
+
+def pid_of(pidfile: Path) -> int:
+    try:
+        pid = int(pidfile.read_text().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return 0
+    return pid
+
+
+def process_alive(pidfile: Path, marker: str) -> bool:
+    pid = pid_of(pidfile)
+    if pid <= 0 or not Path(f"/proc/{pid}").exists():
+        return False
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return False
+    return marker in cmdline
+
+
+def spawn(cmd: list, logfile: Path, pidfile: Path) -> int:
+    logfile.parent.mkdir(parents=True, exist_ok=True)
+    log = open(logfile, "ab", buffering=0)
+    log.write(f"\n===== {time.strftime('%F %T')} {' '.join(cmd)} =====\n".encode())
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+        cwd=str(STATE),
+        start_new_session=True,
+    )
+    pidfile.write_text(str(proc.pid))
+    return proc.pid
+
+
+def stop_proc(pidfile: Path, marker: str, timeout: float = 6.0) -> None:
+    pid = pid_of(pidfile)
+    if pid <= 0:
+        pidfile.unlink(missing_ok=True)
+        return
+    if process_alive(pidfile, marker):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not Path(f"/proc/{pid}").exists():
+                break
+            time.sleep(0.15)
+        if Path(f"/proc/{pid}").exists():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    pidfile.unlink(missing_ok=True)
+
+
+def wait_port(port: int, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                return True
+        time.sleep(0.2)
+    return False
+
+
+def wait_iface(iface: str, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if Path(f"/sys/class/net/{iface}").exists():
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def log_tail(path: Path, lines: int = 6) -> str:
+    try:
+        data = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return " | ".join(l.strip() for l in data[-lines:] if l.strip())
+
+
+# --------------------------------------------------------------------------- #
+# жизненный цикл
+# --------------------------------------------------------------------------- #
+
+def is_on() -> bool:
+    return process_alive(XRAY_PID, "xray") or process_alive(SB_PID, "sing-box")
+
+
+def cmd_off(quiet: bool = False) -> dict:
+    stop_proc(SB_PID, "sing-box")
+    stop_proc(XRAY_PID, "xray")
+    st = load_json(RUNTIME, {})
+    st["running"] = False
+    save_json(RUNTIME, st)
+    if not quiet:
+        print("Отключено")
+    return {"ok": True, "running": False}
+
+
+def cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
+           quiet: bool = False) -> dict:
+    ensure_dirs()
+    s = settings()
+    if profile_index is None:
+        profile_index = s["profile_index"]
+    if node_index is None:
+        node_index = s["node_index"]
+    if mode is None:
+        mode = s["mode"]
+
+    if not XRAY_BIN.exists():
+        raise RuntimeError("Xray не установлен — запустите install.sh")
+    if mode == "tun" and not SB_BIN.exists():
+        raise RuntimeError("sing-box не установлен — запустите install.sh")
+
+    configs = get_configs()
+    if not (0 <= profile_index < len(configs)) or not node_outbounds(configs[profile_index]):
+        raise RuntimeError("профиль не найден или в нём нет серверов")
+
+    set_settings(profile_index=profile_index, node_index=node_index, mode=mode)
+
+    xray_cfg = build_xray(profile_index, node_index)
+    save_json(XRAY_CFG, xray_cfg)
+    err = validate([str(XRAY_BIN), "run", "-c", str(XRAY_CFG), "-test"], XRAY_CFG)
+    if err:
+        raise RuntimeError(f"конфиг Xray отклонён: {err}")
+
+    sb_cfg = None
+    if mode == "tun":
+        sb_cfg = build_singbox(profile_index, s.get("strict_route", False))
+        save_json(SB_CFG, sb_cfg)
+        err = validate([str(SB_BIN), "check", "-c", str(SB_CFG)], SB_CFG)
+        if err:
+            raise RuntimeError(f"конфиг sing-box отклонён: {err}")
+
+    cmd_off(quiet=True)
+
+    last_error = ""
+    try:
+        spawn([str(XRAY_BIN), "run", "-c", str(XRAY_CFG)], XRAY_LOG, XRAY_PID)
+        if not wait_port(SOCKS_PORT, 6):
+            raise RuntimeError("Xray не открыл SOCKS-порт: " + log_tail(XRAY_LOG))
+        if mode == "tun":
+            spawn([str(SB_BIN), "run", "-c", str(SB_CFG)], SB_LOG, SB_PID)
+            if not wait_iface(TUN_IFACE, 8):
+                raise RuntimeError("TUN не поднялся: " + log_tail(SB_LOG))
+    except Exception as exc:  # noqa: BLE001
+        last_error = str(exc)
+        stop_proc(SB_PID, "sing-box")
+        stop_proc(XRAY_PID, "xray")
+        save_json(RUNTIME, {"running": False, "last_error": last_error})
+        raise
+
+    save_json(RUNTIME, {
+        "running": True,
+        "mode": mode,
+        "profile_index": profile_index,
+        "node_index": node_index,
+        "started_at": time.time(),
+        "last_error": "",
+    })
+    if not quiet:
+        name = profiles()[profile_index]["name"]
+        print(f"Подключено · {name}" + (" · TUN" if mode == "tun" else " · SOCKS/HTTP"))
+    return {"ok": True, "running": True}
+
+
+# --------------------------------------------------------------------------- #
+# статус
+# --------------------------------------------------------------------------- #
+
+def iface_stats() -> tuple[int, int]:
+    base = Path(f"/sys/class/net/{TUN_IFACE}/statistics")
+    try:
+        return int((base / "rx_bytes").read_text()), int((base / "tx_bytes").read_text())
+    except (OSError, ValueError):
+        return 0, 0
+
+
+def status() -> dict:
+    ensure_dirs()
+    s = settings()
+    st = load_json(RUNTIME, {})
+    running = is_on()
+    try:
+        pro = profiles()
+    except RuntimeError:
+        pro = []
+    pi = s["profile_index"]
+    if pi >= len(pro):
+        pi = 0
+    ni = s["node_index"]
+    try:
+        nd = nodes(pi) if pro else []
+    except RuntimeError:
+        nd = []
+    rx, tx = iface_stats() if running else (0, 0)
+    uptime = int(time.time() - st["started_at"]) if running and st.get("started_at") else 0
+    installed = XRAY_BIN.exists() and SB_BIN.exists()
+    return {
+        "ok": True,
+        "installed": installed,
+        "running": running,
+        "mode": s["mode"],
+        "strict_route": bool(s.get("strict_route", False)),
+        "profile_index": pi,
+        "profile_name": pro[pi]["name"] if pro else "",
+        "node_index": ni,
+        "node_name": (nd[ni]["tag"] if 0 <= ni < len(nd) else "auto"),
+        "uptime": uptime,
+        "rx": rx,
+        "tx": tx,
+        "socks_port": SOCKS_PORT,
+        "http_port": HTTP_PORT,
+        "tun_iface": TUN_IFACE,
+        "last_error": st.get("last_error", ""),
+        "updated": load_json(SUBFILE, {}).get("updated", 0),
+        "profiles": pro,
+        "nodes": nodes(pi),
+    }
+
+
+def check() -> dict:
+    url = "https://api.ipify.org"
+    direct = subprocess.run(
+        ["curl", "-s", "--max-time", "12", url],
+        capture_output=True, text=True).stdout.strip()
+    if not is_on():
+        return {"ok": False, "error": "не подключено", "direct_ip": direct}
+    proxied = subprocess.run(
+        ["curl", "-s", "--max-time", "20", "--socks5-hostname",
+         f"127.0.0.1:{SOCKS_PORT}", url],
+        capture_output=True, text=True).stdout.strip()
+    return {
+        "ok": bool(proxied),
+        "direct_ip": direct,
+        "proxy_ip": proxied,
+        "changed": bool(proxied) and proxied != direct,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+JSON_OUT = False
+
+
+def emit(data, human: str = "") -> None:
+    if JSON_OUT:
+        print(json.dumps(data, ensure_ascii=False))
+    elif human:
+        print(human)
+
+
+def main(argv: list) -> int:
+    global JSON_OUT
+    p = argparse.ArgumentParser(prog="omavpn", description="Xray + TUN клиент для Omarchy")
+    p.add_argument("--json", action="store_true", help="вывод в JSON")
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("update", help="обновить подписку")
+    sub.add_parser("profiles", help="список профилей")
+    sub.add_parser("nodes", help="ноды текущего профиля")
+    sub.add_parser("status", help="текущий статус")
+    sub.add_parser("on", help="подключить")
+    sub.add_parser("off", help="отключить")
+    sub.add_parser("restart", help="перезапустить")
+    sub.add_parser("toggle", help="переключить")
+    sub.add_parser("check", help="проверить внешний IP")
+    sub.add_parser("logs", help="хвост логов")
+
+    sp = sub.add_parser("profile", help="выбрать профиль")
+    sp.add_argument("index", type=int)
+    sn = sub.add_parser("node", help="выбрать ноду (-1 = авто)")
+    sn.add_argument("index", type=int)
+    sm = sub.add_parser("mode", help="режим: tun | proxy")
+    sm.add_argument("value", choices=["tun", "proxy"])
+    ss = sub.add_parser("strict", help="strict_route вкл/выкл")
+    ss.add_argument("value", choices=["on", "off"])
+
+    args = p.parse_args(argv)
+    JSON_OUT = args.json
+
+    try:
+        if args.cmd == "update":
+            cfg = update_sub()
+            pro = [{"index": i, "name": str(c.get("remarks") or i).strip(),
+                    "node_count": len(node_outbounds(c))} for i, c in enumerate(cfg)]
+            emit({"ok": True, "profiles": pro}, "\n".join(f"{x['index']}: {x['name']}" for x in pro))
+        elif args.cmd == "profiles":
+            pro = profiles()
+            emit({"ok": True, "profiles": pro},
+                 "\n".join(f"{x['index']}: {x['name']} ({x['node_count']})" for x in pro))
+        elif args.cmd == "nodes":
+            nd = nodes(settings()["profile_index"])
+            emit({"ok": True, "nodes": nd},
+                 "\n".join(f"{x['index']}: {x['tag']} · {x['detail']}" for x in nd))
+        elif args.cmd == "status":
+            emit(status())
+        elif args.cmd == "on":
+            emit(cmd_on(None, None, None), "Подключено")
+        elif args.cmd == "off":
+            emit(cmd_off(), "Отключено")
+        elif args.cmd == "restart":
+            cmd_off(quiet=True)
+            emit(cmd_on(None, None, None), "Перезапущено")
+        elif args.cmd == "toggle":
+            if is_on():
+                emit(cmd_off(), "Отключено")
+            else:
+                emit(cmd_on(None, None, None), "Подключено")
+        elif args.cmd == "profile":
+            set_settings(profile_index=args.index, node_index=-1)
+            if is_on():
+                cmd_on(args.index, -1, None, quiet=True)
+            emit({"ok": True, "profile_index": args.index}, f"Профиль: {args.index}")
+        elif args.cmd == "node":
+            set_settings(node_index=args.index)
+            if is_on():
+                cmd_on(None, args.index, None, quiet=True)
+            emit({"ok": True, "node_index": args.index}, f"Нода: {args.index}")
+        elif args.cmd == "mode":
+            set_settings(mode=args.value)
+            if is_on():
+                cmd_on(None, None, args.value, quiet=True)
+            emit({"ok": True, "mode": args.value}, f"Режим: {args.value}")
+        elif args.cmd == "strict":
+            set_settings(strict_route=(args.value == "on"))
+            if is_on():
+                cmd_on(None, None, None, quiet=True)
+            emit({"ok": True, "strict_route": args.value == "on"})
+        elif args.cmd == "check":
+            emit(check())
+        elif args.cmd == "logs":
+            tail = {"xray": log_tail(XRAY_LOG, 40), "sing-box": log_tail(SB_LOG, 40)}
+            emit({"ok": True, **tail}, f"xray: {tail['xray']}\n\nsing-box: {tail['sing-box']}")
+        else:
+            p.print_help()
+            return 0
+    except RuntimeError as exc:
+        fail(str(exc))
+    except urllib.error.URLError as exc:  # noqa: F821
+        fail(f"сеть недоступна: {exc}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

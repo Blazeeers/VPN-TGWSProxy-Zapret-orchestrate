@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.blazeeers.omavpn",
+  "name": "omavpn",
+  "version": "1.0.0",
+  "author": "blazeeers",
+  "license": "MIT",
+  "description": "Xray + sing-box (TUN) VPN client driven by a Happ-format subscription or share-links, controlled from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "shell-plugin/omavpn/Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "omavpn",
+    "description": "Подключение VPN (Xray + TUN), выбор профиля и сервера",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "autoconnect": false
+    },
+    "schema": [
+      {
+        "key": "autoconnect",
+        "type": "boolean",
+        "label": "Подключаться при входе",
+        "defaultValue": false
+      }
+    ]
+  }
+}

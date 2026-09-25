@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+# zapret-autotune — автоматический подбор и применение стратегии обхода zapret
+# под текущую сеть. Для каждой сети стратегия кэшируется. Если ни одна не
+# работает — Discord/YouTube убираются из direct-списка omavpn и идут через VPN.
+#
+# Команды:
+#   zapret-autotune run      — применить/подобрать для текущей сети (по умолчанию)
+#   zapret-autotune rescan   — принудительно переподобрать для текущей сети
+#   zapret-autotune show     — показать кэш сетей
+#   zapret-autotune tune-wan — только выставить IFACE_WAN под текущую сеть
+#
+# Устанавливается установщиком zapret-autotune-install.sh. Запускается от root
+# сервисом zapret-autotune.service (по смене сети и по таймеру).
+set -uo pipefail
+
+CONF=/etc/zapret-autotune.conf
+CACHE=/var/lib/zapret-autotune
+LOG=/var/log/zapret-autotune.log
+CFG=/opt/zapret/config
+F=/opt/zapret/files/fake
+GOOGLE=/opt/zapret/ipset/list-google.txt
+ULIST=/opt/zapret/ipset/zapret-hosts-user.txt
+LOCK=/run/zapret-autotune.lock
+
+# --- конфиг установки -------------------------------------------------------
+if [ -f "$CONF" ]; then . "$CONF"; fi
+USER_NAME="${USER_NAME:-}"
+USER_HOME="${USER_HOME:-}"
+AUTO_VPN="${AUTO_VPN:-1}"
+UID_N=""
+[ -n "$USER_NAME" ] && UID_N="$(id -u "$USER_NAME" 2>/dev/null || echo)"
+OMAVPN="$USER_HOME/.local/bin/omavpn"
+DIRECT_FILE="$USER_HOME/.config/omavpn/direct_domains.txt"
+DIRECT_CHANGED=0
+
+log() { echo "$(date '+%F %T') $*" | tee -a "$LOG" 2>/dev/null; }
+
+# --- списки доменов ---------------------------------------------------------
+write_lists() {
+  cat > "$GOOGLE" <<'EOF'
+youtube.com
+youtu.be
+ytimg.com
+googlevideo.com
+youtube-nocookie.com
+youtubekids.com
+youtubegaming.com
+youtubeeducation.com
+youtubemusic.com
+ytstatic.com
+youtube.googleapis.com
+youtubei.googleapis.com
+EOF
+  cat > "$ULIST" <<'EOF'
+discord.com
+discord.gg
+discordapp.com
+discordapp.net
+discord.co
+discord.dev
+discord.new
+discord.media
+discordmerch.com
+discordstatus.com
+discord-activities.com
+discordactivities.com
+discordpartygames.com
+discordapp.io
+discordcdn.com
+EOF
+  chmod 644 "$GOOGLE" "$ULIST"
+}
+
+# --- сеть -------------------------------------------------------------------
+wan_iface() {
+  ip -o route show default 2>/dev/null | awk '{
+    d="";
+    for (i=1;i<=NF;i++) if ($i=="dev") d=$(i+1);
+    if (d!="" && d!="omavpn0" && d!="tailscale0" && d !~ /^tun/) { print d; exit }
+  }'
+}
+
+netkey() {
+  local iface ssid gw mac key
+  iface="$(wan_iface)"
+  [ -n "$iface" ] || iface="unknown"
+  ssid=""
+  case "$iface" in
+    wl*|wlan*|wlp*) ssid="$(iwgetid -r "$iface" 2>/dev/null || true)" ;;
+  esac
+  [ -n "$ssid" ] || ssid="$(nmcli -t -f GENERAL.CONNECTION device show "$iface" 2>/dev/null | cut -d: -f2-)"
+  if [ -n "$ssid" ] && [ "$iface" != "unknown" ]; then
+    key="wifi-${ssid}"
+  else
+    gw="$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')"
+    mac="$(ip neigh show "$gw" 2>/dev/null | awk '/lladdr/{print $5; exit}')"
+    key="net-${iface}-${mac:-$gw}"
+  fi
+  printf '%s' "$key" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+set_wan() {
+  local w; w="$(wan_iface)"
+  [ -n "$w" ] || return 1
+  python3 - "$CFG" "$w" <<'PY'
+import re, sys
+cfg, wan = sys.argv[1], sys.argv[2]
+t = open(cfg).read()
+if re.search(r'^#?\s*IFACE_WAN=', t, re.M):
+    t = re.sub(r'^#?\s*IFACE_WAN=.*$', f'IFACE_WAN="{wan}"', t, count=1, flags=re.M)
+else:
+    t += f'\nIFACE_WAN="{wan}"\n'
+open(cfg, 'w').write(t)
+PY
+  log "WAN=$w"
+}
+
+# --- проверки ---------------------------------------------------------------
+ok_url() {
+  local code
+  for _ in 1 2; do
+    code="$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 "$1" 2>/dev/null)"
+    case "$code" in 2??|3??) return 0 ;; esac
+  done
+  return 1
+}
+test_targets() { ok_url https://www.youtube.com/ && ok_url https://discord.com/; }
+
+# --- zapret -----------------------------------------------------------------
+build_opt() {
+  cat <<EOF
+--filter-tcp=443 --hostlist=$GOOGLE --hostlist=$ULIST $1 --new
+--filter-tcp=80 --dpi-desync=fake,multisplit --dpi-desync-split-pos=method+2 --dpi-desync-fooling=md5sig --hostlist=$GOOGLE --hostlist=$ULIST --new
+--filter-udp=443 --hostlist=$GOOGLE --hostlist=$ULIST --dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fake-quic=$F/quic_initial_www_google_com.bin
+EOF
+}
+
+# set_opt <полный NFQWS_OPT>; return 0 если изменено, 1 если уже так
+set_opt() {
+  local optf rc
+  optf="$(mktemp /tmp/zapret-autotune.opt.XXXXXX)"
+  printf '%s\n' "$1" > "$optf"
+  python3 - "$CFG" "$optf" <<'PY'
+import re, sys
+cfg, optf = sys.argv[1], sys.argv[2]
+opt = open(optf).read().strip()
+t = open(cfg).read()
+m = re.search(r'NFQWS_OPT="(.*?)"', t, re.S)
+cur = m.group(1).strip() if m else ""
+if cur == opt:
+    sys.exit(3)
+if m:
+    t = t[:m.start()] + 'NFQWS_OPT="' + opt + '"' + t[m.end():]
+else:
+    t = t.rstrip() + '\nNFQWS_OPT="' + opt + '"\n'
+open(cfg, 'w').write(t)
+PY
+  rc=$?; rm -f "$optf"
+  [ "$rc" = 3 ] && return 1
+  return 0
+}
+
+activate() {
+  systemctl restart zapret.service >/dev/null 2>&1
+  sleep 2
+  systemctl is-active --quiet zapret.service
+}
+
+ensure_zapret_on() {
+  systemctl is-active --quiet zapret.service || activate
+}
+
+zapret_off() { systemctl stop zapret.service >/dev/null 2>&1 || true; }
+
+# --- omavpn -----------------------------------------------------------------
+full_direct() {
+  [ -n "$USER_NAME" ] || return 0
+  runuser -u "$USER_NAME" -- env HOME="$USER_HOME" python3 - "$OMAVPN" <<'PY' 2>/dev/null
+import importlib.machinery, importlib.util, sys
+p = sys.argv[1]
+loader = importlib.machinery.SourceFileLoader("omavpn", p)
+spec = importlib.util.spec_from_loader("omavpn", loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+print("\n".join(m.DEFAULT_DIRECT_DOMAINS))
+PY
+}
+
+# ensure_direct <содержимое>; ставит DIRECT_CHANGED
+ensure_direct() {
+  local content="$1" cur=""
+  [ -f "$DIRECT_FILE" ] && cur="$(cat "$DIRECT_FILE" 2>/dev/null)"
+  if [ "$cur" = "$content" ]; then DIRECT_CHANGED=0; return 0; fi
+  printf '%s\n' "$content" > "$DIRECT_FILE"
+  chown "$USER_NAME" "$DIRECT_FILE" 2>/dev/null || true
+  DIRECT_CHANGED=1
+}
+ensure_direct_all() {
+  local content; content="$(full_direct)"
+  if [ -n "$content" ]; then
+    ensure_direct "$content"
+  elif [ -f "$DIRECT_FILE" ]; then
+    rm -f "$DIRECT_FILE"; DIRECT_CHANGED=1
+  else
+    DIRECT_CHANGED=0
+  fi
+}
+ensure_direct_min() { ensure_direct "max.ru"; }
+
+omavpn_running() {
+  [ -n "$USER_NAME" ] && [ -x "$OMAVPN" ] || return 1
+  runuser -u "$USER_NAME" -- env HOME="$USER_HOME" XDG_RUNTIME_DIR="/run/user/$UID_N" \
+    "$OMAVPN" --json status 2>/dev/null | grep -q '"running": *true'
+}
+omavpn_restart() {
+  [ -n "$USER_NAME" ] && [ -x "$OMAVPN" ] || return 0
+  runuser -u "$USER_NAME" -- env HOME="$USER_HOME" XDG_RUNTIME_DIR="/run/user/$UID_N" \
+    "$OMAVPN" restart >/dev/null 2>&1 || true
+}
+omavpn_start() {
+  [ -n "$USER_NAME" ] && [ -x "$OMAVPN" ] || return 1
+  runuser -u "$USER_NAME" -- env HOME="$USER_HOME" XDG_RUNTIME_DIR="/run/user/$UID_N" \
+    "$OMAVPN" on >/dev/null 2>&1 || true
+}
+omavpn_off() {
+  [ -n "$USER_NAME" ] && [ -x "$OMAVPN" ] || return 0
+  runuser -u "$USER_NAME" -- env HOME="$USER_HOME" XDG_RUNTIME_DIR="/run/user/$UID_N" \
+    "$OMAVPN" off >/dev/null 2>&1 || true
+}
+apply_direct_change() {
+  [ "$DIRECT_CHANGED" = 1 ] && omavpn_running && omavpn_restart
+}
+ensure_vpn() {
+  if omavpn_running; then
+    apply_direct_change
+  elif [ "$AUTO_VPN" = 1 ]; then
+    log "поднимаю VPN (omavpn on)"
+    omavpn_start
+    sleep 5
+  fi
+}
+
+# --- стратегии (порядок = приоритет) ---------------------------------------
+STRATEGIES=(
+  "--dpi-desync=multisplit --dpi-desync-split-pos=sniext+1"
+  "--dpi-desync=multisplit --dpi-desync-split-pos=host+1"
+  "--dpi-desync=multisplit --dpi-desync-split-pos=1"
+  "--dpi-desync=multisplit --dpi-desync-split-pos=midsld"
+  "--dpi-desync=multidisorder --dpi-desync-split-pos=sniext"
+  "--dpi-desync=multidisorder --dpi-desync-split-pos=sniext+3"
+  "--dpi-desync=multidisorder --dpi-desync-split-pos=midsld-1"
+  "--dpi-desync=multidisorder --dpi-desync-split-pos=1,midsld"
+  "--dpi-desync=fake,multisplit --dpi-desync-split-pos=sniext+1 --dpi-desync-fooling=md5sig"
+  "--dpi-desync=fake,multisplit --dpi-desync-split-pos=host+1 --dpi-desync-fooling=md5sig"
+  "--dpi-desync=fake,multisplit --dpi-desync-split-pos=1 --dpi-desync-fooling=md5sig"
+  "--dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,midsld --dpi-desync-fooling=badseq,md5sig"
+  "--dpi-desync=fake,multidisorder --dpi-desync-split-pos=sniext --dpi-desync-fooling=md5sig"
+  "--dpi-desync=hostfakesplit --dpi-desync-hostfakesplit-midhost=midsld"
+  "--dpi-desync=hostfakesplit --dpi-desync-hostfakesplit-mod=altorder=1"
+  "--dpi-desync=fake,hostfakesplit --dpi-desync-hostfakesplit-midhost=midsld --dpi-desync-fooling=md5sig"
+  "--dpi-desync=fake --dpi-desync-ttl=1 --dpi-desync-fooling=md5sig"
+  "--dpi-desync=fake --dpi-desync-ttl=3 --dpi-desync-fooling=md5sig"
+  "--dpi-desync=fake --dpi-desync-ttl=7 --dpi-desync-fooling=md5sig"
+  "--dpi-desync=fake --dpi-desync-fooling=md5sig --dpi-desync-fake-tls=$F/tls_clienthello_www_google_com.bin"
+  "--dpi-desync=fake --dpi-desync-fooling=badseq --dpi-desync-fake-tls=$F/tls_clienthello_www_google_com.bin"
+  "--dpi-desync=fakeddisorder --dpi-desync-fooling=md5sig"
+  "--dpi-desync=fakedsplit --dpi-desync-fooling=md5sig"
+  "--dpi-desync=multisplit --dpi-desync-split-pos=sniext+1 --dpi-desync-split-seqovl=1"
+  "--dpi-desync=multisplit --dpi-desync-split-pos=2 --dpi-desync-split-seqovl=336 --dpi-desync-split-seqovl-pattern=$F/tls_clienthello_iana_org.bin"
+  "--dpi-desync=multidisorder --dpi-desync-split-pos=2 --dpi-desync-split-seqovl=1"
+  "--dpi-desync=multisplit --dpi-desync-split-pos=1 --dpi-desync-split-seqovl=568 --dpi-desync-split-seqovl-pattern=$F/tls_clienthello_www_google_com.bin"
+  "--dpi-desync=multidisorder --dpi-desync-split-pos=1 --dpi-desync-fooling=badseq"
+)
+
+apply_strategy_index() { # $1 = индекс; return 0 если target'ы открываются
+  local i="$1"
+  ensure_direct_all
+  apply_direct_change
+  if set_opt "$(build_opt "${STRATEGIES[$i]}")"; then
+    activate
+  else
+    ensure_zapret_on
+  fi
+  test_targets
+}
+
+run_scan() {
+  local key="$1" cf="$2" i
+  ensure_direct_all
+  apply_direct_change
+  sleep 1
+
+  zapret_off
+  if test_targets; then
+    log "сеть чистая: без обхода всё открывается -> zapret выключен"
+    printf 'off\n' > "$cf"
+    return 0
+  fi
+
+  for i in "${!STRATEGIES[@]}"; do
+    log "пробую[$i]: ${STRATEGIES[$i]}"
+    if set_opt "$(build_opt "${STRATEGIES[$i]}")"; then activate; else ensure_zapret_on; fi
+    if test_targets; then
+      log "рабочая стратегия найдена: индекс $i (${STRATEGIES[$i]})"
+      printf '%s\n' "$i" > "$cf"
+      return 0
+    fi
+  done
+
+  log "ни одна стратегия не сработала -> Discord/YouTube через VPN"
+  zapret_off
+  ensure_direct_min
+  ensure_vpn
+  if omavpn_running && test_targets; then
+    log "VPN поднят — цели открываются"
+  else
+    log "VPN не поднялся или цели не открылись (проверь профиль/ноду omavpn)"
+  fi
+  printf 'vpn\n' > "$cf"
+  return 0
+}
+
+apply_cached() { # $1 = стратегия из кэша, $2 = ключ сети; return 0 если ок
+  local strat="$1" key="$2" optf
+  case "$strat" in
+    off)
+      ensure_direct_all; apply_direct_change; zapret_off; test_targets ;;
+    vpn)
+      zapret_off; ensure_direct_min; ensure_vpn
+      if omavpn_running && test_targets; then log "vpn-режим: цели открываются"; else log "vpn-режим: цели не открылись"; fi
+      return 0 ;;
+    custom)
+      optf="$CACHE/$key.opt"
+      [ -s "$optf" ] || return 1
+      ensure_direct_all; apply_direct_change
+      if set_opt "$(cat "$optf")"; then activate; else ensure_zapret_on; fi
+      test_targets ;;
+    ''|*[!0-9]*)
+      return 1 ;;
+    *)
+      apply_strategy_index "$strat" ;;
+  esac
+}
+
+run() {
+  local force="${1:-}" tries=0
+  while ! set_wan; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 3 ]; then
+      log "нет физического WAN — пропуск запуска"
+      return 0
+    fi
+    sleep 3
+  done
+  write_lists
+  mkdir -p "$CACHE"
+  local key cf strat
+  key="$(netkey)"
+  case "$key" in
+    ""|*unknown*) log "ключ сети не определён ($key) — пропуск"; return 0 ;;
+  esac
+  cf="$CACHE/$key.strategy"
+  log "сеть: $key"
+  if [ -s "$cf" ] && [ "$force" != "force" ]; then
+    strat="$(cat "$cf")"
+    log "кэш: strategy=$strat, проверяю"
+    if apply_cached "$strat" "$key"; then
+      log "кэш работает"
+      return 0
+    fi
+    log "кэш перестал работать -> переподбор"
+  fi
+  run_scan "$key" "$cf"
+}
+
+main() {
+  if [ "${ZAPRET_AUTOTUNE_SOURCE:-0}" = 1 ]; then
+    return 0 2>/dev/null || exit 0
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "zapret-autotune: нужен root (sudo zapret-autotune ${1:-run})" >&2
+    exit 1
+  fi
+  exec 9>"$LOCK" || exit 1
+  flock -n 9 || { log "уже выполняется, пропуск"; exit 0; }
+
+  case "${1:-run}" in
+    run)     run normal ;;
+    rescan)  run force ;;
+    show)    ls -1 "$CACHE" 2>/dev/null | sed 's/\.strategy$//' | while read -r k; do printf '%-40s %s\n' "$k" "$(cat "$CACHE/$k.strategy" 2>/dev/null)"; done ;;
+    tune-wan) write_lists; set_wan ;;
+    *) echo "Использование: zapret-autotune {run|rescan|show|tune-wan}"; exit 2 ;;
+  esac
+}
+
+main "$@"

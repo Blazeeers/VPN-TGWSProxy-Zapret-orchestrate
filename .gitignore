@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.bak
+*.bak.*
+*.tmp
+.DS_Store
+
+# локальные секреты/состояние (в репозиторий не попадают)
+subscription
+settings.json
+direct_domains.txt
