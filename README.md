@@ -63,7 +63,7 @@
 | Правило | Что исключается | Зачем |
 |---|---|---|
 | `ip_is_private` | LAN, localhost | локальная сеть, петли |
-| `domain_suffix: direct_domains()` | MAX, Discord, YouTube | см. [docs/zapret.md](docs/zapret.md), [docs/telegram.md](docs/telegram.md) |
+| `domain_suffix: direct_domains()` | MAX, Яндекс, Discord, YouTube | см. [docs/zapret.md](docs/zapret.md), [docs/telegram.md](docs/telegram.md); российские сервисы (MAX, Яндекс) — всегда мимо VPN |
 | `process_name: tg-ws-proxy/Telegram` | Telegram Desktop и локальный MTProto-прокси | трафик WS-прокси должен идти напрямую |
 | `ip_cidr`/`domain` серверов подписки | адреса VPN-серверов | чтобы туннель не зациклился |
 | `port: 25,465,587` | SMTP | не прогонять почту через прокси |

@@ -61,14 +61,26 @@ PROXY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "wire
 # доступ к нему у провайдера блокируется, а tg-ws-proxy его не обслуживает.
 TELEGRAM_PROCESSES = ["tg-ws-proxy", "TgWsProxy", "Telegram", "telegram-desktop"]
 
-# Сервисы, которые не туннелируем — ходим напрямую. MAX работает без VPN;
-# Discord/YouTube идут напрямую, а блокировку снимает zapret (nfqws).
+# Сервисы, которые НИКОГДА не туннелируем: им нужен российский IP, а через
+# зарубежный выход VPN они недоступны/режутся. Этот список применяется всегда,
+# поверх direct_domains.txt, и его не перетирает zapret-autotune.
+ALWAYS_DIRECT_DOMAINS = [
+    "max.ru",
+    "yandex.ru",
+    "ya.ru",
+    "yandex.com",
+    "yandex.net",
+    "yandex-team.ru",
+    "yastatic.net",
+]
+
+# Дополнительно выводим напрямую Discord/YouTube — блокировку снимает zapret.
 # Список можно переопределить файлом ~/.config/omavpn/direct_domains.txt
 # (по одному домену на строку, '#' — комментарий). Этим пользуется
 # zapret-autotune: если обход в сети не работает, он убирает Discord/YouTube
-# из этого файла, и они идут через VPN.
+# из этого файла, и они идут через VPN. ALWAYS_DIRECT_DOMAINS при этом остаются.
 DEFAULT_DIRECT_DOMAINS = [
-    "max.ru",
+    *ALWAYS_DIRECT_DOMAINS,
     # Discord
     "discord.com",
     "discord.gg",
@@ -103,12 +115,16 @@ DIRECT_DOMAINS_FILE = CONF / "direct_domains.txt"
 
 
 def direct_domains() -> list:
+    result = list(ALWAYS_DIRECT_DOMAINS)
     try:
         lines = DIRECT_DOMAINS_FILE.read_text(encoding="utf-8").splitlines()
     except OSError:
         return DEFAULT_DIRECT_DOMAINS
-    doms = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
-    return doms or DEFAULT_DIRECT_DOMAINS
+    for line in lines:
+        dom = line.strip()
+        if dom and not dom.startswith("#") and dom not in result:
+            result.append(dom)
+    return result
 
 DEFAULT_SETTINGS = {
     "profile_index": 0,

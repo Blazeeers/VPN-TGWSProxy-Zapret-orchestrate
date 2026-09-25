@@ -33,8 +33,10 @@
 1. `sniff` — определять протокол/домен из пакета.
 2. `protocol: dns → hijack-dns` — DNS заворачивается в sing-box.
 3. `ip_is_private` → `direct` — LAN, loopback.
-4. `domain_suffix: direct_domains()` → `direct` — MAX, Discord, YouTube
-   (список из `DEFAULT_DIRECT_DOMAINS` либо `~/.config/omavpn/direct_domains.txt`).
+4. `domain_suffix: direct_domains()` → `direct` — MAX, Яндекс, Discord, YouTube
+   (список `ALWAYS_DIRECT_DOMAINS` — MAX/Яндекс — применяется всегда и не
+   перетирается автотюном; Discord/YouTube берутся из `DEFAULT_DIRECT_DOMAINS`
+   либо `~/.config/omavpn/direct_domains.txt`).
 5. `process_name: tg-ws-proxy, TgWsProxy, Telegram, telegram-desktop` → `direct` —
    локальный MTProto-прокси и Telegram Desktop.
 6. `bypass` — адреса серверов подписки (`ip_cidr`/`domain`) → `direct`,
