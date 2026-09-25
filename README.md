@@ -1,4 +1,7 @@
-# omavpn + zapret + tg-ws-proxy
+# VPN-TGWSProxy-Zapret-orchestrate
+
+**VPN (Xray + sing-box TUN) + автоматический обход DPI (zapret) + прокси Telegram
+(tg-ws-proxy) для Omarchy.**
 
 Персональный набор для Omarchy (Arch/Hyprland), который держит ноутбук
 подключённым и «раскрытым» в разных сетях:

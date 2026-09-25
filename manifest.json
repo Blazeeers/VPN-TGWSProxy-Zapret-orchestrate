@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "io.github.blazeeers.omavpn",
-  "name": "omavpn",
+  "name": "VPN-TGWSProxy-Zapret-orchestrate",
   "version": "1.0.0",
   "author": "blazeeers",
   "license": "MIT",
