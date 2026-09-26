@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""bypass-status — агрегированный статус всех «обходов» для виджета панели.
+
+Печатает JSON с состоянием: VPN (omavpn/wowvpn), zapret + автотюн, tg-ws-proxy,
+Telegram-бот и direct-список. Зависимостей нет, root не нужен.
+
+    bypass-status            # JSON
+    bypass-status --check    # JSON + живые проверки доступности (медленнее)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+AUTOTUNE_DIR = "/var/lib/zapret-autotune"
+APP_CANDIDATES = ("omavpn", "wowvpn")
+
+
+def run(cmd: list[str], timeout: float = 8.0) -> str:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return (p.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def resolve_cli() -> tuple[str, str]:
+    """(app_name, cli_path). Поддерживает оба имени — omavpn и wowvpn."""
+    for env in ("OMAVPN_CLI", "BYPASS_CLI"):
+        path = os.environ.get(env)
+        if path and os.path.exists(path):
+            return os.path.basename(path), path
+    for name in APP_CANDIDATES:
+        path = shutil.which(name) or os.path.join(HOME, ".local", "bin", name)
+        if os.path.exists(path):
+            return name, path
+    return "", ""
+
+
+def fmt_uptime(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    h, m, s = seconds // 3600, (seconds % 3600) // 60, seconds % 60
+    return (f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}")
+
+
+def wan_iface() -> str:
+    for line in run(["ip", "-o", "route", "show", "default"]).splitlines():
+        parts = line.split()
+        if "dev" in parts:
+            dev = parts[parts.index("dev") + 1]
+            if "vpn0" in dev or dev.startswith(("tun", "tailscale")):
+                continue
+            return dev
+    return ""
+
+
+def net_key(iface: str) -> str:
+    ssid = run(["iwgetid", "-r", iface]) if iface else ""
+    if not ssid:
+        name = run(["nmcli", "-t", "-f", "GENERAL.CONNECTION", "device", "show", iface]) if iface else ""
+        ssid = name.strip().split(":")[-1] if name else ""
+    if ssid:
+        key = f"wifi-{ssid}"
+    else:
+        gw = run(["ip", "route", "show", "default"])
+        gw = gw.split("via ")[1].split()[0] if "via " in gw else ""
+        mac = run(["ip", "neigh", "show", gw]) if gw else ""
+        mac = mac.split("lladdr ")[1].split()[0] if "lladdr " in mac else gw
+        key = f"net-{iface or 'unknown'}-{mac or 'unknown'}"
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in key)
+
+
+def vpn_status(cli: str) -> dict:
+    if not cli:
+        return {"installed": False, "running": False}
+    raw = run([cli, "--json", "status"], timeout=10)
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return {"installed": False, "running": False}
+    return {
+        "installed": bool(d.get("installed")),
+        "running": bool(d.get("running")),
+        "mode": d.get("mode", ""),
+        "profile": d.get("profile_name", ""),
+        "node": d.get("node_name", ""),
+        "uptime": int(d.get("uptime") or 0),
+        "uptime_text": fmt_uptime(d.get("uptime") or 0),
+        "rx": int(d.get("rx") or 0),
+        "tx": int(d.get("tx") or 0),
+        "error": d.get("last_error", ""),
+    }
+
+
+def zapret_status(iface: str) -> dict:
+    key = net_key(iface)
+    mode = ""
+    try:
+        mode = open(os.path.join(AUTOTUNE_DIR, f"{key}.strategy"), encoding="utf-8").read().strip()
+    except OSError:
+        pass
+    return {
+        "service": run(["systemctl", "is-active", "zapret.service"]) or "unknown",
+        "autotune": run(["systemctl", "is-active", "zapret-autotune.service"]) or "unknown",
+        "timer": run(["systemctl", "is-active", "zapret-autotune.timer"]) or "unknown",
+        "iface": iface,
+        "network": key,
+        "mode": mode,
+    }
+
+
+def port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.4)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def tgwsproxy_status() -> dict:
+    running = bool(run(["pgrep", "-x", "tg-ws-proxy"]))
+    conf = os.path.join(HOME, ".config", "TgWsProxy", "config.json")
+    port = 1443
+    try:
+        port = int(json.load(open(conf, encoding="utf-8")).get("port", 1443))
+    except (OSError, ValueError):
+        pass
+    return {"running": running, "port": port, "listening": port_open(port)}
+
+
+def bot_status() -> dict:
+    state = run(["systemctl", "--user", "is-active", "telegram-inbox-bot.service"])
+    return {"active": state == "active", "state": state or "unknown"}
+
+
+def direct_status(app: str) -> dict:
+    path = os.path.join(HOME, ".config", app, "direct_domains.txt") if app else ""
+    count, has_file = 0, bool(path and os.path.exists(path))
+    if has_file:
+        try:
+            count = sum(1 for l in open(path, encoding="utf-8") if l.strip() and not l.startswith("#"))
+        except OSError:
+            pass
+    return {"file": path if has_file else "", "count": count}
+
+
+def live_checks() -> dict:
+    def code(url: str) -> int:
+        out = run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "12", url], timeout=15)
+        try:
+            return int(out or 0)
+        except ValueError:
+            return 0
+
+    return {
+        "yandex": code("https://yandex.ru/"),
+        "telegram_api": code("https://api.telegram.org/"),
+        "youtube": code("https://www.youtube.com/"),
+    }
+
+
+def collect(check: bool) -> dict:
+    app, cli = resolve_cli()
+    iface = wan_iface()
+    data = {
+        "ok": True,
+        "app": app,
+        "cli": cli,
+        "vpn": vpn_status(cli),
+        "zapret": zapret_status(iface),
+        "tgwsproxy": tgwsproxy_status(),
+        "bot": bot_status(),
+        "direct": direct_status(app),
+    }
+    if check:
+        data["checks"] = live_checks()
+    return data
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="bypass-status", description="Статус всех обходов (JSON)")
+    ap.add_argument("--json", action="store_true", help="JSON (по умолчанию)")
+    ap.add_argument("--check", action="store_true", help="живые проверки доступности")
+    args = ap.parse_args()
+    print(json.dumps(collect(args.check), ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

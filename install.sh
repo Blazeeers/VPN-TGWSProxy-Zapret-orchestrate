@@ -94,6 +94,24 @@ else
   warn "Каталог shell-plugin/omavpn не найден — виджет не установлен"
 fi
 
+# --- Виджет статусов обходов ------------------------------------------------
+if [ -d "$HERE/shell-plugin/bypass-status" ]; then
+  say "Устанавливаю виджет статусов обходов (Bypass Status)…"
+  install -m 0755 "$HERE/bin/bypass-status" "$LOCAL_BIN/bypass-status"
+  BS_ID="io.github.blazeeers.bypass-status"
+  BS_DIR="$HOME_DIR/.config/omarchy/plugins/$BS_ID"
+  mkdir -p "$BS_DIR"
+  cp -f "$HERE/shell-plugin/bypass-status/manifest.json" "$HERE/shell-plugin/bypass-status/Panel.qml" "$BS_DIR/"
+  if command -v omarchy-shell >/dev/null; then
+    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+    if command -v omarchy >/dev/null; then
+      omarchy plugin enable "$BS_ID" >/dev/null 2>&1 || true
+      omarchy bar move "$BS_ID" --section right >/dev/null 2>&1 || true
+    fi
+  fi
+  warn "Если виджета не видно — выполни: omarchy restart shell"
+fi
+
 # --- Подписка ---------------------------------------------------------------
 SUB_FILE="$HOME_DIR/.config/omavpn/subscription"
 if [ ! -s "$SUB_FILE" ]; then

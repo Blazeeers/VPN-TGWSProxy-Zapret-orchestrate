@@ -1,0 +1,399 @@
+import QtQuick
+import QtQuick.Controls
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+
+Panel {
+  id: root
+  moduleName: "io.github.blazeeers.bypass-status"
+  ipcTarget: "io.github.blazeeers.bypass-status"
+  manageIpc: false
+
+  readonly property string scriptPath: Quickshell.env("HOME") + "/.local/bin/bypass-status"
+
+  property var bs: ({ ok: false })
+  property string busy: ""
+  property string lastError: ""
+
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color warn: "#ff9f0a"
+  readonly property color dim: Qt.darker(foreground, 1.55)
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
+
+  readonly property var vpn: (root.bs && root.bs.vpn) ? root.bs.vpn : ({})
+  readonly property var zap: (root.bs && root.bs.zapret) ? root.bs.zapret : ({})
+  readonly property var tg: (root.bs && root.bs.tgwsproxy) ? root.bs.tgwsproxy : ({})
+  readonly property var bot: (root.bs && root.bs.bot) ? root.bs.bot : ({})
+  readonly property var chk: (root.bs && root.bs.checks) ? root.bs.checks : null
+  readonly property string cliPath: (root.bs && root.bs.cli) ? root.bs.cli : ""
+
+  readonly property bool vpnOn: !!root.vpn.running
+
+  function fmtUptime(s) {
+    s = Math.max(0, Number(s) || 0)
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60)
+    function pad(x) { return (x < 10 ? "0" : "") + x }
+    return (h > 0 ? h + ":" + pad(m) : pad(m)) + ":" + pad(sec)
+  }
+
+  function codeState(code) { return (code >= 200 && code < 400) ? "ok" : "bad" }
+
+  readonly property var rows: {
+    var out = [], v = root.vpn, z = root.zap, t = root.tg, b = root.bot
+
+    if (v.running) {
+      out.push({ name: "VPN", state: "ok",
+        detail: (v.profile || "") + " · " + (v.mode === "tun" ? "TUN" : "SOCKS") + " · " + root.fmtUptime(v.uptime) })
+    } else {
+      out.push({ name: "VPN", state: (v.installed === false ? "bad" : "warn"),
+        detail: (v.installed === false ? "не установлен" : "выключен") })
+    }
+
+    var zState = "warn", zDetail = "нет данных"
+    if (z.service === "active") {
+      if (z.mode === "vpn") { zState = "warn"; zDetail = "обход не сработал → через VPN" }
+      else if (z.mode === "off") { zState = "ok"; zDetail = "сеть чистая, обход не нужен" }
+      else if (z.mode === "custom") { zState = "ok"; zDetail = "кастомная стратегия" }
+      else if (z.mode !== "" && z.mode !== undefined) { zState = "ok"; zDetail = "стратегия #" + z.mode }
+      else { zState = "warn"; zDetail = "режим неизвестен" }
+    } else { zState = "warn"; zDetail = "служба выключена" }
+    out.push({ name: "zapret (DPI)", state: zState, detail: zDetail + (z.network ? " · " + z.network : "") })
+
+    out.push({ name: "tg-ws-proxy", state: t.listening ? "ok" : "bad",
+      detail: t.listening ? ("порт " + t.port + ", работает") : "не слушает" })
+
+    out.push({ name: "Telegram-бот", state: b.active ? "ok" : "bad",
+      detail: b.active ? "работает" : (b.state || "неизвестно") })
+
+    if (root.chk) {
+      out.push({ name: "Яндекс", state: root.codeState(root.chk.yandex), detail: "HTTP " + root.chk.yandex })
+      out.push({ name: "Telegram API", state: root.codeState(root.chk.telegram_api), detail: "HTTP " + root.chk.telegram_api })
+      out.push({ name: "YouTube", state: root.codeState(root.chk.youtube), detail: "HTTP " + root.chk.youtube })
+    }
+    return out
+  }
+
+  readonly property bool anyBad: {
+    var r = root.rows
+    for (var i = 0; i < r.length; i++) if (r[i].state === "bad") return true
+    return false
+  }
+  readonly property bool anyWarn: {
+    var r = root.rows
+    for (var i = 0; i < r.length; i++) if (r[i].state === "warn") return true
+    return false
+  }
+  readonly property color healthColor: root.anyBad ? root.urgent : (root.anyWarn ? root.warn : Color.accent)
+  readonly property string summary:
+    "VPN " + (root.vpnOn ? "вкл" : "выкл")
+    + " · zapret " + (root.zap.mode === "vpn" ? "через VPN" : (root.zap.service === "active" ? "вкл" : "выкл"))
+    + " · TG " + (root.tg.listening ? "ок" : "нет")
+    + " · бот " + (root.bot.active ? "ок" : "нет")
+
+  // ---- actions ------------------------------------------------------------
+  function run(args, label) {
+    if (actionProc.running || root.cliPath === "") return
+    root.busy = label || "…"
+    actionProc.command = [root.cliPath, "--json"].concat(args)
+    actionProc.running = true
+  }
+
+  onOpenedChanged: if (opened && !statusProc.running) statusProc.running = true
+
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  IpcHandler {
+    target: root.ipcTarget
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+  }
+
+  Process {
+    id: statusProc
+    command: [root.scriptPath, "--json"]
+    stdout: StdioCollector { id: statusOut; waitForEnd: true }
+    onExited: function(code) {
+      if (code !== 0) return
+      try {
+        var d = JSON.parse(statusOut.text)
+        if (d && d.ok) { root.bs = d; root.lastError = "" }
+      } catch (e) { /* неполный вывод */ }
+    }
+  }
+
+  Process {
+    id: checkProc
+    command: [root.scriptPath, "--check"]
+    stdout: StdioCollector { id: checkOut; waitForEnd: true }
+    onExited: function(code) {
+      root.busy = ""
+      if (code !== 0) { root.lastError = "проверка не удалась"; return }
+      try {
+        var d = JSON.parse(checkOut.text)
+        if (d && d.ok) root.bs = d
+      } catch (e) { root.lastError = "нет ответа от bypass-status" }
+    }
+  }
+
+  Process {
+    id: actionProc
+    stdout: StdioCollector { id: actionOut; waitForEnd: true }
+    stderr: StdioCollector { id: actionErr; waitForEnd: true }
+    onExited: function(code) {
+      root.busy = ""
+      if (code !== 0) {
+        var t = (actionErr.text || actionOut.text || "").trim()
+        try { var j = JSON.parse(t); if (j.error) t = j.error } catch (e) { /* plain */ }
+        root.lastError = t || "ошибка"
+      } else { root.lastError = "" }
+      if (!statusProc.running) statusProc.running = true
+    }
+  }
+
+  Timer {
+    interval: 4000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: if (!statusProc.running) statusProc.running = true
+  }
+
+  // ---- bar button ---------------------------------------------------------
+  BarIconButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    text: "\uf132"
+    active: true
+    activeColor: root.healthColor
+    tooltipText: "Обходы: " + root.summary
+    onPressed: function(buttonCode) { root.toggle() }
+  }
+
+  // ---- popup --------------------------------------------------------------
+  KeyboardPanel {
+    id: panel
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(400))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      onCloseRequested: root.close()
+    }
+
+    Flickable {
+      id: panelFlick
+      anchors.fill: parent
+      contentWidth: width
+      contentHeight: column.implicitHeight
+      clip: true
+      boundsBehavior: Flickable.StopAtBounds
+      flickableDirection: Flickable.VerticalFlick
+      interactive: contentHeight > height
+      ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+      Column {
+        id: column
+        width: panelFlick.width
+        spacing: Style.space(12)
+
+        PanelHero {
+          width: parent.width
+          title: "Обходы"
+          meta: root.summary
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+
+          iconComponent: Component {
+            Text {
+              text: "\uf132"
+              color: root.healthColor
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display
+            }
+          }
+        }
+
+        Text {
+          width: parent.width
+          visible: root.lastError !== ""
+          textFormat: Text.PlainText
+          text: root.lastError
+          color: root.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
+
+          Repeater {
+            model: root.rows
+
+            Rectangle {
+              id: srow
+              required property var modelData
+              width: column.width
+              implicitHeight: scol.implicitHeight + Style.space(12)
+              radius: Style.cornerRadius > 0 ? Style.space(8) : 0
+              color: "transparent"
+
+              Column {
+                id: scol
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(10)
+                spacing: Style.space(1)
+
+                Row {
+                  spacing: Style.space(8)
+                  Rectangle {
+                    width: Style.space(8)
+                    height: width
+                    radius: width / 2
+                    anchors.verticalCenter: parent.verticalCenter
+                    color: srow.modelData.state === "ok" ? Color.accent
+                         : (srow.modelData.state === "warn" ? root.warn : root.urgent)
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: srow.modelData.name
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                  }
+                }
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: srow.modelData.detail
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+            }
+          }
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        Flow {
+          width: parent.width
+          spacing: Style.space(8)
+
+          Rectangle {
+            id: refreshBtn
+            implicitWidth: refreshTxt.implicitWidth + Style.space(20)
+            implicitHeight: refreshTxt.implicitHeight + Style.space(12)
+            radius: Style.cornerRadius > 0 ? Style.space(8) : 0
+            color: rmouse.containsMouse ? root.hoverFill
+                   : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+            border.width: 1
+            border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+
+            Text {
+              id: refreshTxt
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: "Обновить"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            MouseArea {
+              id: rmouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: if (!statusProc.running) statusProc.running = true
+            }
+          }
+
+          Rectangle {
+            id: checkBtn
+            implicitWidth: checkTxt.implicitWidth + Style.space(20)
+            implicitHeight: checkTxt.implicitHeight + Style.space(12)
+            radius: Style.cornerRadius > 0 ? Style.space(8) : 0
+            color: cmouse.containsMouse ? root.hoverFill
+                   : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+            border.width: 1
+            border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+
+            Text {
+              id: checkTxt
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: root.busy === "check" ? "…" : "Проверить доступность"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            MouseArea {
+              id: cmouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                if (checkProc.running) return
+                root.busy = "check"
+                checkProc.running = true
+              }
+            }
+          }
+
+          Rectangle {
+            id: vpnBtn
+            implicitWidth: vpnTxt.implicitWidth + Style.space(20)
+            implicitHeight: vpnTxt.implicitHeight + Style.space(12)
+            radius: Style.cornerRadius > 0 ? Style.space(8) : 0
+            opacity: root.cliPath !== "" ? 1.0 : 0.4
+            color: vmouse.containsMouse && root.cliPath !== "" ? root.hoverFill
+                   : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+            border.width: 1
+            border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+
+            Text {
+              id: vpnTxt
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: root.vpnOn ? "VPN: выключить" : "VPN: включить"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            MouseArea {
+              id: vmouse
+              anchors.fill: parent
+              enabled: root.cliPath !== ""
+              hoverEnabled: true
+              cursorShape: root.cliPath !== "" ? Qt.PointingHandCursor : Qt.ArrowCursor
+              onClicked: root.run(["toggle"], "vpn")
+            }
+          }
+        }
+      }
+    }
+  }
+}

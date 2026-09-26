@@ -80,7 +80,9 @@
 | Компонент | Роль | Расположение |
 |---|---|---|
 | `omavpn` (CLI) | управление VPN | `~/.local/bin/omavpn` |
-| `shell-plugin/omavpn` | виджет панели Omarchy | `~/.config/omarchy/plugins/omavpn` |
+| `shell-plugin/omavpn` | виджет управления VPN в панели Omarchy | `~/.config/omarchy/plugins/io.github.blazeeers.omavpn` |
+| `bin/bypass-status` | агрегатор статуса всех обходов (JSON) | `~/.local/bin/bypass-status` |
+| `shell-plugin/bypass-status` | виджет «Обходы» — статусы всего | `~/.config/omarchy/plugins/io.github.blazeeers.bypass-status` |
 | `zapret/*` | DPI-обход и автотюн | `/usr/local/bin`, `/opt/zapret`, `/etc`, `/var/lib` |
 | `tgwsproxy/install.sh` | установка tg-ws-proxy | `~/.local/bin/tg-ws-proxy` |
 
@@ -233,6 +235,39 @@ omavpn status --json | python3 -m json.tool | head -30
 Автоподключение при входе — тумблер «Подключаться при входе» в настройках
 виджета панели (`autoconnect`).
 
+### Виджет «Обходы» (Bypass Status)
+
+Отдельный виджет в панели показывает статус **всех** обходов сразу:
+
+- **VPN** — включён/выключен, профиль, режим (TUN/SOCKS), uptime;
+- **zapret (DPI)** — активна ли служба и что выбрано для текущей сети
+  (сеть чистая / стратегия #N / кастомная / «через VPN»);
+- **tg-ws-proxy** — слушает ли порт 1443;
+- **Telegram-бот** — активен ли user-сервис;
+- по кнопке **«Проверить доступность»** — HTTP-коды Яндекс / Telegram API / YouTube.
+
+Цвет щита в панели: зелёный — всё хорошо, янтарный — предупреждение (например,
+обход ушёл в VPN), красный — что-то не работает. Данные берёт из
+`bypass-status --json` (обновление раз в 4 с). Скрипт понимает и `omavpn`, и
+`wowvpn` — CLI определяется автоматически.
+
+Установка отдельно:
+
+```bash
+install -m 0755 bin/bypass-status ~/.local/bin/bypass-status
+ID=io.github.blazeeers.bypass-status
+mkdir -p ~/.config/omarchy/plugins/$ID
+cp shell-plugin/bypass-status/manifest.json shell-plugin/bypass-status/Panel.qml ~/.config/omarchy/plugins/$ID/
+omarchy-shell shell rescanPlugins
+omarchy plugin enable $ID
+omarchy bar move $ID --section right
+omarchy restart shell
+```
+
+> Для маркетплейса в одном репозитории публикуется один плагин (манифест в корне —
+> это `omavpn`). Виджет статусов — второй, локальный; для публикации ему нужен
+> отдельный репозиторий.
+
 ### zapret-autotune
 
 ```bash
@@ -278,7 +313,10 @@ sudo bash zapret/zapret-blockcheck.sh standard
 | `~/.config/autostart/tg-ws-proxy.desktop` | автозапуск tg-ws-proxy |
 | `manifest.json` (корень репозитория) | манифест плагина (id `io.github.blazeeers.omavpn`) |
 | `shell-plugin/omavpn/Panel.qml` | QML-виджет панели |
-| `~/.config/omarchy/plugins/io.github.blazeeers.omavpn/` | установленный плагин |
+| `~/.config/omarchy/plugins/io.github.blazeeers.omavpn/` | установленный плагин VPN |
+| `~/.local/bin/bypass-status` | агрегатор статусов обходов (JSON) |
+| `shell-plugin/bypass-status/` | QML виджета «Обходы» |
+| `~/.config/omarchy/plugins/io.github.blazeeers.bypass-status/` | установленный виджет «Обходы» |
 
 ---
 
