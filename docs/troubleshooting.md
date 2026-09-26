@@ -2,6 +2,10 @@
 
 ## Быстрая проверка «всё ли живо»
 
+Самый быстрый способ — **виджет «Обходы»** в панели (иконка-щит, справа): цвет
+щита и список показывают состояние VPN, zapret, tg-ws-proxy и бота; кнопка
+«Проверить доступность» прогоняет живые запросы. Ниже — то же самое из терминала.
+
 ```bash
 systemctl is-active zapret.service zapret-autotune.timer
 omavpn status --json | python3 -m json.tool | head

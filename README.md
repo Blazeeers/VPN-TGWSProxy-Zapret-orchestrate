@@ -326,6 +326,7 @@ sudo bash zapret/zapret-blockcheck.sh standard
 - [docs/zapret.md](docs/zapret.md) — DPI-обход: конфиг, стратегии, автотюн, blockcheck.
 - [docs/telegram.md](docs/telegram.md) — Telegram Desktop, tg-ws-proxy и бот.
 - [docs/troubleshooting.md](docs/troubleshooting.md) — что делать, если что-то отвалилось.
+- [CHANGELOG.md](CHANGELOG.md) — история изменений по версиям.
 
 ---
 
