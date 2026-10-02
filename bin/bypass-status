@@ -160,6 +160,7 @@ def live_checks() -> dict:
         "yandex": code("https://yandex.ru/"),
         "telegram_api": code("https://api.telegram.org/"),
         "youtube": code("https://www.youtube.com/"),
+        "discord": code("https://discord.com/"),
     }
 
 

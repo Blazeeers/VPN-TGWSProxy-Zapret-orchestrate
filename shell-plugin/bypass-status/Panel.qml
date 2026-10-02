@@ -54,13 +54,12 @@ Panel {
     }
 
     var zState = "warn", zDetail = "нет данных"
-    if (z.service === "active") {
-      if (z.mode === "vpn") { zState = "warn"; zDetail = "обход не сработал → через VPN" }
-      else if (z.mode === "off") { zState = "ok"; zDetail = "сеть чистая, обход не нужен" }
-      else if (z.mode === "custom") { zState = "ok"; zDetail = "кастомная стратегия" }
-      else if (z.mode !== "" && z.mode !== undefined) { zState = "ok"; zDetail = "стратегия #" + z.mode }
-      else { zState = "warn"; zDetail = "режим неизвестен" }
-    } else { zState = "warn"; zDetail = "служба выключена" }
+    if (z.mode === "vpn") { zState = "warn"; zDetail = "обход не сработал → через VPN" }
+    else if (z.mode === "off") { zState = "ok"; zDetail = "сеть чистая, обход не нужен" }
+    else if (z.service !== "active") { zState = "warn"; zDetail = "служба выключена" }
+    else if (z.mode === "custom") { zState = "ok"; zDetail = "кастомная стратегия" }
+    else if (z.mode !== "" && z.mode !== undefined) { zState = "ok"; zDetail = "стратегия #" + z.mode }
+    else { zState = "warn"; zDetail = "режим неизвестен" }
     out.push({ name: "zapret (DPI)", state: zState, detail: zDetail + (z.network ? " · " + z.network : "") })
 
     out.push({ name: "tg-ws-proxy", state: t.listening ? "ok" : "bad",
@@ -73,6 +72,7 @@ Panel {
       out.push({ name: "Яндекс", state: root.codeState(root.chk.yandex), detail: "HTTP " + root.chk.yandex })
       out.push({ name: "Telegram API", state: root.codeState(root.chk.telegram_api), detail: "HTTP " + root.chk.telegram_api })
       out.push({ name: "YouTube", state: root.codeState(root.chk.youtube), detail: "HTTP " + root.chk.youtube })
+      out.push({ name: "Discord", state: root.codeState(root.chk.discord), detail: "HTTP " + root.chk.discord })
     }
     return out
   }

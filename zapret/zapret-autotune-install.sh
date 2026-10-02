@@ -89,8 +89,27 @@ esac
 EOF
 chmod 755 /etc/NetworkManager/dispatcher.d/90-zapret-autotune
 
+echo "==> routefix: маршрутизация пакетов zapret мимо policy-routing VPN"
+install -Dm755 "$HERE/zapret-routefix.sh" /usr/local/bin/zapret-routefix
+cat > /etc/systemd/system/zapret-routefix.service <<'EOF'
+[Unit]
+Description=Route zapret desync packets past VPN policy routing
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/zapret-routefix apply
+ExecStop=/usr/local/bin/zapret-routefix clear
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 systemctl enable --now zapret-autotune.timer
+systemctl enable --now zapret-routefix.service
 
 cat <<EOF
 

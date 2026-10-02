@@ -144,6 +144,27 @@ sudo bash zapret/zapret-blockcheck.sh standard   # или quick
 Лог: `/var/log/zapret-blockcheck.log`. Если стратегия не найдена — значит в этой
 сети obход zapret невозможен и правильный режим — `vpn`.
 
+## Связка VPN + zapret (маршрутизация пакетов nfqws)
+
+wowvpn в режиме TUN ставит policy-routing: `ip rule 9001: from all lookup 2022`,
+где таблица 2022 — `default dev wowvpn0`. Из-за этого пакеты, которые nfqws
+дополнительно инжектирует при десинхронизации (метки `0x40000000` и
+`0x20000000`), тоже уходят в туннель — провайдерский DPI их не видит, и обход
+**не срабатывает**, хотя стратегия рабочая (YouTube/Discord не открываются).
+
+Лечится скриптом `zapret-routefix.sh` (сервис `zapret-routefix.service`,
+включается установщиком автотюна): он добавляет правила с приоритетом **8990**
+(до правил wowvpn 9000+):
+
+```
+ip rule add fwmark 0x40000000/0x40000000 lookup main priority 8990
+ip rule add fwmark 0x20000000/0x20000000 lookup main priority 8990
+```
+
+Так инжектируемые пакеты уходят через физический интерфейс. Без VPN правила
+безвредны (main и так смотрит на WAN). Проверка: `systemctl status
+zapret-routefix.service`, `ip rule show | grep 8990`.
+
 ## Логи и диагностика
 
 ```bash
