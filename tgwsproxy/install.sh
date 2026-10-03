@@ -4,9 +4,12 @@
 set -euo pipefail
 
 REPO="Flowseal/tg-ws-proxy"
+VERSION="${TGWSPROXY_VERSION:-1.10.4}"
 ASSET="TgWsProxy_linux_amd64"
-URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
-ICON_URL="https://raw.githubusercontent.com/${REPO}/main/icon.ico"
+URL="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET}"
+SHA256="${TGWSPROXY_SHA256:-818ce6c3c49b0e07f1ab689586adf3a23ec5106fd4f947848f7d8145f8ba2676}"
+ICON_URL="https://raw.githubusercontent.com/${REPO}/v${VERSION}/icon.ico"
+ICON_SHA256="${TGWSPROXY_ICON_SHA256:-4b3108858a414b35d0a6fde2e304fb7ae18e5b2831e69e9e492cfdb1b048009d}"
 
 HOME_DIR="${HOME:?}"
 BIN="$HOME_DIR/.local/bin/tg-ws-proxy"
@@ -18,7 +21,23 @@ CONF="$HOME_DIR/.config/TgWsProxy/config.json"
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 
-for tool in curl; do
+verify_sha256() { # $1 — файл, $2 — ожидаемый sha256, $3 — имя
+  if [ -z "$2" ]; then
+    echo "Нет sha256 для $3. Задай TGWSPROXY_SHA256/TGWSPROXY_ICON_SHA256 и повтори."
+    exit 1
+  fi
+  local got
+  got="$(sha256sum "$1" | awk '{print $1}')"
+  if [ "$got" != "$2" ]; then
+    echo "ОШИБКА: sha256 не совпал для $3"
+    echo "  ожидалось: $2"
+    echo "  получено:  $got"
+    exit 1
+  fi
+  say "sha256 $3 — ок"
+}
+
+for tool in curl sha256sum; do
   command -v "$tool" >/dev/null || { echo "Нужен '$tool' в PATH"; exit 1; }
 done
 
@@ -30,6 +49,7 @@ else
   say "Скачиваю tg-ws-proxy ($URL)"
   TMP="$(mktemp)"
   curl -fL --retry 3 -o "$TMP" "$URL"
+  verify_sha256 "$TMP" "$SHA256" "TgWsProxy_linux_amd64"
   install -Dm755 "$TMP" "$BIN"
   rm -f "$TMP"
 fi
@@ -39,6 +59,7 @@ if command -v magick >/dev/null || command -v convert >/dev/null; then
   mkdir -p "$ICON_DIR"
   TMPICO="$(mktemp --suffix=.ico)"
   if curl -fsSL -o "$TMPICO" "$ICON_URL"; then
+    verify_sha256 "$TMPICO" "$ICON_SHA256" "icon.ico"
     (magick "$TMPICO[5]" -background none -alpha on "$ICON_DIR/tg-ws-proxy.png" 2>/dev/null \
       || convert "$TMPICO[5]" -background none -alpha on "$ICON_DIR/tg-ws-proxy.png") || warn "не удалось сконвертировать иконку"
   fi

@@ -413,6 +413,16 @@ qmllint -I "$OMARCHY_PATH/shell" "$PLUGIN_DIR/Panel.qml"
 - В репозитории **нет** URL подписки и ключей. URL берётся из
   `~/.config/omavpn/subscription` (режим 600) или `OMAVPN_SUB_URL`.
 - `secret` tg-ws-proxy генерируется локально в `~/.config/TgWsProxy/config.json`.
+- **Артефакты пиннингуются и проверяются по sha256** до запуска/выдачи
+  capabilities: Xray, sing-box (`install.sh`) и tg-ws-proxy
+  (`tgwsproxy/install.sh`). Версии и хеши задаются переменными в начале скриптов
+  (`XRAY_VER`/`XRAY_SHA256`, `SB_VER`/`SB_SHA256`,
+  `TGWSPROXY_VERSION`/`TGWSPROXY_SHA256`).
+- Секретные данные (`~/.cache/omavpn/sub.json`, `~/.local/state/omavpn/*.json`,
+  логи, pid) создаются с правами **0600**, каталоги конфига/состояния/кэша —
+  **0700**; CLI работает с `umask 077`.
+- Автотюн пишет пользовательский `direct_domains.txt` **от имени пользователя**
+  (`runuser`), не следуя root'ом по симлинкам и не меняя владельца цели.
 - zapret/автотюн работают от root, но не хранят секретов; `nfqws` запускается
   с понижением привилегий (`--user=zapret`).
 - Скрипты автотюна, устанавливаемые в `/usr/local/bin`, принадлежат root —

@@ -11,18 +11,34 @@ LOCAL_BIN="$HOME_DIR/.local/bin"
 PLUGIN_ID="io.github.blazeeers.omavpn"
 PLUGIN_DIR="$HOME_DIR/.config/omarchy/plugins/$PLUGIN_ID"
 
-XRAY_VER="${XRAY_VER:-latest}"
+XRAY_VER="${XRAY_VER:-26.3.27}"
 SB_VER="${SB_VER:-1.14.1}"
-XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-if [ "$XRAY_VER" != "latest" ]; then
-  XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/Xray-linux-64.zip"
-fi
+# sha256 закреплённых артефактов. При смене версии задай и соответствующий хеш.
+XRAY_SHA256="${XRAY_SHA256:-23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae}"
+SB_SHA256="${SB_SHA256:-12cb2816b52febb356f6a885b740cc8758c3f30b8ae0ca8edba80f0d2d35343f}"
+XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/Xray-linux-64.zip"
 SB_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz"
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 
-for tool in curl python3 tar; do
+verify_sha256() { # $1 — файл, $2 — ожидаемый sha256, $3 — имя
+  if [ -z "$2" ]; then
+    echo "Нет sha256 для $3. Задай XRAY_SHA256/SB_SHA256 для своей версии и повтори."
+    exit 1
+  fi
+  local got
+  got="$(sha256sum "$1" | awk '{print $1}')"
+  if [ "$got" != "$2" ]; then
+    echo "ОШИБКА: sha256 не совпал для $3"
+    echo "  ожидалось: $2"
+    echo "  получено:  $got"
+    exit 1
+  fi
+  say "sha256 $3 — ок"
+}
+
+for tool in curl python3 tar sha256sum; do
   command -v "$tool" >/dev/null || { echo "Нужен '$tool' в PATH"; exit 1; }
 done
 
@@ -35,6 +51,7 @@ else
   say "Скачиваю Xray…"
   TMP="$(mktemp -d)"
   curl -fL --retry 3 -o "$TMP/xray.zip" "$XRAY_URL"
+  verify_sha256 "$TMP/xray.zip" "$XRAY_SHA256" "Xray-linux-64.zip"
   python3 - "$TMP/xray.zip" "$BIN_DIR" <<'PY'
 import sys, zipfile, os, stat
 zf = zipfile.ZipFile(sys.argv[1])
@@ -59,6 +76,7 @@ else
   say "Скачиваю sing-box…"
   TMP="$(mktemp -d)"
   curl -fL --retry 3 -o "$TMP/sb.tar.gz" "$SB_URL"
+  verify_sha256 "$TMP/sb.tar.gz" "$SB_SHA256" "sing-box-${SB_VER}-linux-amd64.tar.gz"
   tar -xzf "$TMP/sb.tar.gz" -C "$TMP"
   found="$(find "$TMP" -type f -name sing-box | head -1)"
   [ -n "$found" ] || { echo "sing-box не найден в архиве"; exit 1; }

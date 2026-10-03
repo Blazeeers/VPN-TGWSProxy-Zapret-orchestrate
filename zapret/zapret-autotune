@@ -185,13 +185,24 @@ print("\n".join(m.DEFAULT_DIRECT_DOMAINS))
 PY
 }
 
+# Запись в файл пользователя выполняется от его UID (runuser): root не должен
+# следовать по пользовательской симлинк-ссылке и менять владельца её цели.
+user_write() { # stdin -> файл $1, от имени $USER_NAME
+  [ -n "$USER_NAME" ] || return 1
+  runuser -u "$USER_NAME" -- tee "$1" >/dev/null
+}
+user_remove() {
+  [ -n "$USER_NAME" ] || return 0
+  runuser -u "$USER_NAME" -- rm -f -- "$1" 2>/dev/null || true
+}
+
 # ensure_direct <содержимое>; ставит DIRECT_CHANGED
 ensure_direct() {
   local content="$1" cur=""
-  [ -f "$DIRECT_FILE" ] && cur="$(cat "$DIRECT_FILE" 2>/dev/null)"
+  [ -n "$USER_NAME" ] || return 0
+  cur="$(runuser -u "$USER_NAME" -- cat "$DIRECT_FILE" 2>/dev/null)"
   if [ "$cur" = "$content" ]; then DIRECT_CHANGED=0; return 0; fi
-  printf '%s\n' "$content" > "$DIRECT_FILE"
-  chown "$USER_NAME" "$DIRECT_FILE" 2>/dev/null || true
+  printf '%s\n' "$content" | user_write "$DIRECT_FILE"
   DIRECT_CHANGED=1
 }
 ensure_direct_all() {
@@ -199,7 +210,7 @@ ensure_direct_all() {
   if [ -n "$content" ]; then
     ensure_direct "$content"
   elif [ -f "$DIRECT_FILE" ]; then
-    rm -f "$DIRECT_FILE"; DIRECT_CHANGED=1
+    user_remove "$DIRECT_FILE"; DIRECT_CHANGED=1
   else
     DIRECT_CHANGED=0
   fi

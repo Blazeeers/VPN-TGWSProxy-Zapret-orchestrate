@@ -4,6 +4,19 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.1.1] — 2026-10-04
+
+### Security
+- `install.sh` и `tgwsproxy/install.sh`: версии артефактов закреплены (pin),
+  добавлена проверка **sha256** до запуска и выдачи capabilities
+  (Xray 26.3.27, sing-box 1.14.1, tg-ws-proxy 1.10.4).
+- `bin/omavpn`: секретные файлы (кэш подписки `sub.json`, сгенерированный
+  `xray.json`, логи, pid) создаются с правами `0600`, каталоги
+  `~/.config|state|cache` — `0700`; CLI работает с `umask 077`.
+- `zapret/zapret-autotune`: запись пользовательского `direct_domains.txt`
+  выполняется от имени пользователя (`runuser`) — root не следует по
+  пользовательским симлинкам и не меняет владельца цели.
+
 ## [1.1.0] — 2026-09-26
 
 ### Added
@@ -44,5 +57,6 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[1.1.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/releases/tag/v1.0.0

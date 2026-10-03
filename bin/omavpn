@@ -141,6 +141,9 @@ DEFAULT_SETTINGS = {
 def ensure_dirs() -> None:
     for d in (BIN, CONF, STATE, CACHE):
         d.mkdir(parents=True, exist_ok=True)
+    os.chmod(BIN, 0o755)
+    for d in (CONF, STATE, CACHE):
+        os.chmod(d, 0o700)
 
 
 def load_json(path: Path, default):
@@ -153,8 +156,11 @@ def load_json(path: Path, default):
 def save_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, ensure_ascii=False, indent=2))
     os.replace(tmp, path)
+    os.chmod(path, 0o600)
 
 
 def settings() -> dict:
@@ -679,7 +685,9 @@ def process_alive(pidfile: Path, marker: str) -> bool:
 
 def spawn(cmd: list, logfile: Path, pidfile: Path) -> int:
     logfile.parent.mkdir(parents=True, exist_ok=True)
-    log = open(logfile, "ab", buffering=0)
+    fd = os.open(logfile, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.chmod(logfile, 0o600)
+    log = os.fdopen(fd, "ab", buffering=0)
     log.write(f"\n===== {time.strftime('%F %T')} {' '.join(cmd)} =====\n".encode())
     proc = subprocess.Popen(
         cmd,
@@ -690,6 +698,7 @@ def spawn(cmd: list, logfile: Path, pidfile: Path) -> int:
         start_new_session=True,
     )
     pidfile.write_text(str(proc.pid))
+    os.chmod(pidfile, 0o600)
     return proc.pid
 
 
@@ -921,6 +930,7 @@ def emit(data, human: str = "") -> None:
 
 def main(argv: list) -> int:
     global JSON_OUT
+    os.umask(0o077)  # приватные каталоги/файлы состояния и кэша по умолчанию
     p = argparse.ArgumentParser(prog="omavpn", description="Xray + TUN клиент для Omarchy")
     p.add_argument("--json", action="store_true", help="вывод в JSON")
     sub = p.add_subparsers(dest="cmd")
