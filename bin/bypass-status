@@ -111,6 +111,13 @@ def autotune_retry_seconds() -> int:
     return 1800
 
 
+def _cache_text(key: str, suffix: str) -> str:
+    try:
+        return open(os.path.join(AUTOTUNE_DIR, f"{key}.{suffix}"), encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+
+
 def probe_state() -> dict:
     """Состояние фонового подбора (пишет zapret-autotune во время сканирования)."""
     path = os.path.join(AUTOTUNE_DIR, "probe.json")
@@ -153,6 +160,8 @@ def zapret_status(iface: str) -> dict:
         last = 0
     st["retry_seconds"] = retry
     st["retry_in"] = max(0, retry - (int(time.time()) - last)) if last else 0
+    st["services"] = _cache_text(key, "services")
+    st["direct"] = _cache_text(key, "direct")
     return st
 
 

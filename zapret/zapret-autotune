@@ -169,6 +169,8 @@ probe_ok_url() {
   return 1
 }
 probe_test_targets() { probe_ok_url https://www.youtube.com/ && probe_ok_url https://discord.com/; }
+probe_youtube_direct() { probe_ok_url https://www.youtube.com/; }
+probe_discord_direct() { probe_ok_url https://discord.com/; }
 probe_show_ips() {
   local host_ip probe_ip
   host_ip="$(curl -s --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p')"
@@ -210,11 +212,18 @@ mark_scan() { # $1 ключ сети
 }
 
 # --- zapret -----------------------------------------------------------------
-build_opt() {
+hosts_for() { # $1 сервисы -> "--hostlist=... --hostlist=..."
+  local h=""
+  case "$1" in *youtube*) h="$h --hostlist=$GOOGLE" ;; esac
+  case "$1" in *discord*) h="$h --hostlist=$ULIST" ;; esac
+  printf '%s' "$h"
+}
+build_opt() { # $1 кандидат, $2 сервисы ("youtube discord" | "youtube" | "discord")
+  local h; h="$(hosts_for "$2")"
   cat <<EOF
---filter-tcp=443 --hostlist=$GOOGLE --hostlist=$ULIST $1 --new
---filter-tcp=80 --dpi-desync=fake,multisplit --dpi-desync-split-pos=method+2 --dpi-desync-fooling=md5sig --hostlist=$GOOGLE --hostlist=$ULIST --new
---filter-udp=443 --hostlist=$GOOGLE --hostlist=$ULIST --dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fake-quic=$F/quic_initial_www_google_com.bin
+--filter-tcp=443 $h $1 --new
+--filter-tcp=80 --dpi-desync=fake,multisplit --dpi-desync-split-pos=method+2 --dpi-desync-fooling=md5sig $h --new
+--filter-udp=443 $h --dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fake-quic=$F/quic_initial_www_google_com.bin
 EOF
 }
 
@@ -300,6 +309,32 @@ ensure_direct_all() {
 }
 ensure_direct_min() { ensure_direct "max.ru"; }
 
+# Какие сервисы выводим напрямую: "youtube" и/или "discord".
+direct_domains_for() {
+  local out="max.ru"
+  case "$1" in *youtube*) out="$out
+$(cat "$GOOGLE" 2>/dev/null)";; esac
+  case "$1" in *discord*) out="$out
+$(cat "$ULIST" 2>/dev/null)";; esac
+  printf '%s\n' "$out"
+}
+set_direct() { ensure_direct "$(direct_domains_for "$1")"; }
+
+# Кэш: стратегия + какие сервисы обрабатывает zapret + какие идут напрямую.
+cache_set() { # $1 ключ, $2 стратегия, $3 сервисы zapret, $4 сервисы напрямую
+  printf '%s\n' "$2" > "$CACHE/$1.strategy"
+  printf '%s\n' "$3" > "$CACHE/$1.services"
+  printf '%s\n' "$4" > "$CACHE/$1.direct"
+  chmod 644 "$CACHE/$1.strategy" "$CACHE/$1.services" "$CACHE/$1.direct" 2>/dev/null || true
+}
+cache_services() { cat "$CACHE/$1.services" 2>/dev/null || echo "youtube discord"; }
+cache_direct() {
+  local f="$CACHE/$1.direct"
+  if [ -f "$f" ]; then cat "$f"
+  elif [ "$(cat "$CACHE/$1.strategy" 2>/dev/null)" = "vpn" ]; then echo ""
+  else echo "youtube discord"; fi
+}
+
 omavpn_running() {
   [ -n "$USER_NAME" ] && [ -x "$OMAVPN" ] || return 1
   runuser -u "$USER_NAME" -- env HOME="$USER_HOME" XDG_RUNTIME_DIR="/run/user/$UID_N" \
@@ -365,20 +400,8 @@ STRATEGIES=(
   "--dpi-desync=multidisorder --dpi-desync-split-pos=1 --dpi-desync-fooling=badseq"
 )
 
-apply_strategy_index() { # $1 = индекс; return 0 если target'ы открываются
-  local i="$1"
-  ensure_direct_all
-  apply_direct_change
-  if set_opt "$(build_opt "${STRATEGIES[$i]}")"; then
-    activate
-  else
-    ensure_zapret_on
-  fi
-  test_targets
-}
-
 run_scan() {
-  local key="$1" cf="$2" i use_probe=0 total="${#STRATEGIES[@]}"
+  local key="$1" cf="$2" i use_probe=0 total="${#STRATEGIES[@]}" yt_ok=0 dc_ok=0 winner="" direct=""
   probe_state_clear
 
   if probe_setup; then
@@ -389,7 +412,7 @@ run_scan() {
   fi
 
   # На время подбора держим сервисы в VPN, чтобы не ломать интернет.
-  ensure_direct_min
+  set_direct ""
   apply_direct_change
   ensure_vpn
   sleep 1
@@ -397,29 +420,59 @@ run_scan() {
   if [ "$use_probe" = 1 ]; then
     probe_state_write 0 0 "проверка сети" 1 ""
     zapret_off
-    if probe_test_targets; then
-      log "сеть чистая: без обхода всё открывается -> zapret выключен"
-      printf 'off\n' > "$cf"
-      ensure_direct_all; apply_direct_change; probe_teardown; probe_state_clear
+    probe_youtube_direct && yt_ok=1
+    probe_discord_direct && dc_ok=1
+    log "прямая проверка: youtube=$yt_ok discord=$dc_ok"
+
+    if [ "$yt_ok" = 1 ] && [ "$dc_ok" = 1 ]; then
+      log "сеть чистая: youtube и discord открываются напрямую -> zapret выключен"
+      cache_set "$key" off "" "youtube discord"
+      set_direct "youtube discord"; apply_direct_change; probe_teardown; probe_state_clear
+      return 0
+    fi
+
+    if [ "$yt_ok" = 1 ]; then
+      log "youtube работает напрямую; zapret нужен только для discord"
+      set_direct "youtube"; apply_direct_change
+      for i in "${!STRATEGIES[@]}"; do
+        log "пробую[$i] (только discord): ${STRATEGIES[$i]}"
+        probe_state_write "$i" "$total" "${STRATEGIES[$i]}" 1 ""
+        if set_opt "$(build_opt "${STRATEGIES[$i]}" discord)"; then activate; else ensure_zapret_on; fi
+        if probe_discord_direct; then winner="$i"; break; fi
+      done
+      if [ -n "$winner" ]; then
+        log "стратегия для discord найдена: индекс $winner"
+        cache_set "$key" "$winner" discord "youtube discord"
+        set_direct "youtube discord"; apply_direct_change
+      else
+        log "для discord стратегия не найдена -> discord через VPN, youtube напрямую"
+        zapret_off
+        cache_set "$key" vpn "" "youtube"
+        set_direct "youtube"; apply_direct_change
+      fi
+      probe_teardown; probe_state_clear
       return 0
     fi
 
     for i in "${!STRATEGIES[@]}"; do
       log "пробую[$i]: ${STRATEGIES[$i]}"
       probe_state_write "$i" "$total" "${STRATEGIES[$i]}" 1 ""
-      if set_opt "$(build_opt "${STRATEGIES[$i]}")"; then activate; else ensure_zapret_on; fi
-      if probe_test_targets; then
-        log "рабочая стратегия найдена: индекс $i (${STRATEGIES[$i]})"
-        printf '%s\n' "$i" > "$cf"
-        ensure_direct_all; apply_direct_change; probe_teardown; probe_state_clear
-        return 0
-      fi
+      if set_opt "$(build_opt "${STRATEGIES[$i]}" "youtube discord")"; then activate; else ensure_zapret_on; fi
+      if probe_youtube_direct && probe_discord_direct; then winner="$i"; break; fi
     done
-
-    log "ни одна стратегия не сработала -> Discord/YouTube через VPN"
-    zapret_off
-    ensure_direct_min; apply_direct_change; probe_teardown; probe_state_clear
-    printf 'vpn\n' > "$cf"
+    if [ -n "$winner" ]; then
+      log "рабочая стратегия найдена: индекс $winner (${STRATEGIES[$winner]})"
+      cache_set "$key" "$winner" "youtube discord" "youtube discord"
+      set_direct "youtube discord"; apply_direct_change
+    else
+      log "ни одна стратегия не сработала -> обход недоступен"
+      zapret_off
+      direct=""
+      [ "$dc_ok" = 1 ] && direct="discord"
+      cache_set "$key" vpn "" "$direct"
+      set_direct "$direct"; apply_direct_change
+    fi
+    probe_teardown; probe_state_clear
     return 0
   fi
 
@@ -430,54 +483,58 @@ run_scan() {
   zapret_off
   if test_targets; then
     log "сеть чистая: без обхода всё открывается -> zapret выключен"
-    printf 'off\n' > "$cf"
+    cache_set "$key" off "" "youtube discord"
     probe_state_clear
     return 0
   fi
   for i in "${!STRATEGIES[@]}"; do
     log "пробую[$i]: ${STRATEGIES[$i]}"
     probe_state_write "$i" "$total" "${STRATEGIES[$i]}" 0 ""
-    if set_opt "$(build_opt "${STRATEGIES[$i]}")"; then activate; else ensure_zapret_on; fi
+    if set_opt "$(build_opt "${STRATEGIES[$i]}" "youtube discord")"; then activate; else ensure_zapret_on; fi
     if test_targets; then
       log "рабочая стратегия найдена: индекс $i (${STRATEGIES[$i]})"
-      printf '%s\n' "$i" > "$cf"
+      cache_set "$key" "$i" "youtube discord" "youtube discord"
       probe_state_clear
       return 0
     fi
   done
   log "ни одна стратегия не сработала -> Discord/YouTube через VPN"
   zapret_off
-  ensure_direct_min
+  set_direct ""
   ensure_vpn
   if omavpn_running && test_targets; then
     log "VPN поднят — цели открываются"
   else
     log "VPN не поднялся или цели не открылись (проверь профиль/ноду omavpn)"
   fi
+  cache_set "$key" vpn "" ""
   probe_state_clear
-  printf 'vpn\n' > "$cf"
   return 0
 }
 
 apply_cached() { # $1 = стратегия из кэша, $2 = ключ сети; return 0 если ок
-  local strat="$1" key="$2" optf
+  local strat="$1" key="$2" optf svc direct
+  svc="$(cache_services "$key")"
+  direct="$(cache_direct "$key")"
   case "$strat" in
     off)
-      ensure_direct_all; apply_direct_change; zapret_off; test_targets ;;
+      set_direct "$direct"; apply_direct_change; zapret_off; test_targets ;;
     vpn)
-      zapret_off; ensure_direct_min; ensure_vpn
+      zapret_off; set_direct "$direct"; apply_direct_change; ensure_vpn
       if omavpn_running && test_targets; then log "vpn-режим: цели открываются"; else log "vpn-режим: цели не открылись"; fi
       return 0 ;;
     custom)
       optf="$CACHE/$key.opt"
       [ -s "$optf" ] || return 1
-      ensure_direct_all; apply_direct_change
+      set_direct "$direct"; apply_direct_change
       if set_opt "$(cat "$optf")"; then activate; else ensure_zapret_on; fi
       test_targets ;;
     ''|*[!0-9]*)
       return 1 ;;
     *)
-      apply_strategy_index "$strat" ;;
+      set_direct "$direct"; apply_direct_change
+      if set_opt "$(build_opt "${STRATEGIES[$strat]}" "$svc")"; then activate; else ensure_zapret_on; fi
+      test_targets ;;
   esac
 }
 

@@ -78,6 +78,21 @@ Panel {
     return " · перепроверка через " + Math.ceil(s / 60) + " мин"
   }
 
+  function directSummary(d) {
+    d = d || ""
+    var a = []
+    if (d.indexOf("youtube") >= 0) a.push("youtube")
+    if (d.indexOf("discord") >= 0) a.push("discord")
+    if (a.length === 0) return "через VPN"
+    return a.join(" + ") + " напрямую, остальное через VPN"
+  }
+  function servicesHint(z) {
+    var s = (z && z.services) ? z.services : ""
+    if (s === "discord") return " (только discord)"
+    if (s === "youtube") return " (только youtube)"
+    return ""
+  }
+
   readonly property var rows: {
     var out = [], v = root.vpn, z = root.zap, t = root.tg
 
@@ -95,11 +110,11 @@ Panel {
         ? ("попытка " + (Number(z.tested) + 1) + "/" + z.total + " · ") : ""
       zState = "warn"
       zDetail = "идёт подбор: " + stxt + (z.strategy || z.text || "проверка") + (z.isolated ? " · изолированно" : "")
-    } else if (z.mode === "vpn") { zState = "warn"; zDetail = "обход не сработал → через VPN" + root.retryHint(z) }
+    } else if (z.mode === "vpn") { zState = "warn"; zDetail = "обход не сработал: " + root.directSummary(z.direct) + root.retryHint(z) }
     else if (z.mode === "off") { zState = "ok"; zDetail = "сеть чистая, обход не нужен" }
     else if (z.service !== "active") { zState = "warn"; zDetail = "служба выключена" }
-    else if (z.mode === "custom") { zState = "ok"; zDetail = "кастомная стратегия" }
-    else if (z.mode !== "" && z.mode !== undefined) { zState = "ok"; zDetail = "стратегия #" + z.mode }
+    else if (z.mode === "custom") { zState = "ok"; zDetail = "кастомная стратегия" + root.servicesHint(z) }
+    else if (z.mode !== "" && z.mode !== undefined) { zState = "ok"; zDetail = "стратегия #" + z.mode + root.servicesHint(z) }
     else { zState = "warn"; zDetail = "режим неизвестен" }
     out.push({ name: "zapret (DPI)", state: zState, detail: zDetail + (z.network ? " · " + z.network : "") })
 

@@ -4,6 +4,16 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.4.0] — 2026-10-04
+
+### Added
+- **Прямая проверка по сервисам** в автотюне: youtube и discord проверяются
+  отдельно, без обхода. Если youtube работает напрямую — он остаётся напрямую
+  (мимо VPN и zapret), а zapret включается и тестируется **только для discord**.
+  Если напрямую ничего не работает — прежняя логика (перебор по обоим).
+  Виджет показывает, что именно идёт напрямую (например, «обход не сработал:
+  youtube напрямую, остальное через VPN»).
+
 ## [1.3.1] — 2026-10-04
 
 ### Changed
@@ -114,6 +124,7 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[1.4.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.4...v1.3.0
 [1.2.4]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.3...v1.2.4
