@@ -128,6 +128,10 @@ systemctl daemon-reload
 systemctl enable --now zapret-autotune.timer
 systemctl enable --now zapret-routefix.service
 
+echo "==> Проверка изоляции пробника (host IP должен быть VPN, probe IP — прямой)"
+systemctl stop zapret-autotune.service 2>/dev/null || true
+/usr/local/bin/zapret-autotune probe-selftest || echo "[!] probe-selftest не прошёл — перебор будет без изоляции"
+
 cat <<EOF
 
 Готово. Запускаю первый подбор под текущую сеть (может занять несколько минут).
