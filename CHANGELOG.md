@@ -4,6 +4,16 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.2.0] — 2026-10-04
+
+### Added
+- **Изолированный фоновый перебор стратегий** (`zapret-autotune`): кандидаты
+  проверяются трафиком служебного пользователя `zapret-probe`
+  (`ip rule uidrange -> main`), пока Discord/YouTube остаются в VPN — интернет и
+  сервисы во время подбора не прерываются. Команда `probe-selftest` проверяет
+  изоляцию; установщик создаёт probe-пользователя, без него — откат к прежнему
+  перебору.
+
 ## [1.1.1] — 2026-10-04
 
 ### Security
@@ -57,6 +67,7 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[1.2.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/releases/tag/v1.0.0

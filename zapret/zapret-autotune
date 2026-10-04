@@ -33,6 +33,16 @@ OMAVPN="$USER_HOME/.local/bin/omavpn"
 DIRECT_FILE="$USER_HOME/.config/omavpn/direct_domains.txt"
 DIRECT_CHANGED=0
 
+# Изолированный пробник: отдельный системный пользователь, чей трафик уходит
+# напрямую (ip rule uidrange -> main). Боевой трафик при этом не трогается:
+# пока идёт подбор, Discord/YouTube держим в VPN, а кандидатов проверяем
+# только трафиком probe-пользователя.
+PROBE_USER="${PROBE_USER:-zapret-probe}"
+PROBE_RULE_PREF="${PROBE_RULE_PREF:-100}"
+PROBE_UID=""
+PROBE_ACTIVE=0
+CURL_BIN="$(command -v curl 2>/dev/null || echo /usr/bin/curl)"
+
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG" 2>/dev/null; }
 
 # --- списки доменов ---------------------------------------------------------
@@ -125,6 +135,41 @@ ok_url() {
   return 1
 }
 test_targets() { ok_url https://www.youtube.com/ && ok_url https://discord.com/; }
+
+# --- изолированный пробник --------------------------------------------------
+probe_uid() {
+  [ -n "$PROBE_UID" ] || PROBE_UID="$(id -u "$PROBE_USER" 2>/dev/null || true)"
+  printf '%s' "$PROBE_UID"
+}
+probe_setup() {
+  local uid; uid="$(probe_uid)"
+  [ -n "$uid" ] || return 1
+  if ! ip rule show 2>/dev/null | grep -q "uidrange $uid-$uid"; then
+    ip rule add uidrange "$uid-$uid" lookup main pref "$PROBE_RULE_PREF" 2>/dev/null || return 1
+  fi
+  PROBE_ACTIVE=1
+  return 0
+}
+probe_teardown() {
+  [ "$PROBE_ACTIVE" = 1 ] || return 0
+  local uid; uid="$(probe_uid)"
+  [ -n "$uid" ] && ip rule del uidrange "$uid-$uid" lookup main pref "$PROBE_RULE_PREF" 2>/dev/null || true
+  PROBE_ACTIVE=0
+}
+probe_ok_url() {
+  local code
+  for _ in 1 2; do
+    code="$(runuser -u "$PROBE_USER" -- env HOME=/tmp "$CURL_BIN" -4 -s -o /dev/null \
+      -w '%{http_code}' --max-time 8 "$1" 2>/dev/null)"
+    case "$code" in 2??|3??) return 0 ;; esac
+  done
+  return 1
+}
+probe_test_targets() { probe_ok_url https://www.youtube.com/ && probe_ok_url https://discord.com/; }
+probe_show_ips() {
+  echo "host  IP: $(curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null)"
+  echo "probe IP: $(runuser -u "$PROBE_USER" -- env HOME=/tmp "$CURL_BIN" -4 -s --max-time 10 https://api.ipify.org 2>/dev/null)"
+}
 
 # --- zapret -----------------------------------------------------------------
 build_opt() {
@@ -295,18 +340,57 @@ apply_strategy_index() { # $1 = индекс; return 0 если target'ы отк
 }
 
 run_scan() {
-  local key="$1" cf="$2" i
-  ensure_direct_all
+  local key="$1" cf="$2" i use_probe=0
+
+  if probe_setup; then
+    use_probe=1
+    log "пробник: изолированный режим (uidrange $PROBE_USER -> main)"
+  else
+    log "пробник: недоступен ($PROBE_USER / ip rule) — перебор как раньше"
+  fi
+
+  # На время подбора держим сервисы в VPN, чтобы не ломать интернет.
+  ensure_direct_min
   apply_direct_change
+  ensure_vpn
   sleep 1
 
+  if [ "$use_probe" = 1 ]; then
+    zapret_off
+    if probe_test_targets; then
+      log "сеть чистая: без обхода всё открывается -> zapret выключен"
+      printf 'off\n' > "$cf"
+      ensure_direct_all; apply_direct_change; probe_teardown
+      return 0
+    fi
+
+    for i in "${!STRATEGIES[@]}"; do
+      log "пробую[$i]: ${STRATEGIES[$i]}"
+      if set_opt "$(build_opt "${STRATEGIES[$i]}")"; then activate; else ensure_zapret_on; fi
+      if probe_test_targets; then
+        log "рабочая стратегия найдена: индекс $i (${STRATEGIES[$i]})"
+        printf '%s\n' "$i" > "$cf"
+        ensure_direct_all; apply_direct_change; probe_teardown
+        return 0
+      fi
+    done
+
+    log "ни одна стратегия не сработала -> Discord/YouTube через VPN"
+    zapret_off
+    ensure_direct_min; apply_direct_change; probe_teardown
+    printf 'vpn\n' > "$cf"
+    return 0
+  fi
+
+  # --- запасной перебор без изоляции (как было) ---
+  ensure_direct_all
+  apply_direct_change
   zapret_off
   if test_targets; then
     log "сеть чистая: без обхода всё открывается -> zapret выключен"
     printf 'off\n' > "$cf"
     return 0
   fi
-
   for i in "${!STRATEGIES[@]}"; do
     log "пробую[$i]: ${STRATEGIES[$i]}"
     if set_opt "$(build_opt "${STRATEGIES[$i]}")"; then activate; else ensure_zapret_on; fi
@@ -316,7 +400,6 @@ run_scan() {
       return 0
     fi
   done
-
   log "ни одна стратегия не сработала -> Discord/YouTube через VPN"
   zapret_off
   ensure_direct_min
@@ -393,13 +476,24 @@ main() {
   fi
   exec 9>"$LOCK" || exit 1
   flock -n 9 || { log "уже выполняется, пропуск"; exit 0; }
+  trap 'probe_teardown' EXIT
 
   case "${1:-run}" in
     run)     run normal ;;
     rescan)  run force ;;
     show)    ls -1 "$CACHE" 2>/dev/null | sed 's/\.strategy$//' | while read -r k; do printf '%-40s %s\n' "$k" "$(cat "$CACHE/$k.strategy" 2>/dev/null)"; done ;;
     tune-wan) write_lists; set_wan ;;
-    *) echo "Использование: zapret-autotune {run|rescan|show|tune-wan}"; exit 2 ;;
+    probe-selftest)
+      write_lists
+      if probe_setup; then
+        echo "=== probe self-test: host и probe IP должны отличаться (host — VPN, probe — напрямую) ==="
+        probe_show_ips
+      else
+        echo "probe setup failed: нет пользователя '$PROBE_USER' или не удалось добавить ip rule"
+        exit 1
+      fi
+      ;;
+    *) echo "Использование: zapret-autotune {run|rescan|show|tune-wan|probe-selftest}"; exit 2 ;;
   esac
 }
 

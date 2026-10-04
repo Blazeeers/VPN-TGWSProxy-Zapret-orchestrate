@@ -275,7 +275,12 @@ sudo zapret-autotune run      # применить/подобрать для т�
 sudo zapret-autotune rescan   # принудительно переподобрать
 zapret-autotune show          # кэш сетей
 sudo zapret-autotune tune-wan # только выставить IFACE_WAN
+sudo zapret-autotune probe-selftest  # проверить изоляцию фонового пробника
 ```
+
+Перебор новых стратегий идёт **изолированно** — трафиком служебного пользователя
+`zapret-probe`, пока Discord/YouTube остаются в VPN, поэтому интернет и сервисы во
+время проверки не прерываются.
 
 Ручное переключение пресетов (аналог `.bat`-стратегий на Windows):
 

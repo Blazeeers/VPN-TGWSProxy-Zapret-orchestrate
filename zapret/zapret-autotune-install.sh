@@ -17,6 +17,21 @@ USER_NAME="${SUDO_USER:-}"
 }
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 
+PROBE_USER="${PROBE_USER:-zapret-probe}"
+echo "==> Служебный пользователь для изолированного пробника: $PROBE_USER"
+if ! id "$PROBE_USER" >/dev/null 2>&1; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$PROBE_USER" 2>/dev/null || true
+fi
+if ! id "$PROBE_USER" >/dev/null 2>&1; then
+  echo "u $PROBE_USER - \"zapret isolated probe user\"" > /usr/lib/sysusers.d/zapret-probe.conf
+  systemd-sysusers >/dev/null 2>&1 || true
+fi
+if id "$PROBE_USER" >/dev/null 2>&1; then
+  echo "    probe uid: $(id -u "$PROBE_USER")"
+else
+  echo "    [!] не удалось создать $PROBE_USER — перебор будет без изоляции"
+fi
+
 echo "==> Пользователь: $USER_NAME ($USER_HOME)"
 echo "==> Ставлю скрипт в /usr/local/bin/zapret-autotune"
 install -Dm755 "$HERE/zapret-autotune" /usr/local/bin/zapret-autotune
@@ -31,6 +46,8 @@ USER_NAME=$USER_NAME
 USER_HOME=$USER_HOME
 # 1 = автотюнер сам поднимает omavpn на сетях, где обход не работает.
 AUTO_VPN=1
+# Пользователь для изолированного пробника стратегий.
+PROBE_USER=$PROBE_USER
 EOF
 chmod 644 /etc/zapret-autotune.conf
 
