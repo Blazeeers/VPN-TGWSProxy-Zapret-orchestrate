@@ -16,6 +16,7 @@ Panel {
   property var bs: ({ ok: false })
   property var vpnInfo: ({})
   property bool vpnLoaded: false
+  property bool vpnExpanded: false
   property string busy: ""
   property string lastError: ""
 
@@ -69,14 +70,6 @@ Panel {
   function codeState(code) { return (code >= 200 && code < 400) ? "ok" : "bad" }
 
   readonly property var vpnProfiles: (root.vpnInfo && root.vpnInfo.profiles instanceof Array) ? root.vpnInfo.profiles : []
-  readonly property var vpnNodes: (root.vpnInfo && root.vpnInfo.nodes instanceof Array) ? root.vpnInfo.nodes : []
-  function pingText(ms) { return (ms === null || ms === undefined) ? "—" : (ms + " ms") }
-  function pingColor(ms) {
-    if (ms === null || ms === undefined) return root.urgent
-    if (ms < 120) return Color.accent
-    if (ms < 300) return root.warn
-    return root.urgent
-  }
 
   function retryHint(z) {
     if (!z || !z.retry_seconds) return ""
@@ -89,10 +82,10 @@ Panel {
     var out = [], v = root.vpn, z = root.zap, t = root.tg
 
     if (v.running) {
-      out.push({ name: "VPN", state: "ok",
+      out.push({ name: "VPN", state: "ok", expandable: true,
         detail: (v.profile || "") + " · " + (v.mode === "tun" ? "TUN" : "SOCKS") + " · " + root.fmtUptime(v.uptime) })
     } else {
-      out.push({ name: "VPN", state: (v.installed === false ? "bad" : "warn"),
+      out.push({ name: "VPN", state: (v.installed === false ? "bad" : "warn"), expandable: true,
         detail: (v.installed === false ? "не установлен" : "выключен") })
     }
 
@@ -316,7 +309,7 @@ Panel {
               width: column.width
               implicitHeight: scol.implicitHeight + Style.space(12)
               radius: Style.cornerRadius > 0 ? Style.space(8) : 0
-              color: "transparent"
+              color: (srow.modelData.expandable && srmouse.containsMouse) ? root.hoverFill : "transparent"
 
               Column {
                 id: scol
@@ -345,6 +338,15 @@ Panel {
                     font.pixelSize: Style.font.body
                     font.bold: true
                   }
+                  Text {
+                    visible: srow.modelData.expandable === true
+                    textFormat: Text.PlainText
+                    text: root.vpnExpanded ? "▾" : "▸"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
                 }
                 Text {
                   width: parent.width
@@ -356,183 +358,81 @@ Panel {
                   elide: Text.ElideRight
                 }
               }
-            }
-          }
-        }
-
-        PanelSeparator { foreground: root.foreground }
-
-        PanelSectionHeader { text: "ПРОФИЛЬ"; foreground: root.foreground; fontFamily: root.fontFamily }
-
-        Column {
-          width: parent.width
-          spacing: Style.space(4)
-
-          Repeater {
-            model: root.vpnProfiles
-
-            Rectangle {
-              id: prow
-              required property var modelData
-              width: column.width
-              implicitHeight: pcol.implicitHeight + Style.space(12)
-              radius: Style.cornerRadius > 0 ? Style.space(8) : 0
-              color: prow.modelData.index === (root.vpnInfo.profile_index || 0)
-                       ? root.selectedFill
-                       : (pmouse.containsMouse ? root.hoverFill : "transparent")
-
-              Column {
-                id: pcol
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(10)
-                spacing: Style.space(1)
-
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: prow.modelData.name
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  elide: Text.ElideRight
-                }
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: (prow.modelData.node_count || 0) + " сервер(ов)"
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
-                }
-              }
 
               MouseArea {
-                id: pmouse
+                id: srmouse
                 anchors.fill: parent
+                enabled: srow.modelData.expandable === true
                 hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.run(["profile", String(prow.modelData.index)], "profile")
+                cursorShape: srow.modelData.expandable ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onClicked: if (srow.modelData.expandable) root.vpnExpanded = !root.vpnExpanded
               }
             }
           }
         }
 
-        PanelSeparator { foreground: root.foreground }
-
-        PanelSectionHeader { text: "СЕРВЕР"; foreground: root.foreground; fontFamily: root.fontFamily }
-
         Column {
           width: parent.width
-          spacing: Style.space(4)
+          spacing: Style.space(12)
+          visible: root.vpnExpanded
 
-          Rectangle {
-            id: autoRow
-            width: column.width
-            implicitHeight: acl.implicitHeight + Style.space(12)
-            radius: Style.cornerRadius > 0 ? Style.space(8) : 0
-            color: (root.vpnInfo.node_index < 0) ? root.selectedFill
-                   : (amouse.containsMouse ? root.hoverFill : "transparent")
+          PanelSeparator { foreground: root.foreground }
 
-            Column {
-              id: acl
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(10)
-              spacing: Style.space(1)
+          PanelSectionHeader { text: "СТРАНА"; foreground: root.foreground; fontFamily: root.fontFamily }
 
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: "Авто (балансировка)"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-                elide: Text.ElideRight
-              }
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: "Лучший сервер по подписке"
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-              }
-            }
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
 
-            MouseArea {
-              id: amouse
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.run(["node", "-1"], "node")
-            }
-          }
+            Repeater {
+              model: root.vpnProfiles
 
-          Repeater {
-            model: root.vpnNodes
+              Rectangle {
+                id: prow
+                required property var modelData
+                width: column.width
+                implicitHeight: pcol.implicitHeight + Style.space(12)
+                radius: Style.cornerRadius > 0 ? Style.space(8) : 0
+                color: prow.modelData.index === (root.vpnInfo.profile_index || 0)
+                         ? root.selectedFill
+                         : (pmouse.containsMouse ? root.hoverFill : "transparent")
 
-            Rectangle {
-              id: nrow
-              required property var modelData
-              width: column.width
-              implicitHeight: ncl.implicitHeight + Style.space(12)
-              radius: Style.cornerRadius > 0 ? Style.space(8) : 0
-              color: nrow.modelData.index === root.vpnInfo.node_index ? root.selectedFill
-                     : (nmouse.containsMouse ? root.hoverFill : "transparent")
+                Column {
+                  id: pcol
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  spacing: Style.space(1)
 
-              Column {
-                id: ncl
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(10)
-                spacing: Style.space(1)
-
-                Row {
-                  width: parent.width
                   Text {
+                    width: parent.width
                     textFormat: Text.PlainText
-                    text: nrow.modelData.tag
+                    text: prow.modelData.name
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
                     elide: Text.ElideRight
-                    width: Math.max(0, parent.width - nTxt.width - Style.space(8))
                   }
                   Text {
-                    id: nTxt
+                    width: parent.width
                     textFormat: Text.PlainText
-                    text: root.pingText(nrow.modelData.ping_ms)
-                    color: root.pingColor(nrow.modelData.ping_ms)
+                    text: (prow.modelData.node_count || 0) + " сервер(ов)"
+                    color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
                   }
                 }
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: (nrow.modelData.detail || "") + (nrow.modelData.address ? " · " + nrow.modelData.address : "")
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
-                }
-              }
 
-              MouseArea {
-                id: nmouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.run(["node", String(nrow.modelData.index)], "node")
+                MouseArea {
+                  id: pmouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.run(["profile", String(prow.modelData.index)], "profile")
+                }
               }
             }
           }
@@ -571,39 +471,6 @@ Panel {
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onClicked: root.run(["update"], "update")
-            }
-          }
-
-          Rectangle {
-            id: pingBtn
-            implicitWidth: pingTxt.implicitWidth + Style.space(20)
-            implicitHeight: pingTxt.implicitHeight + Style.space(12)
-            radius: Style.cornerRadius > 0 ? Style.space(8) : 0
-            color: pmouse2.containsMouse ? root.hoverFill
-                   : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
-            border.width: 1
-            border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
-
-            Text {
-              id: pingTxt
-              anchors.centerIn: parent
-              textFormat: Text.PlainText
-              text: root.busy === "ping" ? "…" : "Пинг серверов"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-            }
-            MouseArea {
-              id: pmouse2
-              anchors.fill: parent
-              enabled: root.cliPath !== "" && root.busy === ""
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: {
-                if (vpnProc.running) return
-                root.busy = "ping"
-                vpnProc.running = true
-              }
             }
           }
 
