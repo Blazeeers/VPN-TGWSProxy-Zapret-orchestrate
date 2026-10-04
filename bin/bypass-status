@@ -10,6 +10,7 @@ tg-ws-proxy и direct-список. Зависимостей нет, root не �
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import shutil
@@ -21,6 +22,7 @@ import time
 HOME = os.path.expanduser("~")
 AUTOTUNE_DIR = "/var/lib/zapret-autotune"
 APP_CANDIDATES = ("omavpn", "wowvpn")
+PROXY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "wireguard"}
 
 
 def run(cmd: list[str], timeout: float = 8.0) -> str:
@@ -198,6 +200,88 @@ def live_checks() -> dict:
     }
 
 
+def cli_json(cli: str, *args) -> dict:
+    raw = run([cli, "--json", *args], timeout=15)
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return {}
+
+
+def read_sub(app: str) -> list:
+    path = os.path.join(HOME, ".cache", app, "sub.json") if app else ""
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if isinstance(data, dict):
+        return data.get("configs") or []
+    return data or []
+
+
+def extract_nodes(configs: list, profile_index: int) -> list:
+    if not (0 <= profile_index < len(configs)):
+        return []
+    out = []
+    for o in configs[profile_index].get("outbounds", []) or []:
+        if o.get("protocol") not in PROXY_PROTOCOLS:
+            continue
+        st = o.get("settings", {}) or {}
+        address, port = "", 0
+        for key in ("vnext", "servers"):
+            seq = st.get(key)
+            if isinstance(seq, list) and seq:
+                address = str(seq[0].get("address") or seq[0].get("server") or "")
+                port = int(seq[0].get("port") or 0)
+                break
+        stream = o.get("streamSettings", {}) or {}
+        detail = ((stream.get("realitySettings", {}) or {}).get("serverName")
+                  or (stream.get("tlsSettings", {}) or {}).get("serverName")
+                  or (stream.get("xhttpSettings", {}) or {}).get("host")
+                  or address)
+        out.append({"index": len(out), "tag": o.get("tag", "proxy"),
+                    "address": address, "port": port, "detail": str(detail)})
+    return out
+
+
+def tcp_ping(host: str, port: int, timeout: float = 1.5, tries: int = 2):
+    if not host or not port:
+        return None
+    best = None
+    for _ in range(tries):
+        try:
+            start = time.perf_counter()
+            with socket.create_connection((host, port), timeout=timeout):
+                dt = (time.perf_counter() - start) * 1000
+            best = dt if best is None else min(best, dt)
+        except OSError:
+            continue
+    return round(best) if best is not None else None
+
+
+def vpn_info(app: str, cli: str) -> dict:
+    if not cli:
+        return {"ok": False, "error": "VPN CLI не найден"}
+    profiles = cli_json(cli, "profiles").get("profiles") or []
+    st = cli_json(cli, "status")
+    profile_index = int(st.get("profile_index") or 0)
+    nodes = extract_nodes(read_sub(app), profile_index)
+    if nodes:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            pings = list(pool.map(lambda n: tcp_ping(n["address"], n["port"]), nodes))
+        for node, ping in zip(nodes, pings):
+            node["ping_ms"] = ping
+    else:
+        nodes = cli_json(cli, "nodes").get("nodes") or []
+        for node in nodes:
+            node.setdefault("ping_ms", None)
+    return {"ok": True, "app": app, "cli": cli,
+            "profile_index": profile_index,
+            "node_index": int(st.get("node_index") if st.get("node_index") is not None else -1),
+            "profiles": profiles, "nodes": nodes,
+            "updated": time.time()}
+
+
 def collect(check: bool) -> dict:
     app, cli = resolve_cli()
     iface = wan_iface()
@@ -219,7 +303,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="bypass-status", description="Статус всех обходов (JSON)")
     ap.add_argument("--json", action="store_true", help="JSON (по умолчанию)")
     ap.add_argument("--check", action="store_true", help="живые проверки доступности")
+    ap.add_argument("--vpn", action="store_true", help="профили/серверы подписки + TCP-пинг")
     args = ap.parse_args()
+    if args.vpn:
+        app, cli = resolve_cli()
+        print(json.dumps(vpn_info(app, cli), ensure_ascii=False))
+        return 0
     print(json.dumps(collect(args.check), ensure_ascii=False))
     return 0
 

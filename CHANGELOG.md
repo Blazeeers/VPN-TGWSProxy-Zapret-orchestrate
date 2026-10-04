@@ -4,6 +4,13 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.3.0] — 2026-10-04
+
+### Added
+- Виджет «Обходы»: управление VPN из текущей подписки — выбор профиля и сервера,
+  обновление подписки и **TCP-пинг до каждого узла** (кнопка «Пинг серверов»).
+  Данные берёт `bypass-status --vpn` (параллельный TCP-connect, ~0.4 с на 12 узлов).
+
 ## [1.2.4] — 2026-10-04
 
 ### Added
@@ -100,6 +107,7 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[1.3.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.4...v1.3.0
 [1.2.4]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.3...v1.2.4
 [1.2.3]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.1...v1.2.2
