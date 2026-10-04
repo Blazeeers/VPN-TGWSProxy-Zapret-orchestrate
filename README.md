@@ -244,6 +244,7 @@ omavpn status --json | python3 -m json.tool | head -30
   строка показывает «идёт подбор: попытка `i/N` · стратегия · изолированно»,
   а в режиме `vpn` — «обход не сработал → через VPN · перепроверка через N мин»;
 - **YouTube** — отдельная строка, когда трафик идёт напрямую, без VPN и обхода;
+- **Обновления** — строка, если для zapret или tg-ws-proxy доступна новая версия;
 - **tg-ws-proxy** — слушает ли порт 1443;
 - по кнопке **«Проверить доступность»** — HTTP-коды Яндекс / Telegram API / YouTube
   / Discord.
@@ -260,6 +261,11 @@ omavpn status --json | python3 -m json.tool | head -30
 
 Данные берёт из `bypass-status --json` (обновление раз в 4 с). Скрипт понимает и
 `omavpn`, и `wowvpn` — CLI определяется автоматически.
+
+Проверка обновлений компонентов идёт **автоматически раз в сутки** пользовательским
+таймером `omavpn-updates.timer` (`bypass-status --updates`): сверяет zapret с AUR
+(`zapret-git`) и GitHub, а tg-ws-proxy — с GitHub-релизами; результат кэшируется в
+`~/.cache/<cli>/updates.json`. Вручную: `bypass-status --updates`.
 
 Управление VPN прямо из виджета (`bypass-status --vpn`):
 

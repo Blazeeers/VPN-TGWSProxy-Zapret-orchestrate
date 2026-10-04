@@ -128,6 +128,14 @@ Panel {
       out.push({ name: "YouTube", state: "ok", detail: "трафик идёт напрямую, без VPN и обхода" })
     }
 
+    var u = root.bs ? root.bs.updates : null
+    if (u && ((u.zapret && u.zapret.update) || (u.tgwsproxy && u.tgwsproxy.update))) {
+      var items = []
+      if (u.zapret && u.zapret.update) items.push("zapret " + (u.zapret.installed || "?") + " → " + u.zapret.latest)
+      if (u.tgwsproxy && u.tgwsproxy.update) items.push("tg-ws-proxy " + (u.tgwsproxy.installed || "?") + " → " + u.tgwsproxy.latest)
+      out.push({ name: "Обновления", state: "warn", detail: "доступны: " + items.join(", ") })
+    }
+
     out.push({ name: "tg-ws-proxy", state: t.listening ? "ok" : "bad",
       detail: t.listening ? ("порт " + t.port + ", работает") : "не слушает" })
 

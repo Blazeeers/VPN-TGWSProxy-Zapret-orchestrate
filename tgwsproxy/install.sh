@@ -53,6 +53,8 @@ else
   install -Dm755 "$TMP" "$BIN"
   rm -f "$TMP"
 fi
+mkdir -p "$HOME_DIR/.local/share/tgwsproxy"
+printf '%s\n' "$VERSION" > "$HOME_DIR/.local/share/tgwsproxy/version"
 
 say "Иконка"
 if command -v magick >/dev/null || command -v convert >/dev/null; then

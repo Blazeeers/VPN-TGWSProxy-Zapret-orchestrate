@@ -4,6 +4,17 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.5.0] — 2026-10-04
+
+### Added
+- **Автоматическая проверка обновлений компонентов**: zapret (AUR `zapret-git` +
+  GitHub bol-van/zapret) и tg-ws-proxy (GitHub-релизы). Раз в сутки
+  пользовательским таймером `omavpn-updates.timer` (`bypass-status --updates`),
+  результат кэшируется в `~/.cache/<cli>/updates.json`.
+- Виджет «Обходы»: строка **«Обновления»**, когда доступна новая версия.
+- `tgwsproxy/install.sh` записывает установленную версию
+  (`~/.local/share/tgwsproxy/version`) — для сравнения при проверке.
+
 ## [1.4.1] — 2026-10-04
 
 ### Added
@@ -130,6 +141,7 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[1.5.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.3.0...v1.3.1

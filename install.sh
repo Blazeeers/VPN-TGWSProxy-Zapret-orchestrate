@@ -130,6 +130,34 @@ if [ -d "$HERE/shell-plugin/bypass-status" ]; then
   warn "Если виджета не видно — выполни: omarchy restart shell"
 fi
 
+# --- Ежедневная проверка обновлений ----------------------------------------
+if [ -x "$LOCAL_BIN/bypass-status" ]; then
+  say "Ставлю таймер проверки обновлений (zapret, tg-ws-proxy)…"
+  mkdir -p "$HOME_DIR/.config/systemd/user"
+  cat > "$HOME_DIR/.config/systemd/user/omavpn-updates.service" <<EOF
+[Unit]
+Description=Check component updates (zapret, tg-ws-proxy)
+
+[Service]
+Type=oneshot
+ExecStart=$LOCAL_BIN/bypass-status --updates
+EOF
+  cat > "$HOME_DIR/.config/systemd/user/omavpn-updates.timer" <<'EOF'
+[Unit]
+Description=Daily component update check
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=24h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  systemctl --user enable --now omavpn-updates.timer >/dev/null 2>&1 || true
+fi
+
 # --- Подписка ---------------------------------------------------------------
 SUB_FILE="$HOME_DIR/.config/omavpn/subscription"
 if [ ! -s "$SUB_FILE" ]; then

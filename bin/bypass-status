@@ -13,6 +13,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -23,6 +24,11 @@ HOME = os.path.expanduser("~")
 AUTOTUNE_DIR = "/var/lib/zapret-autotune"
 APP_CANDIDATES = ("omavpn", "wowvpn")
 PROXY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "wireguard"}
+
+ZAPRET_REPOS = ("bol-van/zapret",)
+TGWS_REPO = "Flowseal/tg-ws-proxy"
+TGWS_VERSION_FILE = os.path.join(HOME, ".local", "share", "tgwsproxy", "version")
+UPDATES_MAX_AGE = 7 * 24 * 3600
 
 
 def run(cmd: list[str], timeout: float = 8.0) -> str:
@@ -291,6 +297,91 @@ def vpn_info(app: str, cli: str) -> dict:
             "updated": time.time()}
 
 
+def _gh_latest_tag(repo: str) -> str:
+    out = run(["curl", "-s", "--max-time", "15", "-H", "Accept: application/vnd.github+json",
+               f"https://api.github.com/repos/{repo}/releases/latest"], timeout=20)
+    try:
+        return str(json.loads(out).get("tag_name") or "").lstrip("v")
+    except ValueError:
+        return ""
+
+
+def _ver_tuple(value: str):
+    parts = re.findall(r"\d+", value or "")
+    return tuple(int(p) for p in parts[:4]) if parts else ()
+
+
+def installed_zapret_version() -> str:
+    out = run(["pacman", "-Q", "zapret-git"]) or run(["pacman", "-Q", "zapret"])
+    fields = out.split()
+    return fields[1] if len(fields) > 1 else ""
+
+
+def installed_tgws_version() -> str:
+    try:
+        return open(TGWS_VERSION_FILE, encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+
+
+def _aur_version(pkg: str) -> str:
+    url = f"https://aur.archlinux.org/rpc/v5/info?arg%5B%5D={pkg}"
+    out = run(["curl", "-s", "--max-time", "15", url], timeout=20)
+    try:
+        results = json.loads(out).get("results") or []
+        return str(results[0].get("Version") or "") if results else ""
+    except (ValueError, IndexError):
+        return ""
+
+
+def _max_ver(*versions: str) -> str:
+    best = ""
+    for value in versions:
+        if value and _ver_tuple(value) > _ver_tuple(best):
+            best = value
+    return best
+
+
+def check_updates() -> dict:
+    def newer(installed, latest):
+        return bool(installed and latest and _ver_tuple(latest) > _ver_tuple(installed))
+
+    zap_installed = installed_zapret_version()
+    zap_aur = _aur_version("zapret-git")
+    zap_gh = _gh_latest_tag(ZAPRET_REPOS[0])
+    zap_latest = _max_ver(zap_aur, zap_gh)
+    tg_installed = installed_tgws_version()
+    tg_latest = _gh_latest_tag(TGWS_REPO)
+    return {
+        "checked": time.time(),
+        "zapret": {"installed": zap_installed, "latest": zap_latest, "aur": zap_aur,
+                   "github": zap_gh, "update": newer(zap_installed, zap_latest)},
+        "tgwsproxy": {"installed": tg_installed, "latest": tg_latest, "update": newer(tg_installed, tg_latest)},
+    }
+
+
+def write_updates(app: str, data: dict) -> None:
+    if not app:
+        return
+    path = os.path.join(HOME, ".cache", app, "updates.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def cached_updates(app: str) -> dict:
+    path = os.path.join(HOME, ".cache", app, "updates.json") if app else ""
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if time.time() - float(data.get("checked") or 0) > UPDATES_MAX_AGE:
+        return {}
+    return data
+
+
 def collect(check: bool) -> dict:
     app, cli = resolve_cli()
     iface = wan_iface()
@@ -302,6 +393,7 @@ def collect(check: bool) -> dict:
         "zapret": zapret_status(iface),
         "tgwsproxy": tgwsproxy_status(),
         "direct": direct_status(app),
+        "updates": cached_updates(app),
     }
     if check:
         data["checks"] = live_checks()
@@ -313,10 +405,17 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="JSON (по умолчанию)")
     ap.add_argument("--check", action="store_true", help="живые проверки доступности")
     ap.add_argument("--vpn", action="store_true", help="профили/серверы подписки + TCP-пинг")
+    ap.add_argument("--updates", action="store_true", help="проверить обновления zapret/tg-ws-proxy")
     args = ap.parse_args()
     if args.vpn:
         app, cli = resolve_cli()
         print(json.dumps(vpn_info(app, cli), ensure_ascii=False))
+        return 0
+    if args.updates:
+        app, _ = resolve_cli()
+        data = check_updates()
+        write_updates(app, data)
+        print(json.dumps(data, ensure_ascii=False))
         return 0
     print(json.dumps(collect(args.check), ensure_ascii=False))
     return 0
