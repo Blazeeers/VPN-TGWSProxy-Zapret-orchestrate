@@ -167,8 +167,17 @@ probe_ok_url() {
 }
 probe_test_targets() { probe_ok_url https://www.youtube.com/ && probe_ok_url https://discord.com/; }
 probe_show_ips() {
-  echo "host  IP: $(curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null)"
-  echo "probe IP: $(runuser -u "$PROBE_USER" -- env HOME=/tmp "$CURL_BIN" -4 -s --max-time 10 https://api.ipify.org 2>/dev/null)"
+  local host_ip probe_ip
+  host_ip="$(curl -s --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p')"
+  probe_ip="$(runuser -u "$PROBE_USER" -- env HOME=/tmp "$CURL_BIN" -s --max-time 12 \
+    https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p')"
+  echo "host  IP: ${host_ip:-?}   (VPN)"
+  echo "probe IP: ${probe_ip:-?}   (напрямую)"
+  if [ -n "$host_ip" ] && [ -n "$probe_ip" ] && [ "$host_ip" != "$probe_ip" ]; then
+    echo "изоляция: OK (адреса различаются)"
+  else
+    echo "изоляция: НЕ подтверждена (проверь правила/маршрут)"
+  fi
 }
 
 # --- zapret -----------------------------------------------------------------
