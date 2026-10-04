@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.blazeeers.bypass-status",
   "name": "Bypass Status",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "blazeeers",
   "license": "MIT",
-  "description": "Tray widget showing the status of all bypasses: VPN (omavpn/wowvpn), zapret DPI, tg-ws-proxy and the Telegram bot.",
+  "description": "Tray widget showing the status of all bypasses: VPN (omavpn/wowvpn), zapret DPI, tg-ws-proxy and live reachability checks.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Обходы",
-    "description": "Статус VPN, zapret, tg-ws-proxy и бота",
+    "description": "Статус VPN, zapret и tg-ws-proxy",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right"

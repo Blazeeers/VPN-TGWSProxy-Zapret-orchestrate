@@ -42,6 +42,7 @@ PROBE_RULE_PREF="${PROBE_RULE_PREF:-100}"
 PROBE_UID=""
 PROBE_ACTIVE=0
 CURL_BIN="$(command -v curl 2>/dev/null || echo /usr/bin/curl)"
+PROBE_STATE="$CACHE/probe.json"
 
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG" 2>/dev/null; }
 
@@ -179,6 +180,19 @@ probe_show_ips() {
     echo "изоляция: НЕ подтверждена (проверь правила/маршрут)"
   fi
 }
+
+# Состояние подбора для виджета: <кэш>/probe.json (читает bypass-status).
+probe_state_write() { # $1 индекс, $2 всего, $3 стратегия, $4 изолированно(1/0), $5 текст
+  python3 - "$PROBE_STATE" "$1" "$2" "$3" "$4" "${5:-}" <<'PY' 2>/dev/null || true
+import json, sys, time
+path, index, total, strategy, isolated, text = sys.argv[1:7]
+json.dump({"active": True, "index": int(index), "total": int(total),
+           "strategy": strategy, "isolated": isolated == "1", "text": text,
+           "updated": time.time()}, open(path, "w"), ensure_ascii=False)
+PY
+  chmod 644 "$PROBE_STATE" 2>/dev/null || true
+}
+probe_state_clear() { rm -f "$PROBE_STATE" 2>/dev/null || true; }
 
 # --- zapret -----------------------------------------------------------------
 build_opt() {
@@ -349,7 +363,8 @@ apply_strategy_index() { # $1 = индекс; return 0 если target'ы отк
 }
 
 run_scan() {
-  local key="$1" cf="$2" i use_probe=0
+  local key="$1" cf="$2" i use_probe=0 total="${#STRATEGIES[@]}"
+  probe_state_clear
 
   if probe_setup; then
     use_probe=1
@@ -365,28 +380,30 @@ run_scan() {
   sleep 1
 
   if [ "$use_probe" = 1 ]; then
+    probe_state_write 0 0 "проверка сети" 1 ""
     zapret_off
     if probe_test_targets; then
       log "сеть чистая: без обхода всё открывается -> zapret выключен"
       printf 'off\n' > "$cf"
-      ensure_direct_all; apply_direct_change; probe_teardown
+      ensure_direct_all; apply_direct_change; probe_teardown; probe_state_clear
       return 0
     fi
 
     for i in "${!STRATEGIES[@]}"; do
       log "пробую[$i]: ${STRATEGIES[$i]}"
+      probe_state_write "$i" "$total" "${STRATEGIES[$i]}" 1 ""
       if set_opt "$(build_opt "${STRATEGIES[$i]}")"; then activate; else ensure_zapret_on; fi
       if probe_test_targets; then
         log "рабочая стратегия найдена: индекс $i (${STRATEGIES[$i]})"
         printf '%s\n' "$i" > "$cf"
-        ensure_direct_all; apply_direct_change; probe_teardown
+        ensure_direct_all; apply_direct_change; probe_teardown; probe_state_clear
         return 0
       fi
     done
 
     log "ни одна стратегия не сработала -> Discord/YouTube через VPN"
     zapret_off
-    ensure_direct_min; apply_direct_change; probe_teardown
+    ensure_direct_min; apply_direct_change; probe_teardown; probe_state_clear
     printf 'vpn\n' > "$cf"
     return 0
   fi
@@ -394,18 +411,22 @@ run_scan() {
   # --- запасной перебор без изоляции (как было) ---
   ensure_direct_all
   apply_direct_change
+  probe_state_write 0 0 "проверка сети" 0 ""
   zapret_off
   if test_targets; then
     log "сеть чистая: без обхода всё открывается -> zapret выключен"
     printf 'off\n' > "$cf"
+    probe_state_clear
     return 0
   fi
   for i in "${!STRATEGIES[@]}"; do
     log "пробую[$i]: ${STRATEGIES[$i]}"
+    probe_state_write "$i" "$total" "${STRATEGIES[$i]}" 0 ""
     if set_opt "$(build_opt "${STRATEGIES[$i]}")"; then activate; else ensure_zapret_on; fi
     if test_targets; then
       log "рабочая стратегия найдена: индекс $i (${STRATEGIES[$i]})"
       printf '%s\n' "$i" > "$cf"
+      probe_state_clear
       return 0
     fi
   done
@@ -418,6 +439,7 @@ run_scan() {
   else
     log "VPN не поднялся или цели не открылись (проверь профиль/ноду omavpn)"
   fi
+  probe_state_clear
   printf 'vpn\n' > "$cf"
   return 0
 }
@@ -485,7 +507,7 @@ main() {
   fi
   exec 9>"$LOCK" || exit 1
   flock -n 9 || { log "уже выполняется, пропуск"; exit 0; }
-  trap 'probe_teardown' EXIT
+  trap 'probe_teardown; probe_state_clear' EXIT
 
   case "${1:-run}" in
     run)     run normal ;;

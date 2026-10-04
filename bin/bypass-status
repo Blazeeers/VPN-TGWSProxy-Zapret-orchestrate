@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """bypass-status — агрегированный статус всех «обходов» для виджета панели.
 
-Печатает JSON с состоянием: VPN (omavpn/wowvpn), zapret + автотюн, tg-ws-proxy,
-Telegram-бот и direct-список. Зависимостей нет, root не нужен.
+Печатает JSON с состоянием: VPN (omavpn/wowvpn), zapret + автотюн,
+tg-ws-proxy и direct-список. Зависимостей нет, root не нужен.
 
     bypass-status            # JSON
     bypass-status --check    # JSON + живые проверки доступности (медленнее)
@@ -98,6 +98,16 @@ def vpn_status(cli: str) -> dict:
     }
 
 
+def probe_state() -> dict:
+    """Состояние фонового подбора (пишет zapret-autotune во время сканирования)."""
+    path = os.path.join(AUTOTUNE_DIR, "probe.json")
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if data.get("active") else {}
+
+
 def zapret_status(iface: str) -> dict:
     key = net_key(iface)
     mode = ""
@@ -105,14 +115,23 @@ def zapret_status(iface: str) -> dict:
         mode = open(os.path.join(AUTOTUNE_DIR, f"{key}.strategy"), encoding="utf-8").read().strip()
     except OSError:
         pass
-    return {
+    st = {
         "service": run(["systemctl", "is-active", "zapret.service"]) or "unknown",
         "autotune": run(["systemctl", "is-active", "zapret-autotune.service"]) or "unknown",
         "timer": run(["systemctl", "is-active", "zapret-autotune.timer"]) or "unknown",
         "iface": iface,
         "network": key,
         "mode": mode,
+        "testing": False,
     }
+    ps = probe_state()
+    if ps:
+        st["testing"] = True
+        st["tested"] = int(ps.get("index") or 0)
+        st["total"] = int(ps.get("total") or 0)
+        st["strategy"] = ps.get("strategy", "")
+        st["isolated"] = bool(ps.get("isolated"))
+    return st
 
 
 def port_open(port: int) -> bool:
@@ -130,11 +149,6 @@ def tgwsproxy_status() -> dict:
     except (OSError, ValueError):
         pass
     return {"running": running, "port": port, "listening": port_open(port)}
-
-
-def bot_status() -> dict:
-    state = run(["systemctl", "--user", "is-active", "telegram-inbox-bot.service"])
-    return {"active": state == "active", "state": state or "unknown"}
 
 
 def direct_status(app: str) -> dict:
@@ -174,7 +188,6 @@ def collect(check: bool) -> dict:
         "vpn": vpn_status(cli),
         "zapret": zapret_status(iface),
         "tgwsproxy": tgwsproxy_status(),
-        "bot": bot_status(),
         "direct": direct_status(app),
     }
     if check:

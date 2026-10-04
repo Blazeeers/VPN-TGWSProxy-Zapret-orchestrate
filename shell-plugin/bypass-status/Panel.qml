@@ -27,11 +27,11 @@ Panel {
   readonly property var vpn: (root.bs && root.bs.vpn) ? root.bs.vpn : ({})
   readonly property var zap: (root.bs && root.bs.zapret) ? root.bs.zapret : ({})
   readonly property var tg: (root.bs && root.bs.tgwsproxy) ? root.bs.tgwsproxy : ({})
-  readonly property var bot: (root.bs && root.bs.bot) ? root.bs.bot : ({})
   readonly property var chk: (root.bs && root.bs.checks) ? root.bs.checks : null
   readonly property string cliPath: (root.bs && root.bs.cli) ? root.bs.cli : ""
 
   readonly property bool vpnOn: !!root.vpn.running
+  readonly property bool zapTesting: !!root.zap.testing || root.zap.autotune === "activating"
 
   function fmtUptime(s) {
     s = Math.max(0, Number(s) || 0)
@@ -43,7 +43,7 @@ Panel {
   function codeState(code) { return (code >= 200 && code < 400) ? "ok" : "bad" }
 
   readonly property var rows: {
-    var out = [], v = root.vpn, z = root.zap, t = root.tg, b = root.bot
+    var out = [], v = root.vpn, z = root.zap, t = root.tg
 
     if (v.running) {
       out.push({ name: "VPN", state: "ok",
@@ -51,6 +51,13 @@ Panel {
     } else {
       out.push({ name: "VPN", state: (v.installed === false ? "bad" : "warn"),
         detail: (v.installed === false ? "не установлен" : "выключен") })
+    }
+
+    if (root.zapTesting) {
+      var stxt = (Number(z.tested) > 0 && Number(z.total) > 0)
+        ? ("попытка " + (Number(z.tested) + 1) + "/" + z.total + " · ") : ""
+      out.push({ name: "Подбор стратегии", state: "warn",
+        detail: stxt + (z.strategy || z.text || "идёт проверка") + (z.isolated ? " · изолированно" : "") })
     }
 
     var zState = "warn", zDetail = "нет данных"
@@ -64,9 +71,6 @@ Panel {
 
     out.push({ name: "tg-ws-proxy", state: t.listening ? "ok" : "bad",
       detail: t.listening ? ("порт " + t.port + ", работает") : "не слушает" })
-
-    out.push({ name: "Telegram-бот", state: b.active ? "ok" : "bad",
-      detail: b.active ? "работает" : (b.state || "неизвестно") })
 
     if (root.chk) {
       out.push({ name: "Яндекс", state: root.codeState(root.chk.yandex), detail: "HTTP " + root.chk.yandex })
@@ -90,9 +94,8 @@ Panel {
   readonly property color healthColor: root.anyBad ? root.urgent : (root.anyWarn ? root.warn : Color.accent)
   readonly property string summary:
     "VPN " + (root.vpnOn ? "вкл" : "выкл")
-    + " · zapret " + (root.zap.mode === "vpn" ? "через VPN" : (root.zap.service === "active" ? "вкл" : "выкл"))
+    + " · zapret " + (root.zapTesting ? "подбор…" : (root.zap.mode === "vpn" ? "через VPN" : (root.zap.service === "active" ? "вкл" : "выкл")))
     + " · TG " + (root.tg.listening ? "ок" : "нет")
-    + " · бот " + (root.bot.active ? "ок" : "нет")
 
   // ---- actions ------------------------------------------------------------
   function run(args, label) {

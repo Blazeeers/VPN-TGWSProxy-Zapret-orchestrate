@@ -4,6 +4,16 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.2.1] — 2026-10-04
+
+### Added
+- Виджет «Обходы»: строка **«Подбор стратегии»** во время фонового перебора —
+  показывает попытку `i/N`, текущую стратегию и пометку «изолированно»
+  (автотюн пишет состояние в `/var/lib/zapret-autotune/probe.json`).
+
+### Changed
+- Виджет «Обходы»: убрано состояние Telegram-бота и его упоминания.
+
 ## [1.2.0] — 2026-10-04
 
 ### Added
@@ -67,6 +77,7 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[1.2.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.0.0...v1.1.0
