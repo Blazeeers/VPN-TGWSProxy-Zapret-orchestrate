@@ -4,6 +4,12 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.4.1] — 2026-10-04
+
+### Added
+- Виджет «Обходы»: информационная строка **YouTube** — «трафик идёт напрямую,
+  без VPN и обхода» (когда YouTube не туннелируется и zapret его не обрабатывает).
+
 ## [1.4.0] — 2026-10-04
 
 ### Added
@@ -124,6 +130,7 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[1.4.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.4...v1.3.0

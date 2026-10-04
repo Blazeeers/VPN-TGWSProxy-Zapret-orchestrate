@@ -39,6 +39,12 @@ Panel {
   readonly property bool tgDown: !root.tg.listening
   readonly property bool zapretBroken: !root.zapTesting &&
     (root.zap.mode === "vpn" || (root.zap.service !== "active" && root.zap.mode !== "off"))
+  // YouTube идёт напрямую и zapret его не обрабатывает.
+  readonly property bool youtubeDirectNoBypass: {
+    var d = root.zap.direct || ""
+    var s = root.zap.services || ""
+    return d.indexOf("youtube") >= 0 && s.indexOf("youtube") < 0
+  }
 
   // Пиктограмма трея по приоритету: VPN → подбор → tg-ws-proxy → zapret.
   readonly property string statusIcon:
@@ -117,6 +123,10 @@ Panel {
     else if (z.mode !== "" && z.mode !== undefined) { zState = "ok"; zDetail = "стратегия #" + z.mode + root.servicesHint(z) }
     else { zState = "warn"; zDetail = "режим неизвестен" }
     out.push({ name: "zapret (DPI)", state: zState, detail: zDetail + (z.network ? " · " + z.network : "") })
+
+    if (root.youtubeDirectNoBypass) {
+      out.push({ name: "YouTube", state: "ok", detail: "трафик идёт напрямую, без VPN и обхода" })
+    }
 
     out.push({ name: "tg-ws-proxy", state: t.listening ? "ok" : "bad",
       detail: t.listening ? ("порт " + t.port + ", работает") : "не слушает" })
