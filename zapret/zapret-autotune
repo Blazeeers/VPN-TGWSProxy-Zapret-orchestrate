@@ -43,6 +43,8 @@ PROBE_UID=""
 PROBE_ACTIVE=0
 CURL_BIN="$(command -v curl 2>/dev/null || echo /usr/bin/curl)"
 PROBE_STATE="$CACHE/probe.json"
+# Как часто в режиме vpn перепроверять, не появился ли рабочий обход (сек).
+RETRY_SECONDS="${RETRY_SECONDS:-1800}"
 
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG" 2>/dev/null; }
 
@@ -193,6 +195,19 @@ PY
   chmod 644 "$PROBE_STATE" 2>/dev/null || true
 }
 probe_state_clear() { rm -f "$PROBE_STATE" 2>/dev/null || true; }
+
+# Периодическая перепроверка обхода в режиме vpn.
+scan_due() { # $1 ключ сети; 0 = пора перепроверять
+  local f="$CACHE/$1.lastscan" now last
+  now="$(date +%s)"
+  last="$(cat "$f" 2>/dev/null || echo 0)"
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $((now - last)) -ge "$RETRY_SECONDS" ]
+}
+mark_scan() { # $1 ключ сети
+  date +%s > "$CACHE/$1.lastscan" 2>/dev/null || true
+  chmod 644 "$CACHE/$1.lastscan" 2>/dev/null || true
+}
 
 # --- zapret -----------------------------------------------------------------
 build_opt() {
@@ -488,13 +503,17 @@ run() {
   if [ -s "$cf" ] && [ "$force" != "force" ]; then
     strat="$(cat "$cf")"
     log "кэш: strategy=$strat, проверяю"
-    if apply_cached "$strat" "$key"; then
+    if [ "$strat" = "vpn" ] && scan_due "$key"; then
+      log "vpn-режим: пора перепроверить обход (${RETRY_SECONDS}s) -> переподбор"
+    elif apply_cached "$strat" "$key"; then
       log "кэш работает"
       return 0
+    else
+      log "кэш перестал работать -> переподбор"
     fi
-    log "кэш перестал работать -> переподбор"
   fi
   run_scan "$key" "$cf"
+  mark_scan "$key"
 }
 
 main() {

@@ -48,6 +48,8 @@ USER_HOME=$USER_HOME
 AUTO_VPN=1
 # Пользователь для изолированного пробника стратегий.
 PROBE_USER=$PROBE_USER
+# Как часто (сек) в режиме vpn перепроверять, не появился ли рабочий обход.
+RETRY_SECONDS=1800
 EOF
 chmod 644 /etc/zapret-autotune.conf
 

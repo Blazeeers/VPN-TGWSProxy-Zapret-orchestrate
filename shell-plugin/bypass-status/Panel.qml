@@ -42,6 +42,13 @@ Panel {
 
   function codeState(code) { return (code >= 200 && code < 400) ? "ok" : "bad" }
 
+  function retryHint(z) {
+    if (!z || !z.retry_seconds) return ""
+    var s = Number(z.retry_in) || 0
+    if (s <= 0) return " · перепроверка скоро"
+    return " · перепроверка через " + Math.ceil(s / 60) + " мин"
+  }
+
   readonly property var rows: {
     var out = [], v = root.vpn, z = root.zap, t = root.tg
 
@@ -61,7 +68,7 @@ Panel {
     }
 
     var zState = "warn", zDetail = "нет данных"
-    if (z.mode === "vpn") { zState = "warn"; zDetail = "обход не сработал → через VPN" }
+    if (z.mode === "vpn") { zState = "warn"; zDetail = "обход не сработал → через VPN" + root.retryHint(z) }
     else if (z.mode === "off") { zState = "ok"; zDetail = "сеть чистая, обход не нужен" }
     else if (z.service !== "active") { zState = "warn"; zDetail = "служба выключена" }
     else if (z.mode === "custom") { zState = "ok"; zDetail = "кастомная стратегия" }

@@ -4,6 +4,14 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.2.2] — 2026-10-04
+
+### Added
+- Автотюн в режиме `vpn` теперь **периодически перепроверяет обход** (раз в
+  `RETRY_SECONDS`, по умолчанию 30 мин) в изолированном режиме: в виджете
+  появляется строка «Подбор стратегии», а в строке zapret — «перепроверка через
+  N мин». Так обход не «выключается навсегда» после одной неудачи.
+
 ## [1.2.1] — 2026-10-04
 
 ### Added
@@ -77,6 +85,7 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[1.2.2]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.1.0...v1.1.1

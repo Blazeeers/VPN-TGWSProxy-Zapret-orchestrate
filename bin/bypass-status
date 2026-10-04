@@ -16,6 +16,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 
 HOME = os.path.expanduser("~")
 AUTOTUNE_DIR = "/var/lib/zapret-autotune"
@@ -98,6 +99,16 @@ def vpn_status(cli: str) -> dict:
     }
 
 
+def autotune_retry_seconds() -> int:
+    try:
+        for line in open("/etc/zapret-autotune.conf", encoding="utf-8"):
+            if line.strip().startswith("RETRY_SECONDS="):
+                return int((line.split("=", 1)[1].strip() or "1800"))
+    except (OSError, ValueError):
+        pass
+    return 1800
+
+
 def probe_state() -> dict:
     """Состояние фонового подбора (пишет zapret-autotune во время сканирования)."""
     path = os.path.join(AUTOTUNE_DIR, "probe.json")
@@ -131,6 +142,15 @@ def zapret_status(iface: str) -> dict:
         st["total"] = int(ps.get("total") or 0)
         st["strategy"] = ps.get("strategy", "")
         st["isolated"] = bool(ps.get("isolated"))
+
+    retry = autotune_retry_seconds()
+    last = 0
+    try:
+        last = int(open(os.path.join(AUTOTUNE_DIR, f"{key}.lastscan"), encoding="utf-8").read().strip() or "0")
+    except (OSError, ValueError):
+        last = 0
+    st["retry_seconds"] = retry
+    st["retry_in"] = max(0, retry - (int(time.time()) - last)) if last else 0
     return st
 
 

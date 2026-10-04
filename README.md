@@ -190,7 +190,7 @@ omavpn nodes        # узлы выбранного профиля
 | `off` | сеть ничего не блокирует | zapret выключен, всё напрямую |
 | `<индекс>` | одна из встроенных стратегий работает | zapret включён, Discord/YouTube напрямую |
 | `custom` | стратегию нашёл `blockcheck` | zapret включён с сохранённой строкой |
-| `vpn` | ничего не помогло | Discord/YouTube уходят в туннель, при `AUTO_VPN=1` поднимается omavpn |
+| `vpn` | ничего не помогло | Discord/YouTube уходят в туннель, при `AUTO_VPN=1` поднимается omavpn; обход перепроверяется каждые 30 мин (`RETRY_SECONDS`) |
 
 Триггеры запуска: смена сети (NetworkManager dispatcher), загрузка
 (`OnBootSec=3min`), периодически (`OnUnitActiveSec=15min`). Применяется только
