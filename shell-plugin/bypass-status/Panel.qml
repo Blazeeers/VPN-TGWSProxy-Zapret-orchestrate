@@ -60,15 +60,13 @@ Panel {
         detail: (v.installed === false ? "не установлен" : "выключен") })
     }
 
+    var zState = "warn", zDetail = "нет данных"
     if (root.zapTesting) {
       var stxt = (Number(z.tested) > 0 && Number(z.total) > 0)
         ? ("попытка " + (Number(z.tested) + 1) + "/" + z.total + " · ") : ""
-      out.push({ name: "Подбор стратегии", state: "warn",
-        detail: stxt + (z.strategy || z.text || "идёт проверка") + (z.isolated ? " · изолированно" : "") })
-    }
-
-    var zState = "warn", zDetail = "нет данных"
-    if (z.mode === "vpn") { zState = "warn"; zDetail = "обход не сработал → через VPN" + root.retryHint(z) }
+      zState = "warn"
+      zDetail = "идёт подбор: " + stxt + (z.strategy || z.text || "проверка") + (z.isolated ? " · изолированно" : "")
+    } else if (z.mode === "vpn") { zState = "warn"; zDetail = "обход не сработал → через VPN" + root.retryHint(z) }
     else if (z.mode === "off") { zState = "ok"; zDetail = "сеть чистая, обход не нужен" }
     else if (z.service !== "active") { zState = "warn"; zDetail = "служба выключена" }
     else if (z.mode === "custom") { zState = "ok"; zDetail = "кастомная стратегия" }
