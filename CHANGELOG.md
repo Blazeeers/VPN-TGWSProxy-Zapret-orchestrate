@@ -4,6 +4,14 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.2.4] — 2026-10-04
+
+### Added
+- Значок виджета в панели теперь меняется по статусу: разорванная связь (VPN не
+  работает), лупа (идёт подбор стратегии zapret), бумажный самолётик
+  (tg-ws-proxy не работает), восклицание (zapret не работает), щит (всё в
+  порядке). Цвет значка — по важности состояния.
+
 ## [1.2.3] — 2026-10-04
 
 ### Changed
@@ -92,6 +100,7 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[1.2.4]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.3...v1.2.4
 [1.2.3]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.2.0...v1.2.1

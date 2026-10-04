@@ -32,6 +32,29 @@ Panel {
 
   readonly property bool vpnOn: !!root.vpn.running
   readonly property bool zapTesting: !!root.zap.testing || root.zap.autotune === "activating"
+  readonly property bool tgDown: !root.tg.listening
+  readonly property bool zapretBroken: !root.zapTesting &&
+    (root.zap.mode === "vpn" || (root.zap.service !== "active" && root.zap.mode !== "off"))
+
+  // Пиктограмма трея по приоритету: VPN → подбор → tg-ws-proxy → zapret.
+  readonly property string statusIcon:
+    !root.vpnOn ? "\uf127" :            // разорванная связь — VPN не работает
+    root.zapTesting ? "\uf002" :        // лупа — идёт подбор стратегии
+    root.tgDown ? "\uf1d8" :            // бумажный самолётик — tg-ws-proxy не работает
+    root.zapretBroken ? "\uf071" :      // восклицание — zapret не работает
+    "\uf132"                            // щит — всё в порядке
+  readonly property color statusColor:
+    !root.vpnOn ? root.urgent :
+    root.zapTesting ? root.warn :
+    root.tgDown ? root.urgent :
+    root.zapretBroken ? root.warn :
+    Color.accent
+  readonly property string statusText:
+    !root.vpnOn ? "VPN не работает" :
+    root.zapTesting ? "идёт подбор стратегии" :
+    root.tgDown ? "tg-ws-proxy не работает" :
+    root.zapretBroken ? "zapret не работает" :
+    "всё в порядке"
 
   function fmtUptime(s) {
     s = Math.max(0, Number(s) || 0)
@@ -178,10 +201,10 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "\uf132"
+    text: root.statusIcon
     active: true
-    activeColor: root.healthColor
-    tooltipText: "Обходы: " + root.summary
+    activeColor: root.statusColor
+    tooltipText: "Обходы: " + root.statusText + " · " + root.summary
     onPressed: function(buttonCode) { root.toggle() }
   }
 
@@ -227,8 +250,8 @@ Panel {
 
           iconComponent: Component {
             Text {
-              text: "\uf132"
-              color: root.healthColor
+              text: root.statusIcon
+              color: root.statusColor
               font.family: root.fontFamily
               font.pixelSize: Style.font.display
             }
