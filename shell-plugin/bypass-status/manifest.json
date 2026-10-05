@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.blazeeers.bypass-status",
   "name": "Bypass Status",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "author": "blazeeers",
   "license": "MIT",
   "description": "Tray widget showing the status of all bypasses: VPN (omavpn/wowvpn), zapret DPI, tg-ws-proxy and live reachability checks.",

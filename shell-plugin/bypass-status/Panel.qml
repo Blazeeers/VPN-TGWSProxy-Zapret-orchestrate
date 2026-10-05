@@ -197,7 +197,6 @@ Panel {
     command: [root.scriptPath, "--json"]
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
     onExited: function(code) {
-      if (root.busy === "refresh" && !vpnProc.running) { root.busy = ""; root.markRefreshed() }
       if (code !== 0) return
       try {
         var d = JSON.parse(statusOut.text)
@@ -226,7 +225,6 @@ Panel {
     command: [root.scriptPath, "--vpn"]
     stdout: StdioCollector { id: vpnOut; waitForEnd: true }
     onExited: function(code) {
-      if (root.busy === "refresh") { root.busy = ""; root.markRefreshed() }
       if (code !== 0) return
       try {
         var d = JSON.parse(vpnOut.text)
@@ -510,40 +508,6 @@ Panel {
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onClicked: root.run(["update"], "update")
-            }
-          }
-
-          Rectangle {
-            id: refreshBtn
-            implicitWidth: refreshTxt.implicitWidth + Style.space(20)
-            implicitHeight: refreshTxt.implicitHeight + Style.space(12)
-            radius: Style.cornerRadius > 0 ? Style.space(8) : 0
-            color: rmouse.containsMouse ? root.hoverFill
-                   : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
-            border.width: 1
-            border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
-
-            Text {
-              id: refreshTxt
-              anchors.centerIn: parent
-              textFormat: Text.PlainText
-              text: root.busy === "refresh" ? "…" : "Обновить данные"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-            }
-            MouseArea {
-              id: rmouse
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: {
-                if (root.busy !== "") return
-                root.busy = "refresh"
-                if (!statusProc.running) statusProc.running = true
-                if (!vpnProc.running) vpnProc.running = true
-                if (!statusProc.running && !vpnProc.running) { root.busy = ""; root.markRefreshed() }
-              }
             }
           }
 
