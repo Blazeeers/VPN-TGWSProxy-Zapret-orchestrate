@@ -18,6 +18,7 @@ Panel {
   property bool vpnLoaded: false
   property bool vpnExpanded: false
   property string busy: ""
+  property string refreshedAt: ""
   property string lastError: ""
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -83,6 +84,8 @@ Panel {
     if (s <= 0) return " · перепроверка скоро"
     return " · перепроверка через " + Math.ceil(s / 60) + " мин"
   }
+
+  function markRefreshed() { root.refreshedAt = Qt.formatTime(new Date(), "HH:mm:ss") }
 
   function directSummary(d) {
     d = d || ""
@@ -194,6 +197,7 @@ Panel {
     command: [root.scriptPath, "--json"]
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
     onExited: function(code) {
+      if (root.busy === "refresh" && !vpnProc.running) { root.busy = ""; root.markRefreshed() }
       if (code !== 0) return
       try {
         var d = JSON.parse(statusOut.text)
@@ -208,6 +212,7 @@ Panel {
     stdout: StdioCollector { id: checkOut; waitForEnd: true }
     onExited: function(code) {
       root.busy = ""
+      root.markRefreshed()
       if (code !== 0) { root.lastError = "проверка не удалась"; return }
       try {
         var d = JSON.parse(checkOut.text)
@@ -221,7 +226,7 @@ Panel {
     command: [root.scriptPath, "--vpn"]
     stdout: StdioCollector { id: vpnOut; waitForEnd: true }
     onExited: function(code) {
-      root.busy = ""
+      if (root.busy === "refresh") { root.busy = ""; root.markRefreshed() }
       if (code !== 0) return
       try {
         var d = JSON.parse(vpnOut.text)
@@ -236,6 +241,7 @@ Panel {
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function(code) {
       root.busy = ""
+      root.markRefreshed()
       if (code !== 0) {
         var t = (actionErr.text || actionOut.text || "").trim()
         try { var j = JSON.parse(t); if (j.error) t = j.error } catch (e) { /* plain */ }
@@ -521,7 +527,7 @@ Panel {
               id: refreshTxt
               anchors.centerIn: parent
               textFormat: Text.PlainText
-              text: "Обновить"
+              text: root.busy === "refresh" ? "…" : "Обновить данные"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -531,7 +537,13 @@ Panel {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onClicked: if (!statusProc.running) statusProc.running = true
+              onClicked: {
+                if (root.busy !== "") return
+                root.busy = "refresh"
+                if (!statusProc.running) statusProc.running = true
+                if (!vpnProc.running) vpnProc.running = true
+                if (!statusProc.running && !vpnProc.running) { root.busy = ""; root.markRefreshed() }
+              }
             }
           }
 
@@ -596,6 +608,16 @@ Panel {
               onClicked: root.run(["toggle"], "vpn")
             }
           }
+        }
+
+        Text {
+          width: parent.width
+          visible: root.refreshedAt !== ""
+          textFormat: Text.PlainText
+          text: "обновлено " + root.refreshedAt
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
         }
       }
     }

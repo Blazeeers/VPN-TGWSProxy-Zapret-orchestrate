@@ -15,6 +15,14 @@
 - `tgwsproxy/install.sh` записывает установленную версию
   (`~/.local/share/tgwsproxy/version`) — для сравнения при проверке.
 
+## [1.5.1] — 2026-10-04
+
+### Fixed
+- Виджет «Обходы»: кнопка **«Обновить данные»** (была «Обновить») теперь
+  перезапрашивает и статусы, и список профилей/стран, и показывает внизу
+  «обновлено HH:MM:SS». Раньше она лишь повторяла опрос статуса, который и так
+  идёт каждые 4 с — поэтому казалось, что кнопка не работает.
+
 ## [1.4.1] — 2026-10-04
 
 ### Added
@@ -141,6 +149,7 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[1.5.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.3.1...v1.4.0
