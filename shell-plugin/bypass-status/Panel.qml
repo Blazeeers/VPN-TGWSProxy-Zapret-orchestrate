@@ -152,7 +152,9 @@ Panel {
       var items = []
       if (u.zapret && u.zapret.update) items.push("zapret " + (u.zapret.installed || "?") + " → " + u.zapret.latest)
       if (u.tgwsproxy && u.tgwsproxy.update) items.push("tg-ws-proxy " + (u.tgwsproxy.installed || "?") + " → " + u.tgwsproxy.latest)
-      out.push({ name: "Обновления", state: "warn", detail: "доступны: " + items.join(", ") })
+      var udetail = root.busy === "upd" ? "обновляю…"
+                  : ("доступны: " + items.join(", ") + " · нажми, чтобы обновить")
+      out.push({ name: "Обновления", state: "warn", detail: udetail, action: "update" })
     }
 
     out.push({ name: "tg-ws-proxy", state: t.listening ? "ok" : "bad",
@@ -284,6 +286,23 @@ Panel {
     }
   }
 
+  Process {
+    id: updProc
+    command: [root.scriptPath, "--update-components"]
+    stdout: StdioCollector { id: updOut; waitForEnd: true }
+    onExited: function(code) {
+      root.busy = ""
+      var msg = "не удалось обновить"
+      try {
+        var d = JSON.parse(updOut.text)
+        if (d && d.messages && d.messages.length) msg = d.messages.join("; ")
+      } catch (e) { /* ignore */ }
+      root.notice = msg
+      noticeTimer.restart()
+      if (!statusProc.running) statusProc.running = true
+    }
+  }
+
   Timer {
     id: noticeTimer
     interval: 8000
@@ -403,7 +422,7 @@ Panel {
               width: column.width
               implicitHeight: scol.implicitHeight + Style.space(12)
               radius: Style.cornerRadius > 0 ? Style.space(8) : 0
-              color: (srow.modelData.expandable && srmouse.containsMouse) ? root.hoverFill : "transparent"
+              color: ((srow.modelData.expandable === true || srow.modelData.action === "update") && srmouse.containsMouse) ? root.hoverFill : "transparent"
 
               Column {
                 id: scol
@@ -456,10 +475,20 @@ Panel {
               MouseArea {
                 id: srmouse
                 anchors.fill: parent
-                enabled: srow.modelData.expandable === true
+                enabled: srow.modelData.expandable === true || srow.modelData.action === "update"
                 hoverEnabled: true
-                cursorShape: srow.modelData.expandable ? Qt.PointingHandCursor : Qt.ArrowCursor
-                onClicked: if (srow.modelData.expandable) root.vpnExpanded = !root.vpnExpanded
+                cursorShape: (srow.modelData.expandable === true || srow.modelData.action === "update")
+                             ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onClicked: {
+                  if (srow.modelData.expandable === true) {
+                    root.vpnExpanded = !root.vpnExpanded
+                    return
+                  }
+                  if (srow.modelData.action === "update" && root.busy === "") {
+                    root.busy = "upd"
+                    updProc.running = true
+                  }
+                }
               }
             }
           }

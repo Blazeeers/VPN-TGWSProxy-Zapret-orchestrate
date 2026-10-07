@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -492,6 +493,138 @@ def cached_updates(app: str) -> dict:
     return data
 
 
+def run_rc(cmd: list[str], timeout: float = 900.0) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+
+
+def _gh_release_asset(repo: str, asset_name: str) -> dict:
+    out = run(["curl", "-s", "--max-time", "20", "-H", "Accept: application/vnd.github+json",
+               f"https://api.github.com/repos/{repo}/releases/latest"], timeout=25)
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return {}
+    for asset in data.get("assets") or []:
+        if asset.get("name") == asset_name:
+            return {"tag": str(data.get("tag_name") or "").lstrip("v"),
+                    "url": asset.get("browser_download_url") or "",
+                    "digest": str(asset.get("digest") or "")}
+    return {}
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _launch_in_terminal(command: str) -> bool:
+    term = shutil.which("omarchy-launch-terminal")
+    if not term:
+        return False
+    try:
+        subprocess.Popen([term, "bash", "-lc", command], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+
+def update_tgwsproxy() -> dict:
+    """Обновляет tg-ws-proxy из последнего релиза GitHub (sha256-дайджест из API)."""
+    asset_name = "TgWsProxy_linux_amd64"
+    meta = _gh_release_asset(TGWS_REPO, asset_name)
+    if not meta or not meta.get("url"):
+        return {"ok": False, "error": "не удалось получить релиз с GitHub"}
+    digest = str(meta.get("digest") or "").removeprefix("sha256:")
+    if not digest:
+        return {"ok": False, "error": "в релизе нет sha256-дайджеста — обнови вручную"}
+    version = meta["tag"]
+    tmp = os.path.join(HOME, ".cache", "tgwsproxy", f"{asset_name}-{version}.tmp")
+    os.makedirs(os.path.dirname(tmp), exist_ok=True)
+    rc, _ = run_rc(["curl", "-fL", "--retry", "3", "-sS", "-o", tmp, meta["url"]], timeout=900)
+    if rc != 0 or not os.path.exists(tmp):
+        return {"ok": False, "error": "не удалось скачать релиз"}
+    if _sha256_file(tmp) != digest:
+        os.remove(tmp)
+        return {"ok": False, "error": "sha256 не совпал — обновление отменено"}
+    binary = os.path.join(HOME, ".local", "bin", "tg-ws-proxy")
+    os.makedirs(os.path.dirname(binary), exist_ok=True)
+    was_running = bool(run(["pgrep", "-x", "tg-ws-proxy"]))
+    if os.path.exists(binary):
+        shutil.copy2(binary, binary + ".bak")
+    os.replace(tmp, binary)
+    os.chmod(binary, 0o755)
+    version_file = os.path.join(HOME, ".local", "share", "tgwsproxy", "version")
+    os.makedirs(os.path.dirname(version_file), exist_ok=True)
+    with open(version_file, "w", encoding="utf-8") as handle:
+        handle.write(version + "\n")
+    if was_running:
+        run(["pkill", "-x", "tg-ws-proxy"])
+        time.sleep(0.7)
+        subprocess.Popen([binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    return {"ok": True, "version": version, "restarted": was_running}
+
+
+def update_zapret() -> dict:
+    """zapret — системный пакет: repo через pkexec, AUR/фолбэк через yay в терминале."""
+    pkg = "zapret-git" if run(["pacman", "-Q", "zapret-git"]) else "zapret"
+    term_cmd = f"yay -S --noconfirm --needed {pkg}; echo; read -rp 'Готово, нажми Enter…'"
+    if run(["pacman", "-Si", pkg]):
+        pkexec = shutil.which("pkexec")
+        if pkexec:
+            rc, _ = run_rc([pkexec, "pacman", "-S", "--noconfirm", "--needed", pkg], timeout=1800)
+            if rc == 0:
+                return {"ok": True, "package": pkg}
+        if _launch_in_terminal(term_cmd):
+            return {"ok": True, "deferred": True, "package": pkg,
+                    "message": f"обновление {pkg} открыто в терминале — введи пароль"}
+        return {"ok": False, "error": f"обнови {pkg} вручную: yay -S {pkg}"}
+    if _launch_in_terminal(term_cmd):
+        return {"ok": True, "deferred": True, "package": pkg,
+                "message": f"обновление {pkg} открыто в терминале — введи пароль"}
+    return {"ok": False, "error": f"обнови {pkg} вручную: yay -S {pkg}"}
+
+
+def update_components(app: str) -> dict:
+    """Обновляет компоненты с доступными обновлениями (клик по строке «Обновления»)."""
+    data = check_updates()
+    results: list[dict] = []
+    messages: list[str] = []
+    if (data.get("tgwsproxy") or {}).get("update"):
+        res = update_tgwsproxy()
+        res["component"] = "tg-ws-proxy"
+        results.append(res)
+        if res.get("ok"):
+            messages.append("tg-ws-proxy обновлён до " + str(res.get("version"))
+                            + (" (перезапущен)" if res.get("restarted") else ""))
+        else:
+            messages.append("tg-ws-proxy: " + str(res.get("error")))
+    if (data.get("zapret") or {}).get("update"):
+        res = update_zapret()
+        res["component"] = "zapret"
+        results.append(res)
+        if res.get("message"):
+            messages.append(str(res["message"]))
+        elif res.get("ok"):
+            messages.append("zapret обновлён")
+        else:
+            messages.append("zapret: " + str(res.get("error")))
+    write_updates(app, check_updates())
+    if not results:
+        return {"ok": True, "results": [], "messages": ["обновлений нет"]}
+    return {"ok": all(r.get("ok") for r in results), "results": results,
+            "messages": messages or ["готово"]}
+
+
 def collect(check: bool) -> dict:
     app, cli = resolve_cli()
     iface = wan_iface()
@@ -517,6 +650,8 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="живые проверки доступности")
     ap.add_argument("--vpn", action="store_true", help="профили/серверы подписки + TCP-пинг")
     ap.add_argument("--updates", action="store_true", help="проверить обновления zapret/tg-ws-proxy")
+    ap.add_argument("--update-components", action="store_true",
+                    help="скачать и установить доступные обновления (zapret/tg-ws-proxy)")
     ap.add_argument("--yt", action="store_true", help="проверить YouTube (страница + видео с googlevideo)")
     ap.add_argument("--rescan-request", action="store_true", help="запросить перебор стратегий zapret")
     args = ap.parse_args()
@@ -529,6 +664,10 @@ def main() -> int:
         data = check_updates()
         write_updates(app, data)
         print(json.dumps(data, ensure_ascii=False))
+        return 0
+    if args.update_components:
+        app, _ = resolve_cli()
+        print(json.dumps(update_components(app), ensure_ascii=False))
         return 0
     if args.yt:
         app, _ = resolve_cli()
