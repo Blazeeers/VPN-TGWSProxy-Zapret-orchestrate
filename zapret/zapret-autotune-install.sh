@@ -33,6 +33,10 @@ else
 fi
 
 echo "==> Пользователь: $USER_NAME ($USER_HOME)"
+if ! command -v yt-dlp >/dev/null 2>&1; then
+  echo "    [!] yt-dlp не найден: проверка YouTube будет без замера скорости видео"
+  echo "        поставь: sudo pacman -S yt-dlp  (или pipx install yt-dlp)"
+fi
 echo "==> Ставлю скрипт в /usr/local/bin/zapret-autotune"
 install -Dm755 "$HERE/zapret-autotune" /usr/local/bin/zapret-autotune
 

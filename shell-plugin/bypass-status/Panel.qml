@@ -19,6 +19,7 @@ Panel {
   property bool vpnLoaded: false
   property bool vpnExpanded: false
   property string busy: ""
+  property string notice: ""
   property string refreshedAt: ""
   property string lastError: ""
 
@@ -269,8 +270,24 @@ Panel {
     stdout: StdioCollector { id: rescanOut; waitForEnd: true }
     onExited: function(code) {
       root.busy = ""
+      var msg = "не удалось запросить перебор"
+      if (code === 0) {
+        msg = "перебор запрошен — стратегии тестируются"
+        try {
+          var d = JSON.parse(rescanOut.text)
+          if (d && d.message) msg = d.message
+        } catch (e) { /* ignore */ }
+      }
+      root.notice = msg
+      noticeTimer.restart()
       if (!statusProc.running) statusProc.running = true
     }
+  }
+
+  Timer {
+    id: noticeTimer
+    interval: 8000
+    onTriggered: root.notice = ""
   }
 
   Process {
@@ -678,6 +695,17 @@ Panel {
               onClicked: root.run(["toggle"], "vpn")
             }
           }
+        }
+
+        Text {
+          width: parent.width
+          visible: root.notice !== ""
+          textFormat: Text.PlainText
+          text: root.notice
+          color: root.warn
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
         }
 
         Text {

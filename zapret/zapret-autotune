@@ -46,6 +46,18 @@ PROBE_STATE="$CACHE/probe.json"
 # Как часто в режиме vpn перепроверять, не появился ли рабочий обход (сек).
 RETRY_SECONDS="${RETRY_SECONDS:-1800}"
 
+# Глубокая проверка YouTube: страница + реальная скорость видео с googlevideo
+# (иначе «страница открывается, а видео не грузится»). yt-dlp — опционально.
+YTDLP_BIN="$(command -v yt-dlp 2>/dev/null || true)"
+YT_TEST_URL="https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+YT_MIN_BYTES=131072   # минимум скачанных байт
+YT_MIN_KBPS=100       # минимальная скорость, КиБ/с
+YT_DL_SECONDS=10      # бюджет на загрузку куска видео
+YT_PROBE_URL=""       # кэш ссылки на видео (трафик пробника)
+YT_HOST_URL=""        # кэш ссылки на видео (боевой трафик)
+YT_URL_FAILS=0        # сколько раз не удалось получить ссылку через yt-dlp
+YT_DL_CODE=0; YT_DL_SIZE=0; YT_DL_SECS=0; YT_DL_KBPS=0
+
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG" 2>/dev/null; }
 
 # --- списки доменов ---------------------------------------------------------
@@ -137,7 +149,7 @@ ok_url() {
   done
   return 1
 }
-test_targets() { ok_url https://www.youtube.com/ && ok_url https://discord.com/; }
+test_targets() { ok_url https://www.youtube.com/ && yt_video_check host && ok_url https://discord.com/; }
 
 # --- изолированный пробник --------------------------------------------------
 probe_uid() {
@@ -178,9 +190,71 @@ probe_any_url() {
   done
   return 1
 }
-# YouTube считается рабочим напрямую только если открывается и страница, и CDN видео
-# (googlevideo) — иначе «страница грузится, а видео нет».
-probe_youtube_direct() { probe_ok_url https://www.youtube.com/ && probe_any_url https://redirector.googlevideo.com/; }
+
+# --- глубокая проверка видео YouTube ----------------------------------------
+yt_dl_stats() { # $1 url, $2 runner (probe|host) -> "code size secs"
+  if [ "$2" = probe ]; then
+    runuser -u "$PROBE_USER" -- env HOME=/tmp "$CURL_BIN" -4 -s -o /dev/null \
+      -r "0-$((YT_MIN_BYTES * 2 - 1))" --max-time "$YT_DL_SECONDS" \
+      -w '%{http_code} %{size_download} %{time_total}' "$1" 2>/dev/null
+  else
+    env HOME=/tmp "$CURL_BIN" -4 -s -o /dev/null \
+      -r "0-$((YT_MIN_BYTES * 2 - 1))" --max-time "$YT_DL_SECONDS" \
+      -w '%{http_code} %{size_download} %{time_total}' "$1" 2>/dev/null
+  fi
+}
+yt_dl_ok() { # $1 = "code size secs"; заполняет YT_DL_*
+  YT_DL_CODE=0; YT_DL_SIZE=0; YT_DL_SECS=0; YT_DL_KBPS=0
+  set -- $1
+  YT_DL_CODE="${1:-0}"; YT_DL_SIZE="${2:-0}"; YT_DL_SECS="${3:-0}"
+  case "$YT_DL_CODE" in 200|206) ;; *) return 1 ;; esac
+  [ "${YT_DL_SIZE%.*}" -ge "$YT_MIN_BYTES" ] 2>/dev/null || return 1
+  YT_DL_KBPS="$(awk -v b="$YT_DL_SIZE" -v s="$YT_DL_SECS" \
+    'BEGIN { if (s <= 0) s = 0.001; printf "%d", (b / 1024) / s }')"
+  [ "$YT_DL_KBPS" -ge "$YT_MIN_KBPS" ] 2>/dev/null
+}
+yt_extract_url() { # $1 runner (probe|host); кэширует ссылку в YT_PROBE_URL/YT_HOST_URL
+  local u=""
+  [ -n "$YTDLP_BIN" ] || return 1
+  if [ "$1" = probe ]; then
+    u="$(timeout 45 runuser -u "$PROBE_USER" -- env HOME=/tmp "$YTDLP_BIN" \
+      --no-cache-dir -q --no-warnings -f worst -g "$YT_TEST_URL" 2>/dev/null | head -n1)"
+    [ -n "$u" ] || return 1
+    YT_PROBE_URL="$u"
+  else
+    u="$(timeout 45 "$YTDLP_BIN" --no-cache-dir -q --no-warnings -f worst -g \
+      "$YT_TEST_URL" 2>/dev/null | head -n1)"
+    [ -n "$u" ] || return 1
+    YT_HOST_URL="$u"
+  fi
+  YT_URL_FAILS=0
+  return 0
+}
+yt_video_check() { # $1 runner (probe|host); 0 = видео реально качается
+  local url
+  if [ -z "$YTDLP_BIN" ]; then
+    if [ "$1" = probe ]; then probe_any_url https://redirector.googlevideo.com/
+    else ok_url https://redirector.googlevideo.com/; fi
+    return
+  fi
+  if [ "$1" = probe ]; then url="$YT_PROBE_URL"; else url="$YT_HOST_URL"; fi
+  if [ -z "$url" ]; then
+    if [ "$YT_URL_FAILS" -ge 2 ] || ! yt_extract_url "$1"; then
+      YT_URL_FAILS=$((YT_URL_FAILS + 1))
+      [ "$YT_URL_FAILS" -eq 2 ] && log "yt-dlp не смог получить ссылку на видео — проверяю YouTube без скорости"
+      if [ "$1" = probe ]; then probe_any_url https://redirector.googlevideo.com/
+      else ok_url https://redirector.googlevideo.com/; fi
+      return
+    fi
+    if [ "$1" = probe ]; then url="$YT_PROBE_URL"; else url="$YT_HOST_URL"; fi
+  fi
+  yt_dl_ok "$(yt_dl_stats "$url" "$1")"
+}
+
+# YouTube считается работающим напрямую только если открывается страница И
+# реально качается кусок видео (googlevideo) — иначе «страница грузится, а
+# видео нет».
+probe_youtube_direct() { probe_ok_url https://www.youtube.com/ && yt_video_check probe; }
 probe_discord_direct() { probe_ok_url https://discord.com/; }
 probe_show_ips() {
   local host_ip probe_ip
@@ -431,7 +505,10 @@ run_scan() {
   if [ "$use_probe" = 1 ]; then
     probe_state_write 0 0 "проверка сети" 1 ""
     zapret_off
-    probe_youtube_direct && yt_ok=1
+    if probe_ok_url https://www.youtube.com/; then
+      if yt_video_check probe; then yt_ok=1
+      else log "страница YouTube открывается, но видео не качается напрямую (${YT_DL_KBPS} КиБ/с); проверю обход"; fi
+    fi
     probe_discord_direct && dc_ok=1
     log "прямая проверка: youtube=$yt_ok discord=$dc_ok"
 

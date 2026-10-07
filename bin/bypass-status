@@ -286,12 +286,27 @@ def cached_youtube(app: str) -> dict:
     return data
 
 
+def scan_running() -> bool:
+    """Идёт ли прямо сейчас подбор стратегий zapret."""
+    for unit in ("zapret-autotune-rescan.service", "zapret-autotune.service"):
+        state = run(["systemctl", "is-active", unit]) or ""
+        if state not in ("", "inactive", "failed", "unknown"):
+            return True
+    return False
+
+
 def request_rescan() -> dict:
     """Просит zapret-autotune перепроверить стратегии (через systemd path-юнит)."""
+    if scan_running():
+        return {"ok": False, "reason": "already_running", "message": "перебор уже идёт"}
     os.makedirs(os.path.dirname(RESCAN_REQUEST), exist_ok=True)
+    try:
+        os.remove(RESCAN_REQUEST)  # чтобы path-юнит точно увидел создание файла
+    except OSError:
+        pass
     with open(RESCAN_REQUEST, "w", encoding="utf-8") as handle:
         handle.write(str(time.time()))
-    return {"ok": True, "request": RESCAN_REQUEST}
+    return {"ok": True, "request": RESCAN_REQUEST, "message": "перебор запрошен — стратегии тестируются"}
 
 
 def live_checks() -> dict:

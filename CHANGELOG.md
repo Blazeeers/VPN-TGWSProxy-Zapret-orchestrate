@@ -4,6 +4,20 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.6.1] — 2026-10-08
+
+### Fixed
+- Автотюн: «YouTube работает напрямую» теперь проверяется по-настоящему —
+  страница **и** скорость видео с `googlevideo` (`yt-dlp` + `curl`, порог
+  ≥100 КиБ/с). Раньше проверялась только доступность страницы/CDN, из-за чего
+  выбиралась стратегия, при которой видео всё равно не грузилось.
+- Если видео не качается, перебор ищет общую стратегию для YouTube **и** Discord;
+  если ни одна не помогает — оба сервиса уходят в VPN.
+- Кнопка «Тест стратегий»: во время идущего перебора виджет показывает «перебор
+  уже идёт» вместо тихого игнорирования; запрос пересоздаёт файл, чтобы
+  systemd path-юнит сработал гарантированно.
+- Установщик автотюна предупреждает, если не найден `yt-dlp`.
+
 ## [1.6.0] — 2026-10-04
 
 ### Added
@@ -171,6 +185,7 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[1.6.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.5.2...v1.6.0
 [1.5.2]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.5.0...v1.5.1
