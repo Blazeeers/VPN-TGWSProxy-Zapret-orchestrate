@@ -194,11 +194,11 @@ probe_any_url() {
 # --- глубокая проверка видео YouTube ----------------------------------------
 yt_dl_stats() { # $1 url, $2 runner (probe|host) -> "code size secs"
   if [ "$2" = probe ]; then
-    runuser -u "$PROBE_USER" -- env HOME=/tmp "$CURL_BIN" -4 -s -o /dev/null \
+    runuser -u "$PROBE_USER" -- env HOME=/tmp "$CURL_BIN" -4 -sL -o /dev/null \
       -r "0-$((YT_MIN_BYTES * 2 - 1))" --max-time "$YT_DL_SECONDS" \
       -w '%{http_code} %{size_download} %{time_total}' "$1" 2>/dev/null
   else
-    env HOME=/tmp "$CURL_BIN" -4 -s -o /dev/null \
+    env HOME=/tmp "$CURL_BIN" -4 -sL -o /dev/null \
       -r "0-$((YT_MIN_BYTES * 2 - 1))" --max-time "$YT_DL_SECONDS" \
       -w '%{http_code} %{size_download} %{time_total}' "$1" 2>/dev/null
   fi

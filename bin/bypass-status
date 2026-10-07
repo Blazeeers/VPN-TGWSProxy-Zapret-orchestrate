@@ -236,7 +236,7 @@ def youtube_video_check() -> dict:
             url = ""
         if not url:
             return {"ok": False, "error": "yt-dlp не вернул ссылку"}
-        out = run(["curl", "-4", "-s", "--max-time", "25", "-o", "/dev/null",
+        out = run(["curl", "-4", "-sL", "--max-time", "25", "-o", "/dev/null",
                    "-r", "0-262143", "-w", "%{http_code} %{size_download} %{time_total}",
                    url], timeout=30)
         parts = out.split()
