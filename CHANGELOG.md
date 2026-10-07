@@ -4,6 +4,20 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.6.0] — 2026-10-04
+
+### Added
+- **Реальная проверка YouTube**: качается кусок видео с `googlevideo.com`
+  (через `yt-dlp` + `curl`) и меряется скорость — ловит случай «страница
+  открывается, видео не грузится» (троттлинг). Результат кэшируется
+  (`~/.cache/<cli>/yt.json`) и показывается строкой в виджете; иконка трея —
+  `YouTube` (жёлтая), если видео не грузится.
+- Кнопки в виджете: **Проверить YouTube** (`bypass-status --yt`) и
+  **Тест стратегий** (принудительный перебор zapret через
+  `--rescan-request` + systemd `zapret-autotune-rescan.path`).
+- Автотюн: прямая проверка YouTube теперь требует доступности и страницы, и CDN
+  `googlevideo` — иначе YouTube не считается работающим напрямую.
+
 ## [1.5.2] — 2026-10-04
 
 ### Removed
@@ -157,6 +171,7 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[1.6.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.5.2...v1.6.0
 [1.5.2]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.4.1...v1.5.0

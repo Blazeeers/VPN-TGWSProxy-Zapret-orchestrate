@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 
 HOME = os.path.expanduser("~")
 AUTOTUNE_DIR = "/var/lib/zapret-autotune"
@@ -29,6 +30,9 @@ ZAPRET_REPOS = ("bol-van/zapret",)
 TGWS_REPO = "Flowseal/tg-ws-proxy"
 TGWS_VERSION_FILE = os.path.join(HOME, ".local", "share", "tgwsproxy", "version")
 UPDATES_MAX_AGE = 7 * 24 * 3600
+YOUTUBE_CACHE_AGE = 30 * 60
+RESCAN_REQUEST = os.path.join(HOME, ".cache", "zapret-autotune", "rescan.request")
+YT_TEST_VIDEO = "dQw4w9WgXcQ"
 
 
 def run(cmd: list[str], timeout: float = 8.0) -> str:
@@ -197,6 +201,97 @@ def direct_status(app: str) -> dict:
         except OSError:
             pass
     return {"file": path if has_file else "", "count": count}
+
+
+def _http_code(url: str, timeout: int = 12) -> int:
+    out = run(["curl", "-4", "-s", "-L", "-o", "/dev/null", "-w", "%{http_code}",
+               "--max-time", str(timeout), url], timeout=timeout + 3)
+    try:
+        return int(out or 0)
+    except ValueError:
+        return 0
+
+
+YTDLP = shutil.which("yt-dlp")
+MIN_YT_BYTES = 131072
+MIN_YT_KBPS = 100
+
+
+def youtube_video_check() -> dict:
+    """Качает кусок видео с googlevideo.com и меряет скорость — ловит троттлинг.
+
+    Страница может открываться, а видео при этом не грузиться: тогда прямой
+    youtube работать «нормально» не считается.
+    """
+    if YTDLP:
+        url = ""
+        try:
+            proc = subprocess.run(
+                [YTDLP, "-q", "--no-warnings", "-f", "worst", "-g",
+                 f"https://www.youtube.com/watch?v={YT_TEST_VIDEO}"],
+                capture_output=True, text=True, timeout=45)
+            lines = (proc.stdout or "").strip().splitlines()
+            url = lines[0] if lines else ""
+        except (OSError, subprocess.TimeoutExpired):
+            url = ""
+        if not url:
+            return {"ok": False, "error": "yt-dlp не вернул ссылку"}
+        out = run(["curl", "-4", "-s", "--max-time", "25", "-o", "/dev/null",
+                   "-r", "0-262143", "-w", "%{http_code} %{size_download} %{time_total}",
+                   url], timeout=30)
+        parts = out.split()
+        if len(parts) != 3:
+            return {"ok": False, "error": "googlevideo не ответил"}
+        code, size, secs = parts
+        size_i = int(float(size))
+        secs_f = float(secs) or 0.001
+        kbps = round((size_i / 1024) / secs_f)
+        ok = code in ("200", "206") and size_i >= MIN_YT_BYTES and kbps >= MIN_YT_KBPS
+        return {"ok": ok, "code": code, "bytes": size_i, "secs": round(secs_f, 2),
+                "kbps": kbps, "method": "yt-dlp"}
+    # без yt-dlp — грубая проверка доступности (без скорости)
+    page = _http_code(f"https://www.youtube.com/watch?v={YT_TEST_VIDEO}")
+    cdn = _http_code("https://redirector.googlevideo.com/")
+    return {"ok": page in (200, 301, 302) and cdn != 0, "page": page, "cdn": cdn,
+            "method": "reachability"}
+
+
+def youtube_status(check_video: bool = True) -> dict:
+    page = _http_code("https://www.youtube.com/")
+    thumb = _http_code(f"https://i.ytimg.com/vi/{YT_TEST_VIDEO}/hqdefault.jpg")
+    video = youtube_video_check() if check_video else {}
+    ok = page in (200, 201, 301, 302) and bool(video.get("ok")) if check_video else page in (200, 201, 301, 302)
+    return {"checked": time.time(), "page": page, "thumb": thumb, "video": video, "ok": bool(ok)}
+
+
+def write_json_cache(app: str, name: str, data: dict) -> None:
+    if not app:
+        return
+    path = os.path.join(HOME, ".cache", app, name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def cached_youtube(app: str) -> dict:
+    path = os.path.join(HOME, ".cache", app, "yt.json") if app else ""
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if time.time() - float(data.get("checked") or 0) > YOUTUBE_CACHE_AGE:
+        return {}
+    return data
+
+
+def request_rescan() -> dict:
+    """Просит zapret-autotune перепроверить стратегии (через systemd path-юнит)."""
+    os.makedirs(os.path.dirname(RESCAN_REQUEST), exist_ok=True)
+    with open(RESCAN_REQUEST, "w", encoding="utf-8") as handle:
+        handle.write(str(time.time()))
+    return {"ok": True, "request": RESCAN_REQUEST}
 
 
 def live_checks() -> dict:
@@ -394,6 +489,7 @@ def collect(check: bool) -> dict:
         "tgwsproxy": tgwsproxy_status(),
         "direct": direct_status(app),
         "updates": cached_updates(app),
+        "youtube": cached_youtube(app),
     }
     if check:
         data["checks"] = live_checks()
@@ -406,6 +502,8 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="живые проверки доступности")
     ap.add_argument("--vpn", action="store_true", help="профили/серверы подписки + TCP-пинг")
     ap.add_argument("--updates", action="store_true", help="проверить обновления zapret/tg-ws-proxy")
+    ap.add_argument("--yt", action="store_true", help="проверить YouTube (страница + видео с googlevideo)")
+    ap.add_argument("--rescan-request", action="store_true", help="запросить перебор стратегий zapret")
     args = ap.parse_args()
     if args.vpn:
         app, cli = resolve_cli()
@@ -416,6 +514,15 @@ def main() -> int:
         data = check_updates()
         write_updates(app, data)
         print(json.dumps(data, ensure_ascii=False))
+        return 0
+    if args.yt:
+        app, _ = resolve_cli()
+        data = youtube_status()
+        write_json_cache(app, "yt.json", data)
+        print(json.dumps(data, ensure_ascii=False))
+        return 0
+    if args.rescan_request:
+        print(json.dumps(request_rescan(), ensure_ascii=False))
         return 0
     print(json.dumps(collect(args.check), ensure_ascii=False))
     return 0

@@ -126,9 +126,38 @@ ExecStop=/usr/local/bin/zapret-routefix clear
 WantedBy=multi-user.target
 EOF
 
+# --- Принудительный перебор по запросу из виджета --------------------------
+REQUEST_DIR="$USER_HOME/.cache/zapret-autotune"
+REQUEST_FILE="$REQUEST_DIR/rescan.request"
+mkdir -p "$REQUEST_DIR"
+chown "$USER_NAME" "$REQUEST_DIR" 2>/dev/null || true
+
+cat > /etc/systemd/system/zapret-autotune-rescan.service <<EOF
+[Unit]
+Description=Forced zapret strategy rescan (requested from UI)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/zapret-autotune rescan
+ExecStopPost=/usr/bin/rm -f $REQUEST_FILE
+EOF
+
+cat > /etc/systemd/system/zapret-autotune-rescan.path <<EOF
+[Unit]
+Description=Watch for a forced zapret rescan request
+
+[Path]
+PathExists=$REQUEST_FILE
+Unit=zapret-autotune-rescan.service
+
+[Install]
+WantedBy=paths.target
+EOF
+
 systemctl daemon-reload
 systemctl enable --now zapret-autotune.timer
 systemctl enable --now zapret-routefix.service
+systemctl enable --now zapret-autotune-rescan.path
 
 echo "==> Проверка изоляции пробника (host IP должен быть VPN, probe IP — прямой)"
 systemctl stop zapret-autotune.service 2>/dev/null || true

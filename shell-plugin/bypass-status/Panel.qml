@@ -15,6 +15,7 @@ Panel {
 
   property var bs: ({ ok: false })
   property var vpnInfo: ({})
+  property var ytResult: ({})
   property bool vpnLoaded: false
   property bool vpnExpanded: false
   property string busy: ""
@@ -46,24 +47,32 @@ Panel {
     var s = root.zap.services || ""
     return d.indexOf("youtube") >= 0 && s.indexOf("youtube") < 0
   }
+  // Результат реальной проверки YouTube (страница + видео): свежий ручной или из кэша.
+  readonly property var yt: (root.ytResult && root.ytResult.checked)
+    ? root.ytResult
+    : ((root.bs && root.bs.youtube && root.bs.youtube.checked) ? root.bs.youtube : ({}))
+  readonly property bool ytBad: root.yt && root.yt.ok === false
 
   // Пиктограмма трея по приоритету: VPN → подбор → tg-ws-proxy → zapret.
   readonly property string statusIcon:
     !root.vpnOn ? "\uf127" :            // разорванная связь — VPN не работает
     root.zapTesting ? "\uf002" :        // лупа — идёт подбор стратегии
     root.tgDown ? "\uf1d8" :            // бумажный самолётик — tg-ws-proxy не работает
+    root.ytBad ? "\uf167" :             // YouTube — видео не грузится
     root.zapretBroken ? "\uf071" :      // восклицание — zapret не работает
     "\uf132"                            // щит — всё в порядке
   readonly property color statusColor:
     !root.vpnOn ? root.urgent :
     root.zapTesting ? root.warn :
     root.tgDown ? root.urgent :
+    root.ytBad ? root.warn :
     root.zapretBroken ? root.warn :
     Color.accent
   readonly property string statusText:
     !root.vpnOn ? "VPN не работает" :
     root.zapTesting ? "идёт подбор стратегии" :
     root.tgDown ? "tg-ws-proxy не работает" :
+    root.ytBad ? "YouTube: видео не грузится" :
     root.zapretBroken ? "zapret не работает" :
     "всё в порядке"
 
@@ -127,7 +136,13 @@ Panel {
     else { zState = "warn"; zDetail = "режим неизвестен" }
     out.push({ name: "zapret (DPI)", state: zState, detail: zDetail + (z.network ? " · " + z.network : "") })
 
-    if (root.youtubeDirectNoBypass) {
+    if (root.ytBad) {
+      var ytv = root.yt.video || {}
+      var ytd = "страница открывается, видео не грузится"
+      if (ytv.kbps) ytd += " (" + ytv.kbps + " КБ/с)"
+      else if (ytv.error) ytd += ": " + ytv.error
+      out.push({ name: "YouTube", state: "warn", detail: ytd })
+    } else if (root.youtubeDirectNoBypass) {
       out.push({ name: "YouTube", state: "ok", detail: "трафик идёт напрямую, без VPN и обхода" })
     }
 
@@ -179,6 +194,8 @@ Panel {
     if (!statusProc.running) statusProc.running = true
     if (!vpnProc.running && (!root.vpnLoaded || (Date.now() / 1000 - (root.vpnInfo.updated || 0)) > 120))
       vpnProc.running = true
+    if (!ytProc.running && (!root.yt.checked || (Date.now() / 1000 - (root.yt.checked || 0)) > 1800))
+      ytProc.running = true
   }
 
   implicitWidth: button.implicitWidth
@@ -230,6 +247,29 @@ Panel {
         var d = JSON.parse(vpnOut.text)
         if (d && d.ok) { root.vpnInfo = d; root.vpnLoaded = true }
       } catch (e) { /* ignore */ }
+    }
+  }
+
+  Process {
+    id: ytProc
+    command: [root.scriptPath, "--yt"]
+    stdout: StdioCollector { id: ytOut; waitForEnd: true }
+    onExited: function(code) {
+      root.busy = ""
+      if (code === 0) {
+        try { var d = JSON.parse(ytOut.text); if (d && d.checked) root.ytResult = d } catch (e) { /* ignore */ }
+      }
+      if (!statusProc.running) statusProc.running = true
+    }
+  }
+
+  Process {
+    id: rescanProc
+    command: [root.scriptPath, "--rescan-request"]
+    stdout: StdioCollector { id: rescanOut; waitForEnd: true }
+    onExited: function(code) {
+      root.busy = ""
+      if (!statusProc.running) statusProc.running = true
     }
   }
 
@@ -480,6 +520,72 @@ Panel {
         Flow {
           width: parent.width
           spacing: Style.space(8)
+
+          Rectangle {
+            id: ytBtn
+            implicitWidth: ytTxt.implicitWidth + Style.space(20)
+            implicitHeight: ytTxt.implicitHeight + Style.space(12)
+            radius: Style.cornerRadius > 0 ? Style.space(8) : 0
+            color: ymouse.containsMouse ? root.hoverFill
+                   : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+            border.width: 1
+            border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+
+            Text {
+              id: ytTxt
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: root.busy === "yt" ? "…" : "Проверить YouTube"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            MouseArea {
+              id: ymouse
+              anchors.fill: parent
+              enabled: root.busy === ""
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                if (root.busy !== "" || ytProc.running) return
+                root.busy = "yt"
+                ytProc.running = true
+              }
+            }
+          }
+
+          Rectangle {
+            id: rescanBtn
+            implicitWidth: rescanTxt.implicitWidth + Style.space(20)
+            implicitHeight: rescanTxt.implicitHeight + Style.space(12)
+            radius: Style.cornerRadius > 0 ? Style.space(8) : 0
+            color: rsmouse.containsMouse ? root.hoverFill
+                   : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+            border.width: 1
+            border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+
+            Text {
+              id: rescanTxt
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: root.busy === "rescan" ? "…" : "Тест стратегий"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            MouseArea {
+              id: rsmouse
+              anchors.fill: parent
+              enabled: root.busy === ""
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                if (root.busy !== "" || rescanProc.running) return
+                root.busy = "rescan"
+                rescanProc.running = true
+              }
+            }
+          }
 
           Rectangle {
             id: subBtn

@@ -169,7 +169,18 @@ probe_ok_url() {
   return 1
 }
 probe_test_targets() { probe_ok_url https://www.youtube.com/ && probe_ok_url https://discord.com/; }
-probe_youtube_direct() { probe_ok_url https://www.youtube.com/; }
+probe_any_url() {
+  local code
+  for _ in 1 2; do
+    code="$(runuser -u "$PROBE_USER" -- env HOME=/tmp "$CURL_BIN" -4 -s -o /dev/null \
+      -w '%{http_code}' --max-time 8 "$1" 2>/dev/null)"
+    [ -n "$code" ] && [ "$code" != "000" ] && return 0
+  done
+  return 1
+}
+# YouTube считается рабочим напрямую только если открывается и страница, и CDN видео
+# (googlevideo) — иначе «страница грузится, а видео нет».
+probe_youtube_direct() { probe_ok_url https://www.youtube.com/ && probe_any_url https://redirector.googlevideo.com/; }
 probe_discord_direct() { probe_ok_url https://discord.com/; }
 probe_show_ips() {
   local host_ip probe_ip
