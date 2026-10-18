@@ -15,7 +15,7 @@
   "barWidget": {
     "displayName": "Обходы",
     "description": "Статус VPN, zapret и tg-ws-proxy: подбор лучшего региона и сервера, проверка работоспособности каждые 5 минут",
-    "category": "Network",
+    "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {},
