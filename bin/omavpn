@@ -19,6 +19,7 @@ import os
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import time
@@ -54,6 +55,17 @@ HTTP_PORT = 10809
 TUN_IFACE = "omavpn0"
 TUN_ADDR = "172.19.0.1/30"
 
+# Тест серверов (нод): на каждую ноду поднимается отдельный временный Xray на
+# свободном локальном SOCKS-порту, через него гоняются реальные пробы. Живой
+# VPN (xray + sing-box/TUN) при этом не трогается. Прогресс пишется в
+# CACHE/probe.json — его читает виджет панели (bypass-status).
+PROBE_FILE = CACHE / "probe.json"
+PROBE_DIR = CACHE / "probe"
+PROBE_URL = "https://discord.com/api/v9/gateway"
+PROBE_PORT_BASE = 10990
+PROBE_DEFAULT_PROBES = 8
+PROBE_DEFAULT_TIMEOUT = 6.0
+
 PROXY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "wireguard"}
 
 # Telegram Desktop и локальный MTProto/WS-прокси (tg-ws-proxy) не туннелируем —
@@ -61,17 +73,34 @@ PROXY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "wire
 # доступ к нему у провайдера блокируется, а tg-ws-proxy его не обслуживает.
 TELEGRAM_PROCESSES = ["tg-ws-proxy", "TgWsProxy", "Telegram", "telegram-desktop"]
 
+# Tailscale. Трафик своего tailnet (CGNAT 100.64.0.0/10, включая MagicDNS
+# 100.100.100.100) не заводим в туннель: иначе VPN перехватывает его, демон
+# не получает netmap (map long-poll) и логин не завершается, а к узлам tailnet
+# нельзя подключиться напрямую.
+TAILSCALE_CIDRS = ["100.64.0.0/10"]
+
 # Сервисы, которые НИКОГДА не туннелируем: им нужен российский IP, а через
 # зарубежный выход VPN они недоступны/режутся. Этот список применяется всегда,
 # поверх direct_domains.txt, и его не перетирает zapret-autotune.
+# Tailscale добавлен в тот же список по обратной причине: ему нужен прямой
+# выход (управляющий канал, DERP, MagicDNS), иначе map long-poll рвётся через
+# прокси и логин/связь с узлами tailnet не работают.
 ALWAYS_DIRECT_DOMAINS = [
     "max.ru",
+    # DeepSeek API нужен ассистенту (opencode/websearch): через зарубежный выход
+    # VPN он периодически рвётся, а напрямую из РФ работает стабильно. Поэтому
+    # он ВСЕГДА идёт мимо туннеля и не может быть выкинут автоподбором zapret.
+    "deepseek.com",
+    "deepseek.ai",
     "yandex.ru",
     "ya.ru",
     "yandex.com",
     "yandex.net",
     "yandex-team.ru",
     "yastatic.net",
+    "tailscale.com",
+    "tailscale.io",
+    "ts.net",
 ]
 
 # Дополнительно выводим напрямую Discord/YouTube — блокировку снимает zapret.
@@ -601,7 +630,9 @@ def build_xray(profile_index: int, node_index: int) -> dict:
 
 def build_singbox(profile_index: int, strict: bool) -> dict:
     ips, domains = server_endpoints(profile_index)
-    bypass = []
+    # Адреса серверов подписки и весь tailnet Tailscale не заводим в туннель.
+    exclude = [*ips, *TAILSCALE_CIDRS]
+    bypass = [{"ip_cidr": TAILSCALE_CIDRS, "outbound": "direct"}]
     if ips:
         bypass.append({"ip_cidr": ips, "outbound": "direct"})
     if domains:
@@ -621,9 +652,13 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
             "interface_name": TUN_IFACE,
             "address": [TUN_ADDR],
             "mtu": 9000,
-            "stack": "mixed",
+            "stack": "gvisor",
             "auto_route": True,
             "strict_route": bool(strict),
+            # Адреса серверов подписки и tailnet Tailscale не заводим в туннель:
+            # иначе соединение самого Xray к серверу уходит в TUN и зацикливается,
+            # а пакеты к узлам Tailscale перехватываются VPN.
+            "route_exclude_address": exclude,
         }],
         "outbounds": [
             {"type": "socks", "tag": "proxy", "server": "127.0.0.1",
@@ -852,6 +887,12 @@ def iface_stats() -> tuple[int, int]:
         return 0, 0
 
 
+def caps_ok() -> bool:
+    """Есть ли у sing-box CAP_NET_ADMIN (иначе TUN потребует root/пароль)."""
+    out = _run_out(["getcap", str(SB_BIN)], 5)
+    return "cap_net_admin" in out
+
+
 def status() -> dict:
     ensure_dirs()
     s = settings()
@@ -876,6 +917,7 @@ def status() -> dict:
         "ok": True,
         "installed": installed,
         "running": running,
+        "caps_ok": caps_ok(),
         "mode": s["mode"],
         "strict_route": bool(s.get("strict_route", False)),
         "profile_index": pi,
@@ -892,6 +934,7 @@ def status() -> dict:
         "updated": load_json(SUBFILE, {}).get("updated", 0),
         "profiles": pro,
         "nodes": nodes(pi),
+        "probe": probe_state(),
     }
 
 
@@ -912,6 +955,378 @@ def check() -> dict:
         "proxy_ip": proxied,
         "changed": bool(proxied) and proxied != direct,
     }
+
+
+# --------------------------------------------------------------------------- #
+# тест серверов (нод) через временный Xray
+# --------------------------------------------------------------------------- #
+
+def _free_port(start: int, tries: int = 200) -> int:
+    for port in range(start, start + tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError("нет свободного локального порта для теста")
+
+
+def probe_running() -> bool:
+    """Идёт ли тест серверов прямо сейчас (по файлу прогресса)."""
+    data = load_json(PROBE_FILE, {})
+    if not data.get("running"):
+        return False
+    pid = int(data.get("pid") or 0)
+    if pid > 0 and Path(f"/proc/{pid}").exists():
+        return True
+    # файл только что обновлён, а pid ещё не виден — считаем, что тест идёт
+    return (time.time() - float(data.get("updated") or 0)) < 20
+
+
+def _save_probe(state: dict) -> None:
+    state["updated"] = time.time()
+    save_json(PROBE_FILE, state)
+
+
+def _port_up(port: int, timeout: float, proc=None) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.4)
+            try:
+                if s.connect_ex(("127.0.0.1", port)) == 0:
+                    return True
+            except OSError:
+                pass
+        time.sleep(0.2)
+    return False
+
+
+def _run_out(cmd: list, timeout: float) -> str:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return (p.stdout or "").strip()
+
+
+def _probe_once(port: int, url: str, timeout: float):
+    """Одна проба через локальный SOCKS. None — проба не удалась."""
+    out = _run_out(["curl", "-s", "-o", "/dev/null", "--socks5-hostname", f"127.0.0.1:{port}",
+                    "-w", "%{http_code} %{time_appconnect} %{time_total}",
+                    "--max-time", str(timeout), url], timeout + 3)
+    parts = out.split()
+    if len(parts) < 3:
+        return None
+    try:
+        code = int(parts[0])
+        tls = float(parts[1])
+        total = float(parts[2])
+    except ValueError:
+        return None
+    if code == 0:
+        return None
+    return {"code": code, "tls": tls, "total": total}
+
+
+def probe_node(profile_index: int, node_index: int, probes: int, url: str,
+               timeout: float) -> dict:
+    """Поднимает временный Xray с одной нодой и меряет её реальные пробы."""
+    nd = nodes(profile_index)[node_index]
+    result = {"index": node_index, "tag": nd["tag"], "detail": nd["detail"],
+              "address": nd["address"], "dead": True, "note": "", "probes": probes,
+              "ok_count": 0, "loss": probes, "med": None, "p90": None, "max": None,
+              "tls_med": None, "score": None, "secs": 0.0}
+    started = time.time()
+    PROBE_DIR.mkdir(parents=True, exist_ok=True)
+    port = _free_port(PROBE_PORT_BASE)
+    cfg_path = PROBE_DIR / "node.json"
+    log_path = PROBE_DIR / "node.log"
+
+    cfg = build_xray(profile_index, node_index)
+    cfg.pop("observatory", None)
+    cfg.pop("burstObservatory", None)
+    routing = cfg.get("routing")
+    if isinstance(routing, dict):
+        routing.pop("balancers", None)
+        routing.pop("observatoryTag", None)
+    cfg["inbounds"] = [{"tag": "probe-in", "listen": "127.0.0.1", "port": port,
+                        "protocol": "socks",
+                        "settings": {"udp": False, "auth": "noauth"}}]
+    cfg["log"] = {"loglevel": "error", "error": str(log_path), "access": "none"}
+    save_json(cfg_path, cfg)
+
+    err = validate([str(XRAY_BIN), "run", "-c", str(cfg_path), "-test"], cfg_path)
+    if err:
+        result["note"] = "конфиг отклонён: " + (err.splitlines() or [""])[0][:140]
+        result["secs"] = round(time.time() - started, 1)
+        return result
+
+    proc = subprocess.Popen([str(XRAY_BIN), "run", "-c", str(cfg_path)],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        if not _port_up(port, 8.0, proc):
+            result["note"] = "Xray не поднялся с этой нодой"
+        else:
+            totals, tlss, streak = [], [], 0
+            for _ in range(max(1, probes)):
+                one = _probe_once(port, url, timeout)
+                if one is None:
+                    streak += 1
+                    if streak >= 3:      # нода явно не отвечает — не тянем таймауты
+                        break
+                    continue
+                streak = 0
+                totals.append(one["total"])
+                if one["tls"]:
+                    tlss.append(one["tls"])
+            if not totals:
+                result["note"] = "нет ответа через ноду"
+            else:
+                ordered = sorted(totals)
+                med = statistics.median(ordered)
+                p90 = ordered[min(len(ordered) - 1, int(round(0.9 * (len(ordered) - 1))))]
+                loss = max(0, probes - len(ordered))
+                result.update({
+                    "dead": False,
+                    "ok_count": len(ordered),
+                    "loss": loss,
+                    "med": round(med, 2),
+                    "p90": round(p90, 2),
+                    "max": round(max(ordered), 2),
+                    "tls_med": round(statistics.median(tlss), 2) if tlss else None,
+                    # чем меньше, тем лучше: медиана + хвост + штраф за потери
+                    "score": round(med * 0.4 + p90 * 0.6 + loss * 1.5, 3),
+                })
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+    result["secs"] = round(time.time() - started, 1)
+    return result
+
+
+def probe_all(profile_index: int | None = None, probes: int = PROBE_DEFAULT_PROBES,
+              url: str = PROBE_URL, timeout: float = PROBE_DEFAULT_TIMEOUT,
+              node_index: int | None = None) -> dict:
+    """Тестирует все серверы профиля. Прогресс — в CACHE/probe.json."""
+    if probe_running():
+        return {"ok": False, "error": "тест серверов уже идёт"}
+    s = settings()
+    if profile_index is None:
+        profile_index = int(s.get("profile_index") or 0)
+    pro = profiles()
+    if not (0 <= profile_index < len(pro)):
+        raise RuntimeError("профиль не найден")
+    nd = nodes(profile_index)
+    if node_index is not None:
+        if not (0 <= node_index < len(nd)):
+            raise RuntimeError(f"сервер #{node_index} не найден в профиле")
+        nd = [nd[node_index]]
+    if not nd:
+        raise RuntimeError("в профиле нет серверов")
+    probes = max(1, int(probes))
+
+    ensure_dirs()
+    state = {
+        "running": True, "pid": os.getpid(), "profile": profile_index,
+        "profile_name": pro[profile_index]["name"], "nodes_total": len(nd),
+        "nodes_done": 0, "current": "", "current_index": -1,
+        "probes": probes, "url": url, "started": time.time(), "finished": 0.0,
+        "results": [], "best": None, "error": "",
+    }
+    _save_probe(state)
+    try:
+        for n in nd:
+            state["current"], state["current_index"] = n["tag"], n["index"]
+            _save_probe(state)
+            state["results"].append(probe_node(profile_index, n["index"], probes, url, timeout))
+            state["nodes_done"] = len(state["results"])
+            _save_probe(state)
+        alive = sorted((r for r in state["results"] if not r["dead"]),
+                       key=lambda r: r["score"])
+        if alive:
+            state["best"] = {"index": alive[0]["index"], "tag": alive[0]["tag"],
+                             "med": alive[0]["med"], "score": alive[0]["score"]}
+    except Exception as exc:  # noqa: BLE001
+        state["error"] = str(exc)
+    state["running"] = False
+    state["finished"] = time.time()
+    state["current"] = ""
+    state["pid"] = 0
+    _save_probe(state)
+    return {"ok": not state["error"], "profile": profile_index, **state}
+
+
+def probe_state() -> dict:
+    """Текущее состояние/результаты теста серверов (для виджета)."""
+    data = load_json(PROBE_FILE, {})
+    if not isinstance(data, dict):
+        return {}
+    if data.get("running"):
+        pid = int(data.get("pid") or 0)
+        if not (pid > 0 and Path(f"/proc/{pid}").exists()) \
+                and (time.time() - float(data.get("updated") or 0)) > 30:
+            data["running"] = False
+            data["stale"] = True
+    return data
+
+
+def probe_best(probes_quick: int = 2, timeout_quick: float = 3.5,
+               probes_final: int = 6, timeout_final: float = 6.0,
+               url: str = PROBE_URL, apply: bool = False) -> dict:
+    """Тест ВСЕХ регионов (профилей) и серверов: выбирает лучшую пару регион+сервер.
+
+    Быстрый проход по всем нодам всех профилей, затем подтверждающая серия
+    проб на лучшей ноде. Результат (и прогресс) — в CACHE/probe.json.
+    С apply=True лучшая пара применяется в настройках и, если VPN включён,
+    немедленно переподключается на неё.
+    """
+    if probe_running():
+        return {"ok": False, "error": "тест серверов уже идёт"}
+    pro = profiles()
+    if not pro:
+        raise RuntimeError("в подписке нет профилей")
+    probes_quick = max(1, int(probes_quick))
+    ensure_dirs()
+    state = {
+        "running": True, "pid": os.getpid(), "mode": "best", "phase": "quick",
+        "profile": settings().get("profile_index", 0), "profile_name": "",
+        "profiles_total": len(pro), "profiles_done": 0,
+        "nodes_total": sum(int(p["node_count"]) for p in pro), "nodes_done": 0,
+        "current": "", "current_index": -1, "current_profile": -1,
+        "probes": probes_quick, "url": url, "started": time.time(), "finished": 0.0,
+        "results": [], "best": None, "error": "",
+    }
+    _save_probe(state)
+    try:
+        quick: list[dict] = []
+        for p in pro:
+            nd = nodes(p["index"])
+            for n in nd:
+                state["current"] = p["name"].strip() + " · " + n["tag"]
+                state["current_index"] = n["index"]
+                state["current_profile"] = p["index"]
+                _save_probe(state)
+                res = probe_node(p["index"], n["index"], probes_quick, url, timeout_quick)
+                res["profile"] = p["index"]
+                res["profile_name"] = p["name"].strip()
+                quick.append(res)
+                state["results"] = quick
+                state["nodes_done"] = len(quick)
+                _save_probe(state)
+            state["profiles_done"] += 1
+            _save_probe(state)
+
+        alive = sorted((r for r in quick if not r["dead"]), key=lambda r: r["score"])
+        best = None
+        if alive:
+            state["phase"] = "confirm"
+            state["current"] = "подтверждение: " + alive[0]["profile_name"] + " · " + alive[0]["tag"]
+            _save_probe(state)
+            confirmed = probe_node(alive[0]["profile"], alive[0]["index"],
+                                   max(probes_quick, probes_final), url, timeout_final)
+            confirmed["profile"] = alive[0]["profile"]
+            confirmed["profile_name"] = alive[0]["profile_name"]
+            best = confirmed if not confirmed["dead"] else next(
+                (r for r in alive[1:] if not r["dead"]), None)
+        state["phase"] = "done"
+        if best:
+            state["best"] = {
+                "profile_index": best["profile"], "profile_name": best["profile_name"],
+                "index": best["index"], "tag": best["tag"], "detail": best["detail"],
+                "med": best["med"], "p90": best["p90"], "score": best["score"],
+                "loss": best["loss"], "probes": best["probes"],
+            }
+            if apply:
+                set_settings(profile_index=best["profile"], node_index=best["index"])
+                state["applied"] = True
+                state["reconnected"] = False
+                if is_on():
+                    cmd_on(best["profile"], best["index"], None, quiet=True)
+                    state["reconnected"] = True
+        else:
+            state["error"] = "ни одна нода не ответила"
+    except Exception as exc:  # noqa: BLE001
+        state["error"] = str(exc)
+    state["running"] = False
+    state["finished"] = time.time()
+    state["current"] = ""
+    state["pid"] = 0
+    _save_probe(state)
+    return {"ok": not state["error"], **state}
+
+
+def _proxy_ok(timeout: float = 8.0) -> bool:
+    """Работает ли туннель: HTTP-код через локальный SOCKS."""
+    out = _run_out(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time",
+                    str(timeout), "--socks5-hostname", f"127.0.0.1:{SOCKS_PORT}",
+                    "https://www.cloudflare.com/cdn-cgi/trace"], timeout + 3)
+    try:
+        return int(out or 0) == 200
+    except ValueError:
+        return False
+
+
+def heal(min_gap: float = 600.0, probes: int = 3, timeout: float = 4.0) -> dict:
+    """Самовосстановление VPN: перезапуск, при неудаче — лучшая нода текущего профиля.
+
+    Вызывается из монитора работоспособности (bypass-status --health), поэтому
+    ограничен по частоте: не чаще одного раза в min_gap секунд.
+    """
+    if not is_on():
+        return {"ok": False, "reason": "vpn_off", "actions": []}
+    st = load_json(RUNTIME, {})
+    last = float(st.get("last_heal") or 0)
+    if time.time() - last < min_gap:
+        return {"ok": False, "reason": "throttled", "actions": [],
+                "retry_in": int(min_gap - (time.time() - last))}
+    actions: list[str] = []
+    if _proxy_ok():
+        return {"ok": True, "actions": ["туннель в порядке"], "checked": True}
+    actions.append("перезапуск VPN")
+    cmd_off(quiet=True)
+    try:
+        cmd_on(None, None, None, quiet=True)
+    except Exception as exc:  # noqa: BLE001
+        actions.append(f"перезапуск не удался: {exc}")
+    if _proxy_ok():
+        _mark_heal(actions)
+        return {"ok": True, "actions": actions}
+    # перезапуск не помог — пробуем ноды текущего профиля и переключаемся
+    try:
+        s = settings()
+        nd = nodes(s["profile_index"])
+        results = []
+        for n in nd:
+            results.append(probe_node(s["profile_index"], n["index"], probes, PROBE_URL, timeout))
+        alive = sorted((r for r in results if not r["dead"]), key=lambda r: r["score"])
+        if alive:
+            set_settings(node_index=alive[0]["index"])
+            actions.append("переключение на " + alive[0]["tag"])
+            cmd_on(None, alive[0]["index"], None, quiet=True)
+    except Exception as exc:  # noqa: BLE001
+        actions.append(f"перебор нод не удался: {exc}")
+    ok = _proxy_ok()
+    actions.append("туннель восстановлен" if ok else "туннель не восстановлен")
+    _mark_heal(actions)
+    return {"ok": ok, "actions": actions}
+
+
+def _mark_heal(actions: list) -> None:
+    st = load_json(RUNTIME, {})
+    st["last_heal"] = time.time()
+    st["last_heal_actions"] = actions
+    save_json(RUNTIME, st)
 
 
 # --------------------------------------------------------------------------- #
@@ -945,6 +1360,25 @@ def main(argv: list) -> int:
     sub.add_parser("toggle", help="переключить")
     sub.add_parser("check", help="проверить внешний IP")
     sub.add_parser("logs", help="хвост логов")
+
+    spb = sub.add_parser("probe", help="протестировать серверы профиля (временный Xray + пробы)")
+    spb.add_argument("--profile", type=int, default=None, help="индекс профиля (по умолчанию текущий)")
+    spb.add_argument("--probes", type=int, default=PROBE_DEFAULT_PROBES, help="проб на сервер")
+    spb.add_argument("--url", default=PROBE_URL, help="URL пробы")
+    spb.add_argument("--timeout", type=float, default=PROBE_DEFAULT_TIMEOUT,
+                     help="таймаут одной пробы, с")
+    spb.add_argument("--node", type=int, default=None,
+                     help="протестировать только один сервер (индекс из `nodes`)")
+
+    sb = sub.add_parser("best", help="протестировать все регионы и серверы, выбрать лучшую пару")
+    sb.add_argument("--apply", action="store_true",
+                    help="применить лучшую пару (и переподключиться, если VPN включён)")
+    sb.add_argument("--probes-quick", type=int, default=2, help="проб на сервер в быстром проходе")
+    sb.add_argument("--timeout-quick", type=float, default=3.5, help="таймаут быстрой пробы, с")
+    sb.add_argument("--probes-final", type=int, default=6, help="проб на лучший сервер при подтверждении")
+    sb.add_argument("--timeout-final", type=float, default=6.0, help="таймаут подтверждающей пробы, с")
+    sb.add_argument("--url", default=PROBE_URL, help="URL пробы")
+    sub.add_parser("heal", help="самовосстановление VPN (перезапуск/переключение ноды)")
 
     sp = sub.add_parser("profile", help="выбрать профиль")
     sp.add_argument("index", type=int)
@@ -1011,6 +1445,34 @@ def main(argv: list) -> int:
         elif args.cmd == "logs":
             tail = {"xray": log_tail(XRAY_LOG, 40), "sing-box": log_tail(SB_LOG, 40)}
             emit({"ok": True, **tail}, f"xray: {tail['xray']}\n\nsing-box: {tail['sing-box']}")
+        elif args.cmd == "best":
+            res = probe_best(args.probes_quick, args.timeout_quick, args.probes_final,
+                             args.timeout_final, args.url, args.apply)
+            b = res.get("best") or {}
+            if res.get("error") and not b:
+                lines = [str(res["error"])]
+            else:
+                lines = [f"лучший регион: {b.get('profile_name','?')} · сервер #{b.get('index')} "
+                         f"{b.get('tag','?')} · med {b.get('med')} с · p90 {b.get('p90')} с"]
+                if res.get("applied"):
+                    lines.append("применено" + (" и переподключено" if res.get("reconnected") else ""))
+            emit(res, "\n".join(lines))
+        elif args.cmd == "heal":
+            res = heal()
+            emit(res, "; ".join(res.get("actions") or [res.get("reason", "нечего лечить")]))
+        elif args.cmd == "probe":
+            res = probe_all(args.profile, args.probes, args.url, args.timeout, args.node)
+            lines = []
+            for r in res.get("results", []):
+                if r["dead"]:
+                    lines.append(f"{r['index']:>2} {r['tag']:<14} DEAD · {r['note'] or 'нет ответа'}")
+                else:
+                    lines.append(f"{r['index']:>2} {r['tag']:<14} med {r['med']}s  p90 {r['p90']}s  "
+                                 f"потери {r['loss']}/{r['probes']}  score {r['score']}")
+            if res.get("best"):
+                lines.append(f"лучшая: #{res['best']['index']} {res['best']['tag']} "
+                             f"({res['best']['med']}s)")
+            emit(res, "\n".join(lines) or str(res.get("error") or "тест не выполнен"))
         else:
             p.print_help()
             return 0

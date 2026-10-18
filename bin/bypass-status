@@ -34,6 +34,13 @@ UPDATES_MAX_AGE = 7 * 24 * 3600
 YOUTUBE_CACHE_AGE = 30 * 60
 RESCAN_REQUEST = os.path.join(HOME, ".cache", "zapret-autotune", "rescan.request")
 YT_TEST_VIDEO = "dQw4w9WgXcQ"
+# Файлы прогресса теста серверов (пишет omavpn probe) — читаем первый свежий.
+PROBE_APPS = ("omavpn", "wowvpn")
+PROBE_MAX_AGE = 12 * 3600
+HEALTH_MAX_AGE = 15 * 60
+HEALTH_LOCK = os.path.join(HOME, ".cache", "bypass-status", "health.lock")
+DISCORD_GATEWAY = "https://discord.com/api/v9/gateway"
+DEEPSEEK_URL = "https://api.deepseek.com/"
 
 
 def run(cmd: list[str], timeout: float = 8.0) -> str:
@@ -101,6 +108,7 @@ def vpn_status(cli: str) -> dict:
     return {
         "installed": bool(d.get("installed")),
         "running": bool(d.get("running")),
+        "caps_ok": d.get("caps_ok"),
         "mode": d.get("mode", ""),
         "profile": d.get("profile_name", ""),
         "node": d.get("node_name", ""),
@@ -310,6 +318,71 @@ def request_rescan() -> dict:
     return {"ok": True, "request": RESCAN_REQUEST, "message": "перебор запрошен — стратегии тестируются"}
 
 
+def read_vpn_test(app: str) -> dict:
+    """Свежие прогресс/результаты теста серверов VPN (или {})."""
+    best = {}
+    for name in (app, *PROBE_APPS):
+        if not name:
+            continue
+        try:
+            data = json.load(open(os.path.join(HOME, ".cache", name, "probe.json"), encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and float(data.get("updated") or 0) > float(best.get("updated") or 0):
+            best = data
+    if not best:
+        return {}
+    if best.get("running"):
+        pid = int(best.get("pid") or 0)
+        if not (pid > 0 and os.path.exists(f"/proc/{pid}")) \
+                and (time.time() - float(best.get("updated") or 0)) > 30:
+            best["running"] = False
+            best["stale"] = True
+    elif time.time() - float(best.get("finished") or best.get("updated") or 0) > PROBE_MAX_AGE:
+        return {}
+    return best
+
+
+def start_vpn_test(cli: str) -> dict:
+    """Запускает тест серверов (omavpn probe) фоном; прогресс читается из кэша."""
+    if not cli:
+        return {"ok": False, "error": "VPN CLI не найден"}
+    state = read_vpn_test(os.path.basename(cli))
+    if state.get("running"):
+        return {"ok": False, "reason": "already_running", "message": "тест серверов уже идёт"}
+    return _spawn_probe(cli, ["probe"],
+                        "тест серверов запущен — пробы идут в фоне")
+
+
+def start_optimize(cli: str) -> dict:
+    """Тест всех регионов и серверов → применить лучшую пару (фоном)."""
+    if not cli:
+        return {"ok": False, "error": "VPN CLI не найден"}
+    state = read_vpn_test(os.path.basename(cli))
+    if state.get("running"):
+        return {"ok": False, "reason": "already_running", "message": "тест серверов уже идёт"}
+    return _spawn_probe(cli, ["best", "--apply"],
+                        "подбираю лучший регион и сервер — пробы идут в фоне")
+
+
+def _spawn_probe(cli: str, args: list, message: str) -> dict:
+    app = os.path.basename(cli)
+    log = os.path.join(HOME, ".cache", app, "probe.out")
+    try:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        handle = open(log, "ab")
+    except OSError as exc:
+        return {"ok": False, "error": f"нет доступа к {log}: {exc}"}
+    try:
+        subprocess.Popen([cli, "--json", *args], stdin=subprocess.DEVNULL,
+                         stdout=handle, stderr=handle, start_new_session=True)
+    except OSError as exc:
+        return {"ok": False, "error": f"не удалось запустить тест: {exc}"}
+    finally:
+        handle.close()
+    return {"ok": True, "started": True, "message": message}
+
+
 def live_checks() -> dict:
     def code(url: str) -> int:
         out = run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "12", url], timeout=15)
@@ -324,6 +397,229 @@ def live_checks() -> dict:
         "youtube": code("https://www.youtube.com/"),
         "discord": code("https://discord.com/"),
     }
+
+
+# --------------------------------------------------------------------------- #
+# комплексная проверка текущей конфигурации (монитор работоспособности)
+# --------------------------------------------------------------------------- #
+
+def _http(url: str, timeout: float = 10.0, proxy: str = "") -> tuple[int, float, str]:
+    """(код, секунды, тело[для коротких ответов]). proxy — http://host:port."""
+    cmd = ["curl", "-4", "-s", "-L", "-w", "\n%{http_code} %{time_total}", "--max-time", str(timeout)]
+    if proxy:
+        cmd += ["--proxy", proxy]
+    cmd.append(url)
+    out = run(cmd, timeout=timeout + 3)
+    if not out:
+        return 0, 0.0, ""
+    body, _, tail = out.rpartition("\n")
+    parts = tail.split()
+    try:
+        code = int(parts[0])
+        secs = float(parts[1]) if len(parts) > 1 else 0.0
+    except (ValueError, IndexError):
+        return 0, 0.0, ""
+    return code, round(secs, 2), body.strip()[:400]
+
+
+def _ok_code(code: int) -> bool:
+    return 200 <= code < 400
+
+
+def _proxy_port(app: str) -> int:
+    return 10809 if app == "omavpn" else 10809
+
+
+def health_items(app: str, cli: str) -> tuple[list, dict]:
+    """Все проверки «как есть сейчас» (VPN + zapret + сервисы)."""
+    items: list[dict] = []
+    data: dict = {}
+    v = vpn_status(cli)
+    data["vpn"] = v
+
+    # --- VPN: туннель реально работает? -------------------------------------
+    if not v.get("running"):
+        items.append({"id": "vpn", "name": "VPN", "state": "idle",
+                      "detail": "выключен — трафик идёт напрямую"})
+        data["exit_ip"] = ""
+    else:
+        trace_code, trace_secs, body = _http("https://www.cloudflare.com/cdn-cgi/trace", 8)
+        exit_ip = ""
+        for line in body.splitlines():
+            if line.startswith("ip="):
+                exit_ip = line[3:].strip()
+        socks_ok = False
+        socks = run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "8",
+                     "--socks5-hostname", "127.0.0.1:10808",
+                     "https://www.cloudflare.com/cdn-cgi/trace"], timeout=11)
+        try:
+            socks_ok = int(socks or 0) == 200
+        except ValueError:
+            socks_ok = False
+        data["exit_ip"] = exit_ip or ("нет выхода" if not _ok_code(trace_code) else "")
+        data["socks_ok"] = socks_ok
+        if socks_ok and _ok_code(trace_code):
+            items.append({"id": "vpn", "name": "VPN", "state": "ok",
+                          "detail": (v.get("profile") or "") + " · " + (v.get("node") or "авто")
+                                    + " · выход " + (exit_ip or "?")})
+        else:
+            items.append({"id": "vpn", "name": "VPN", "state": "bad",
+                          "detail": "подключение есть, но трафик не идёт"
+                                    + ("" if socks_ok else " (SOCKS молчит)")})
+
+    # --- zapret: служба и обход DPI -----------------------------------------
+    z = zapret_status(wan_iface())
+    data["zapret"] = z
+    if z.get("testing"):
+        items.append({"id": "zapret", "name": "zapret", "state": "warn",
+                      "detail": "идёт подбор стратегии"})
+    elif z.get("mode") == "off":
+        items.append({"id": "zapret", "name": "zapret", "state": "ok",
+                      "detail": "сеть чистая, обход не нужен"})
+    elif z.get("service") != "active":
+        items.append({"id": "zapret", "name": "zapret", "state": "bad",
+                      "detail": "служба zapret не работает"})
+    else:
+        mode = z.get("mode") or "?"
+        items.append({"id": "zapret", "name": "zapret", "state": "ok",
+                      "detail": "стратегия #" + str(mode) + " · служба активна"})
+
+    # --- YouTube: страница + видео (троттлинг) ------------------------------
+    yt = youtube_status(check_video=True)
+    data["youtube"] = yt
+    ytv = yt.get("video") or {}
+    if yt.get("ok"):
+        extra = ""
+        if ytv.get("kbps"):
+            extra = " · видео " + str(round(ytv["kbps"] / 1024, 1)) + " МБ/с"
+        items.append({"id": "youtube", "name": "YouTube", "state": "ok",
+                      "detail": "страница и видео открываются" + extra})
+    elif _ok_code(int(yt.get("page") or 0)):
+        items.append({"id": "youtube", "name": "YouTube", "state": "bad",
+                      "detail": "страница открывается, видео не грузится"
+                                + (": " + str(ytv.get("error")) if ytv.get("error") else "")})
+    else:
+        items.append({"id": "youtube", "name": "YouTube", "state": "bad",
+                      "detail": "не открывается (HTTP " + str(yt.get("page")) + ")"})
+
+    # --- Discord: страница, шлюз, CDN ---------------------------------------
+    d_page, _, _ = _http("https://discord.com/", 10)
+    d_gw, gw_secs, _ = _http(DISCORD_GATEWAY, 10)
+    d_cdn, _, _ = _http("https://cdn.discordapp.com/", 10)
+    discord_ok = _ok_code(d_page) and _ok_code(d_gw)
+    data["discord"] = {"page": d_page, "gateway": d_gw, "cdn": d_cdn, "secs": gw_secs}
+    if discord_ok:
+        items.append({"id": "discord", "name": "Discord", "state": "ok",
+                      "detail": "страница и шлюз отвечают · " + str(gw_secs) + " с"})
+    else:
+        items.append({"id": "discord", "name": "Discord", "state": "bad",
+                      "detail": "страница " + str(d_page) + ", шлюз " + str(d_gw)})
+
+    # --- DeepSeek API (нужен ассистенту) ------------------------------------
+    ds_code, ds_secs, _ = _http(DEEPSEEK_URL, 12)
+    data["deepseek"] = {"code": ds_code, "secs": ds_secs}
+    if ds_code:
+        items.append({"id": "deepseek", "name": "DeepSeek API", "state": "ok",
+                      "detail": "HTTP " + str(ds_code) + " · " + str(ds_secs) + " с"})
+    else:
+        items.append({"id": "deepseek", "name": "DeepSeek API", "state": "bad",
+                      "detail": "нет ответа — ассистент не сможет работать"})
+
+    # --- Telegram API (через HTTP-прокси VPN, если он включён) --------------
+    proxy = f"http://127.0.0.1:{_proxy_port(app)}" if v.get("running") else ""
+    tg_code, _, _ = _http("https://api.telegram.org/", 10, proxy)
+    data["telegram"] = {"code": tg_code, "proxy": bool(proxy)}
+    if tg_code:
+        tg_state, tg_detail = "ok", "HTTP " + str(tg_code) + (" · через прокси VPN" if proxy else "")
+    elif v.get("running"):
+        tg_state, tg_detail = "bad", "нет ответа через прокси VPN"
+    else:
+        # без VPN Bot API в РФ и не должен открываться — это не поломка
+        tg_state, tg_detail = "idle", "нет ответа (нужен VPN — включится при подключении)"
+    items.append({"id": "telegram", "name": "Telegram API",
+                  "state": tg_state, "detail": tg_detail})
+
+    # --- tg-ws-proxy --------------------------------------------------------
+    tg = tgwsproxy_status()
+    data["tgwsproxy"] = tg
+    items.append({"id": "tgwsproxy", "name": "tg-ws-proxy",
+                  "state": "ok" if tg.get("listening") else "bad",
+                  "detail": ("порт " + str(tg.get("port")) + " слушает") if tg.get("listening")
+                            else "не слушает"})
+    return items, data
+
+
+def run_health(heal_vpn: bool = True) -> dict:
+    """Комплексный тест текущей конфигурации + попытка самовосстановления VPN."""
+    if os.path.exists(HEALTH_LOCK):
+        try:
+            if time.time() - os.path.getmtime(HEALTH_LOCK) < 180:
+                return {"ok": False, "reason": "already_running"}
+        except OSError:
+            pass
+    os.makedirs(os.path.dirname(HEALTH_LOCK), exist_ok=True)
+    try:
+        open(HEALTH_LOCK, "w").write(str(os.getpid()))
+    except OSError:
+        pass
+    started = time.time()
+    app, cli = resolve_cli()
+    result: dict = {"ok": True, "checked": 0}
+    try:
+        items, data = health_items(app, cli)
+        heal_info = {}
+        # VPN подключён, но не работает → пробуем вылечить (с ограничением частоты)
+        vpn_item = next((i for i in items if i["id"] == "vpn"), None)
+        if heal_vpn and cli and vpn_item and vpn_item["state"] == "bad":
+            try:
+                raw = run([cli, "--json", "heal"], timeout=180)
+                heal_info = json.loads(raw) if raw else {}
+            except ValueError:
+                heal_info = {}
+            if heal_info.get("ok"):
+                items, data = health_items(app, cli)
+        bad = [i["name"] for i in items if i["state"] == "bad"]
+        warn = [i["name"] for i in items if i["state"] == "warn"]
+        # state "idle" — не поломка (VPN намеренно выключен), в вердикт не идёт
+        verdict = "bad" if bad else ("warn" if warn else "ok")
+        if verdict == "ok":
+            summary = "всё работает: " + ", ".join(i["name"] for i in items)
+        elif verdict == "warn":
+            summary = "работает, но есть замечания · " + ", ".join(warn)
+        else:
+            summary = "не работает: " + ", ".join(bad)
+        result = {
+            "ok": verdict != "bad",
+            "checked": time.time(),
+            "verdict": verdict,
+            "summary": summary,
+            "items": items,
+            "heal": heal_info,
+            "secs": round(time.time() - started, 1),
+            **{k: v for k, v in data.items() if k in ("exit_ip", "socks_ok")},
+        }
+    except Exception as exc:  # noqa: BLE001
+        result = {"ok": False, "checked": time.time(), "verdict": "bad",
+                  "summary": "проверка прервалась: " + str(exc), "items": [], "error": str(exc)}
+    finally:
+        try:
+            os.remove(HEALTH_LOCK)
+        except OSError:
+            pass
+    if app:
+        write_json_cache(app, "health.json", result)
+    return result
+
+
+def cached_health(app: str) -> dict:
+    path = os.path.join(HOME, ".cache", app, "health.json") if app else ""
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    data["age"] = int(time.time() - float(data.get("checked") or 0))
+    data["stale"] = data["age"] > HEALTH_MAX_AGE
+    return data
 
 
 def cli_json(cli: str, *args) -> dict:
@@ -638,6 +934,8 @@ def collect(check: bool) -> dict:
         "direct": direct_status(app),
         "updates": cached_updates(app),
         "youtube": cached_youtube(app),
+        "health": cached_health(app),
+        "vpn_test": read_vpn_test(app),
     }
     if check:
         data["checks"] = live_checks()
@@ -654,6 +952,14 @@ def main() -> int:
                     help="скачать и установить доступные обновления (zapret/tg-ws-proxy)")
     ap.add_argument("--yt", action="store_true", help="проверить YouTube (страница + видео с googlevideo)")
     ap.add_argument("--rescan-request", action="store_true", help="запросить перебор стратегий zapret")
+    ap.add_argument("--vpn-test", action="store_true",
+                    help="запустить тест серверов VPN (omavpn probe) фоном")
+    ap.add_argument("--optimize", action="store_true",
+                    help="подобрать лучший регион и сервер (omavpn best --apply) фоном")
+    ap.add_argument("--health", action="store_true",
+                    help="комплексный тест текущей конфигурации (+ самовосстановление VPN)")
+    ap.add_argument("--health-json", action="store_true",
+                    help="комплексный тест без самовосстановления")
     args = ap.parse_args()
     if args.vpn:
         app, cli = resolve_cli()
@@ -677,6 +983,17 @@ def main() -> int:
         return 0
     if args.rescan_request:
         print(json.dumps(request_rescan(), ensure_ascii=False))
+        return 0
+    if args.vpn_test:
+        _, cli = resolve_cli()
+        print(json.dumps(start_vpn_test(cli), ensure_ascii=False))
+        return 0
+    if args.optimize:
+        _, cli = resolve_cli()
+        print(json.dumps(start_optimize(cli), ensure_ascii=False))
+        return 0
+    if args.health or args.health_json:
+        print(json.dumps(run_health(heal_vpn=not args.health_json), ensure_ascii=False))
         return 0
     print(json.dumps(collect(args.check), ensure_ascii=False))
     return 0

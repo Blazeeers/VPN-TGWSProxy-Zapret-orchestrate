@@ -120,6 +120,10 @@ if [ -d "$HERE/shell-plugin/bypass-status" ]; then
   BS_DIR="$HOME_DIR/.config/omarchy/plugins/$BS_ID"
   mkdir -p "$BS_DIR"
   cp -f "$HERE/shell-plugin/bypass-status/manifest.json" "$HERE/shell-plugin/bypass-status/Panel.qml" "$BS_DIR/"
+  if [ -d "$HERE/shell-plugin/bypass-status/icons" ]; then
+    mkdir -p "$BS_DIR/icons"
+    cp -f "$HERE/shell-plugin/bypass-status/icons/"*.png "$BS_DIR/icons/" 2>/dev/null || true
+  fi
   if command -v omarchy-shell >/dev/null; then
     omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
     if command -v omarchy >/dev/null; then
