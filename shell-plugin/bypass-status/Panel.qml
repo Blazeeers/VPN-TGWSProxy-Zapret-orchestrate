@@ -8,14 +8,26 @@ import qs.Ui
 
 Panel {
   id: root
-  moduleName: "io.github.blazeeers.bypass-status"
-  ipcTarget: "io.github.blazeeers.bypass-status"
+  moduleName: "io.github.blazeeers.omavpn"
+  ipcTarget: "io.github.blazeeers.omavpn"
   manageIpc: false
 
   readonly property string scriptPath: Quickshell.env("HOME") + "/.local/bin/bypass-status"
   // Пиктограммы лежат рядом с Panel.qml (icons/), поэтому путь относительный —
   // и в локальной установке, и в пакете для маркетплейса.
   readonly property string iconDir: "icons"
+
+  property bool autoTried: false
+
+  readonly property bool autoconnect: root.setting("autoconnect", false)
+
+  function setSetting(key, value) {
+    if (!root.bar || !root.bar.shell || typeof root.bar.shell.updateEntryInline !== "function") return
+    var entry = { id: root.moduleName }
+    for (var k in settings) if (k !== "id") entry[k] = settings[k]
+    entry[key] = value
+    root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
 
   property var bs: ({ ok: false })
   property var vpnInfo: ({})
@@ -234,6 +246,15 @@ Panel {
     if (healthProc.running) return
     root.busy = "health"
     healthProc.running = true
+  }
+
+  onBsChanged: {
+    var v = root.vpn
+    if (!root.autoTried && root.autoconnect && v && v.installed !== false && !v.running
+        && root.cliPath !== "") {
+      root.autoTried = true
+      root.run(["on"], "auto")
+    }
   }
 
   onOpenedChanged: if (opened) {
@@ -1062,6 +1083,55 @@ Panel {
                 updProc.running = true
               }
             }
+          }
+        }
+
+        // ---------- настройка ----------
+        Rectangle {
+          id: autoRowBox
+          width: parent.width
+          implicitHeight: autoRow.implicitHeight + Style.space(12)
+          radius: Style.cornerRadius > 0 ? Style.space(10) : 0
+          color: autoMouse.containsMouse ? root.hoverFill : "transparent"
+
+          Row {
+            id: autoRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(10)
+            spacing: Style.space(10)
+
+            Pictogram {
+              name: "vpn"
+              tint: root.autoconnect ? Color.accent : root.dim
+              px: Style.space(18)
+              anchors.verticalCenter: parent.verticalCenter
+            }
+            Text {
+              textFormat: Text.PlainText
+              text: "Подключаться при входе"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              width: parent.width - Style.space(90)
+            }
+            Text {
+              textFormat: Text.PlainText
+              text: root.autoconnect ? "вкл" : "выкл"
+              color: root.autoconnect ? Color.accent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          MouseArea {
+            id: autoMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.setSetting("autoconnect", !root.autoconnect)
           }
         }
 

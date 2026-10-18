@@ -94,11 +94,22 @@ say "Ставлю CLI в $LOCAL_BIN/omavpn"
 install -m 0755 "$HERE/bin/omavpn" "$LOCAL_BIN/omavpn"
 
 # --- Плагин панели -----------------------------------------------------------
-if [ -d "$HERE/shell-plugin/omavpn" ]; then
-  say "Устанавливаю плагин панели ($PLUGIN_ID)…"
-  mkdir -p "$PLUGIN_DIR"
+if [ -d "$HERE/shell-plugin/bypass-status" ]; then
+  say "Устанавливаю плагин панели ($PLUGIN_ID — виджет «Обходы»)…"
+  mkdir -p "$PLUGIN_DIR/icons"
   cp -f "$HERE/manifest.json" "$PLUGIN_DIR/"
-  cp -f "$HERE/shell-plugin/omavpn/Panel.qml" "$PLUGIN_DIR/"
+  cp -f "$HERE/shell-plugin/bypass-status/Panel.qml" "$PLUGIN_DIR/"
+  cp -f "$HERE/shell-plugin/bypass-status/icons/"*.png "$PLUGIN_DIR/icons/" 2>/dev/null || true
+  # локальная установка кладёт Panel.qml в корень плагина — правим entryPoint
+  python3 - "$PLUGIN_DIR/manifest.json" <<'PYEOF'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path, encoding="utf-8"))
+data["entryPoints"]["barWidget"] = "Panel.qml"
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+PYEOF
   if command -v omarchy-shell >/dev/null; then
     omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
     if command -v omarchy >/dev/null; then
@@ -109,29 +120,12 @@ if [ -d "$HERE/shell-plugin/omavpn" ]; then
     warn "omarchy-shell не найден в PATH — включите виджет вручную: omarchy plugin enable $PLUGIN_ID"
   fi
 else
-  warn "Каталог shell-plugin/omavpn не найден — виджет не установлен"
+  warn "Каталог shell-plugin/bypass-status не найден — виджет не установлен"
 fi
 
-# --- Виджет статусов обходов ------------------------------------------------
-if [ -d "$HERE/shell-plugin/bypass-status" ]; then
-  say "Устанавливаю виджет статусов обходов (Bypass Status)…"
+# --- CLI виджета «Обходы» --------------------------------------------------
+if [ -f "$HERE/bin/bypass-status" ]; then
   install -m 0755 "$HERE/bin/bypass-status" "$LOCAL_BIN/bypass-status"
-  BS_ID="io.github.blazeeers.bypass-status"
-  BS_DIR="$HOME_DIR/.config/omarchy/plugins/$BS_ID"
-  mkdir -p "$BS_DIR"
-  cp -f "$HERE/shell-plugin/bypass-status/manifest.json" "$HERE/shell-plugin/bypass-status/Panel.qml" "$BS_DIR/"
-  if [ -d "$HERE/shell-plugin/bypass-status/icons" ]; then
-    mkdir -p "$BS_DIR/icons"
-    cp -f "$HERE/shell-plugin/bypass-status/icons/"*.png "$BS_DIR/icons/" 2>/dev/null || true
-  fi
-  if command -v omarchy-shell >/dev/null; then
-    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
-    if command -v omarchy >/dev/null; then
-      omarchy plugin enable "$BS_ID" >/dev/null 2>&1 || true
-      omarchy bar move "$BS_ID" --section right >/dev/null 2>&1 || true
-    fi
-  fi
-  warn "Если виджета не видно — выполни: omarchy restart shell"
 fi
 
 # --- Ежедневная проверка обновлений ----------------------------------------
