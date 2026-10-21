@@ -240,6 +240,42 @@ omavpn nodes        # узлы выбранного профиля
 
 Подробности — [docs/guard.md](docs/guard.md).
 
+### Аудит маршрутов (route-audit)
+
+Отдельная страховка от «домен заблокировали, а маршрут остался прежним».
+Каждые 10 минут `bypass-status --route-audit` прогоняет список доменов
+(YouTube, `youtubei.googleapis.com`, `i.ytimg.com`, `redirector.googlevideo.com`,
+Discord, Telegram Bot API, DeepSeek) и смотрит не «открывается ли сайт», а
+**отвечает ли конкретный домен по своему текущему пути**:
+
+1. проверка «как есть» (curl по текущему маршруту через TUN);
+2. если путь `direct` и проверка провалилась — проверка через локальный SOCKS
+   (порт берётся из `xray.json`);
+3. через VPN хорошо — `omavpn route set <домен> proxy`, перезапуск sing-box,
+   повторная проверка;
+4. плохо обоими путями — не переключается (это не про маршрут).
+
+Оверрайды лежат в `~/.config/omavpn/route_overrides.json` и **сильнее**
+`direct_domains.txt` (его перезаписывает `zapret-autotune`). Раз в сутки
+(`--route-audit-recheck`) оверрайды старше 24 часов снимаются и перепроверяются:
+если direct снова работает — домен остаётся напрямую, если нет — оверрайд
+возвращается.
+
+Поводом послужила реальная поломка 22.10.2026: `youtubei.googleapis.com`
+(служебный API плеера) блокируется напрямую наглухо, zapret его не пробивает, и
+YouTube «тормозил» при живом видео. Теперь домен всегда идёт через VPN
+(`ALWAYS_PROXY_DOMAINS`), а аудит ловит такие случаи сам.
+
+```bash
+omavpn route list                          # домен, путь, источник, возраст, причина
+omavpn route set example.com proxy --reason "API не отвечает напрямую"
+omavpn route unset example.com             # вернуть обычный приоритет
+bypass-status --route-audit                # прогнать аудит вручную
+bypass-status --route-audit-recheck        # перепроверить старые оверрайды
+```
+
+Подробности — [docs/route-audit.md](docs/route-audit.md).
+
 ---
 
 ## Использование
@@ -253,6 +289,7 @@ omavpn profiles | nodes
 omavpn profile 5 | node 0
 omavpn mode tun|proxy
 omavpn strict on|off
+omavpn route list | route set <домен> proxy|direct | route unset <домен>
 omavpn check | logs | update
 ```
 
@@ -303,7 +340,11 @@ omavpn --json status | python3 -m json.tool | head -30
   периодически терял связь с DeepSeek, напрямую из РФ API отвечает стабильно;
 - **tg-ws-proxy** — слушает ли локальный порт;
 - **Обновления** — строка появляется, если для zapret или tg-ws-proxy есть новая
-  версия (нажатие обновляет компоненты).
+  версия (нажатие обновляет компоненты);
+- **Маршруты** — строка «маршруты: проверено N, исправлено M» или «маршруты в
+  порядке» (то же в подсказке иконки) и кнопка **«Проверить маршруты»**. Домен,
+  который не отвечает своим путём, уходит на рабочий — см.
+  [docs/route-audit.md](docs/route-audit.md).
 
 #### Монитор работоспособности (каждые 5 минут)
 
@@ -387,6 +428,7 @@ omavpn probe --node 12      # один сервер
 omavpn heal                 # перезапуск/переключение ноды, если туннель не работает
 bypass-status --optimize    # запустить подбор фоном (то же делает кнопка)
 bypass-status --health      # комплексная проверка текущей конфигурации
+bypass-status --route-audit # аудит маршрутов: нерабочий домен → рабочий путь
 ```
 
 Установка отдельно:
@@ -462,6 +504,8 @@ sudo bash zapret/zapret-blockcheck.sh standard
 | `~/.config/omavpn/settings.json` | профиль/нода/режим |
 | `~/.config/omavpn/subscription` | URL подписки (секрет, 600) |
 | `~/.config/omavpn/direct_domains.txt` | переопределение direct-списка |
+| `~/.config/omavpn/route_overrides.json` | оверрайды маршрутов доменов (сильнее `direct_domains.txt`) |
+| `~/.cache/omavpn/route-audit.json` | результат последнего аудита маршрутов |
 | `~/.local/state/omavpn/` | конфиги, pid, логи |
 | `~/.cache/omavpn/sub.json` | кэш подписки |
 | `/opt/zapret/` | zapret, бинарь `nfqws`, списки, конфиг |
@@ -478,6 +522,8 @@ sudo bash zapret/zapret-blockcheck.sh standard
 | `~/.local/bin/omavpn-guard` | надзиратель за обходами |
 | `~/.local/state/omavpn-guard/` | его журнал, намерение, история переключений (0700) |
 | `~/.config/systemd/user/omavpn-guard.*` | юнит и таймер надзирателя |
+| `~/.config/systemd/user/omavpn-route-audit.*` | таймер аудита маршрутов (каждые 10 мин) |
+| `~/.config/systemd/user/omavpn-route-recheck.*` | таймер перепроверки оверрайдов (раз в сутки) |
 | `~/.config/systemd/user/omavpn-autostart.service` | поднятие VPN при входе |
 | `~/.local/state/omavpn-guard/intent` | включён ли VPN по решению пользователя |
 | `shell-plugin/bypass-status/` | QML виджета «Обходы» |
@@ -489,6 +535,7 @@ sudo bash zapret/zapret-blockcheck.sh standard
 
 - [docs/architecture.md](docs/architecture.md) — как устроена маршрутизация и связка сервисов.
 - [docs/guard.md](docs/guard.md) — надзиратель за обходами: что проверяет и как лечит.
+- [docs/route-audit.md](docs/route-audit.md) — аудит маршрутов: оверрайды, пробы, перепроверка.
 - [docs/zapret.md](docs/zapret.md) — DPI-обход: конфиг, стратегии, автотюн, blockcheck.
 - [docs/telegram.md](docs/telegram.md) — Telegram Desktop, tg-ws-proxy и бот.
 - [docs/troubleshooting.md](docs/troubleshooting.md) — что делать, если что-то отвалилось.

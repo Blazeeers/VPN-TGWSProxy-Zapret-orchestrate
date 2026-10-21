@@ -103,6 +103,19 @@ ALWAYS_DIRECT_DOMAINS = [
     "ts.net",
 ]
 
+# Домены, которые ВСЕГДА идут через VPN — даже если zapret-autotune вернул их
+# в direct_domains.txt. Причина (проверено 22.10.2026): youtubei.googleapis.com
+# блокируется наглухо напрямую (все IP — таймаут 10 с), а zapret его не пробивает,
+# потому что домена нет в /opt/zapret/ipset/zapret-hosts-user.txt. Без этого API
+# страница YouTube висит по 10 секунд при живом видео. Сам видеопоток
+# (googlevideo.com) и картинки (ytimg.com) остаются на обходе — там 24 МБ/с.
+# Правило для этих доменов ставится ПЕРЕД direct-правилом, поэтому даже
+# перезапись direct_domains.txt их не вытолкнет из туннеля.
+ALWAYS_PROXY_DOMAINS = [
+    "youtubei.googleapis.com",
+    "youtube.googleapis.com",
+]
+
 # Дополнительно выводим напрямую Discord/YouTube — блокировку снимает zapret.
 # Список можно переопределить файлом ~/.config/omavpn/direct_domains.txt
 # (по одному домену на строку, '#' — комментарий). Этим пользуется
@@ -137,23 +150,233 @@ DEFAULT_DIRECT_DOMAINS = [
     "youtubeeducation.com",
     "youtubemusic.com",
     "ytstatic.com",
-    "youtube.googleapis.com",
-    "youtubei.googleapis.com",
+    # youtube.googleapis.com и youtubei.googleapis.com сюда НЕ входят: они в
+    # ALWAYS_PROXY_DOMAINS (напрямую недоступны, см. комментарий выше).
 ]
 DIRECT_DOMAINS_FILE = CONF / "direct_domains.txt"
+# Ручные оверрайды маршрута домена:
+#   {"<домен>": {"path": "proxy"|"direct", "reason": "...", "ts": 1792645769}}
+# Ставятся командой `omavpn route set` (и автоматически — аудитом маршрутов).
+# Они сильнее всего остального: домен с "proxy" не попадёт в direct-правило,
+# даже если zapret-autotune запихал его в direct_domains.txt.
+ROUTE_OVERRIDES_FILE = CONF / "route_overrides.json"
+ROUTE_PATHS = ("proxy", "direct")
+
+
+def warn(msg: str) -> None:
+    """Предупреждение в stderr — stdout занят JSON'ом для виджета."""
+    print(f"omavpn: {msg}", file=sys.stderr)
+
+
+def norm_domain(value: str) -> str:
+    return value.strip().strip(".").lower()
+
+
+def route_overrides() -> dict:
+    """Читает оверрайды маршрутов из ~/.config/omavpn/route_overrides.json.
+
+    Битый или нечитаемый файл не повод падать: предупреждаем в stderr и считаем
+    список пустым. Иначе один недописанный JSON оставил бы без конфига весь
+    маршрут (а виджет — без статуса).
+    """
+    try:
+        raw = ROUTE_OVERRIDES_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        warn(f"не читается {ROUTE_OVERRIDES_FILE}: {exc} — оверрайды игнорирую")
+        return {}
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        warn(f"битый JSON в {ROUTE_OVERRIDES_FILE} ({exc}) — оверрайды игнорирую")
+        return {}
+    if not isinstance(data, dict):
+        warn(f"{ROUTE_OVERRIDES_FILE}: ожидался объект «домен → оверрайд» — игнорирую")
+        return {}
+    result: dict = {}
+    for key, value in data.items():
+        dom = norm_domain(str(key))
+        if not dom:
+            continue
+        if isinstance(value, str):  # короткая форма: {"домен": "proxy"}
+            value = {"path": value}
+        if not isinstance(value, dict):
+            warn(f"{ROUTE_OVERRIDES_FILE}: оверрайд {dom} не объект — пропускаю")
+            continue
+        path = str(value.get("path") or "").strip().lower()
+        if path not in ROUTE_PATHS:
+            warn(f"{ROUTE_OVERRIDES_FILE}: у {dom} неизвестный путь {path!r} — пропускаю")
+            continue
+        try:
+            ts = int(value.get("ts") or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        result[dom] = {"path": path, "reason": str(value.get("reason") or "").strip(),
+                       "ts": ts}
+    return result
+
+
+def save_route_overrides(data: dict) -> None:
+    save_json(ROUTE_OVERRIDES_FILE, data)
+
+
+def proxy_domains(overrides: dict | None = None) -> list:
+    """Домены, которые обязаны идти через VPN (правило ПЕРЕД direct)."""
+    over = route_overrides() if overrides is None else overrides
+    forced_direct = {dom for dom, ent in over.items() if ent["path"] == "direct"}
+    result = [dom for dom in ALWAYS_PROXY_DOMAINS if dom not in forced_direct]
+    for dom, ent in over.items():
+        if ent["path"] == "proxy" and dom not in result:
+            result.append(dom)
+    return result
 
 
 def direct_domains() -> list:
-    result = list(ALWAYS_DIRECT_DOMAINS)
+    """Список direct-правила: ALWAYS_DIRECT + файл/умолчания + оверрайды direct.
+
+    Приоритет (он же порядок правил в build_singbox):
+    override → ALWAYS_PROXY_DOMAINS → direct_domains.txt → final=proxy.
+    Поэтому домены, которым положено идти в туннель, отсюда вычищаются — даже
+    если их записал zapret-autotune (этот файл он перезаписывает сам).
+    """
+    over = route_overrides()
+    proxied = set(proxy_domains(over))
+    result: list[str] = []
+
+    def add(dom: str) -> None:
+        dom = norm_domain(dom)
+        if dom and not dom.startswith("#") and dom not in proxied and dom not in result:
+            result.append(dom)
+
+    for dom in ALWAYS_DIRECT_DOMAINS:
+        add(dom)
     try:
         lines = DIRECT_DOMAINS_FILE.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return DEFAULT_DIRECT_DOMAINS
+        lines = DEFAULT_DIRECT_DOMAINS
     for line in lines:
-        dom = line.strip()
-        if dom and not dom.startswith("#") and dom not in result:
-            result.append(dom)
+        add(line.strip())
+    for dom, ent in over.items():
+        if ent["path"] == "direct":
+            add(dom)
     return result
+
+
+def fmt_age(seconds) -> str:
+    if seconds is None:
+        return "—"
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds} с"
+    if seconds < 3600:
+        return f"{seconds // 60} мин"
+    if seconds < 86400:
+        return f"{seconds // 3600} ч"
+    return f"{seconds // 86400} д"
+
+
+def route_entries() -> list:
+    """Полная картина маршрутов для `omavpn route list`.
+
+    Путь каждого домена считается по тому же приоритету, что и в build_singbox:
+    override → ALWAYS_PROXY_DOMAINS → direct_domains.txt → final=proxy.
+    """
+    over = route_overrides()
+    now = int(time.time())
+    rows: dict = {}
+
+    def put(dom: str, path: str, source: str, reason: str = "", ts: int = 0) -> None:
+        dom = norm_domain(dom)
+        if not dom:
+            return
+        rows[dom] = {"domain": dom, "path": path, "source": source, "reason": reason,
+                     "ts": ts, "age": max(0, now - ts) if ts else None}
+
+    file_domains: list = []
+    file_exists = DIRECT_DOMAINS_FILE.exists()
+    if file_exists:
+        try:
+            for line in DIRECT_DOMAINS_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    file_domains.append(line)
+        except OSError as exc:
+            warn(f"не читается {DIRECT_DOMAINS_FILE}: {exc} — беру умолчания")
+            file_exists = False
+
+    for dom in ALWAYS_DIRECT_DOMAINS:
+        put(dom, "direct", "always")
+    for dom in ALWAYS_PROXY_DOMAINS:
+        put(dom, "proxy", "always")
+    for dom in (file_domains if file_exists else DEFAULT_DIRECT_DOMAINS):
+        if norm_domain(dom) not in rows:
+            put(dom, "direct", "file" if file_exists else "default")
+    for dom, ent in over.items():  # оверрайды — самый сильный источник
+        put(dom, ent["path"], "override", ent["reason"], int(ent.get("ts") or 0))
+    return sorted(rows.values(), key=lambda row: (row["path"] != "proxy", row["domain"]))
+
+
+def route_table_text(rows: list) -> str:
+    if not rows:
+        return "маршруты не заданы"
+    width = max(len(row["domain"]) for row in rows)
+    head = (f"{'домен':<{width}}  {'путь':<6}  {'источник':<8}  {'возраст':<7}  причина")
+    lines = [head, "-" * len(head)]
+    for row in rows:
+        lines.append(f"{row['domain']:<{width}}  {row['path']:<6}  {row['source']:<8}  "
+                     f"{fmt_age(row['age']):<7}  {row['reason']}")
+    return "\n".join(lines)
+
+
+def _restart_after_route_change() -> tuple[bool, str]:
+    """Перезапускает VPN, чтобы новый маршрут вступил в силу.
+
+    Если VPN выключен — ничего не делаем: конфиг соберётся при следующем `on`.
+    Возвращает (перезапущено, пояснение).
+    """
+    if not is_on():
+        return False, "VPN выключен — правило применится при следующем подключении"
+    cmd_on(None, None, None, quiet=True)
+    return True, ""
+
+
+def route_set(domain: str, path: str, reason: str = "", restart: bool = True) -> dict:
+    """Ставит оверрайд маршрута домена и (по умолчанию) перезапускает VPN."""
+    dom = norm_domain(domain)
+    if not dom or any(ch in dom for ch in " /\\:"):
+        raise RuntimeError(f"некорректный домен: {domain!r}")
+    path = str(path).strip().lower()
+    if path not in ROUTE_PATHS:
+        raise RuntimeError(f"неизвестный путь: {path!r} (нужно proxy или direct)")
+    over = route_overrides()
+    previous = (over.get(dom) or {}).get("path", "")
+    over[dom] = {"path": path, "reason": reason.strip(), "ts": int(time.time())}
+    save_route_overrides(over)
+    restarted, note = (False, "")
+    if restart:
+        restarted, note = _restart_after_route_change()
+    return {"ok": True, "domain": dom, "path": path, "previous": previous,
+            "reason": reason.strip(), "restarted": restarted, "note": note}
+
+
+def route_unset(domain: str, restart: bool = True) -> dict:
+    """Снимает оверрайд домена (домен возвращается к обычному приоритету правил)."""
+    dom = norm_domain(domain)
+    if not dom:
+        raise RuntimeError("пустой домен")
+    over = route_overrides()
+    previous = over.pop(dom, None)
+    if previous is not None:
+        save_route_overrides(over)
+    restarted, note = (False, "")
+    if restart and previous is not None:
+        restarted, note = _restart_after_route_change()
+    return {"ok": True, "domain": dom, "removed": previous is not None,
+            "previous": (previous or {}).get("path", ""), "restarted": restarted,
+            "note": note}
 
 DEFAULT_SETTINGS = {
     "profile_index": 0,
@@ -637,6 +860,11 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
         bypass.append({"ip_cidr": ips, "outbound": "direct"})
     if domains:
         bypass.append({"domain": domains, "outbound": "direct"})
+    # Домены, которым положено в туннель (ALWAYS_PROXY_DOMAINS + оверрайды) —
+    # отдельным правилом ПЕРЕД direct: direct_domains.txt перезаписывает
+    # zapret-autotune, доверять ему как источнику истины нельзя.
+    forced = proxy_domains()
+    forced_rule = [{"domain_suffix": forced, "outbound": "proxy"}] if forced else []
     return {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
@@ -674,6 +902,7 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
                 {"action": "sniff"},
                 {"protocol": "dns", "action": "hijack-dns"},
                 {"ip_is_private": True, "outbound": "direct"},
+                *forced_rule,
                 {"domain_suffix": direct_domains(), "outbound": "direct"},
                 {"process_name": TELEGRAM_PROCESSES, "outbound": "direct"},
                 *bypass,
@@ -1392,8 +1621,26 @@ def main(argv: list) -> int:
     ss = sub.add_parser("strict", help="strict_route вкл/выкл")
     ss.add_argument("value", choices=["on", "off"])
 
+    # Маршруты доменов: ручные оверрайды direct/proxy поверх direct_domains.txt.
+    srt = sub.add_parser("route", help="маршрут домена: оверрайды proxy/direct")
+    rsub = srt.add_subparsers(dest="route_cmd")
+    rlist = rsub.add_parser("list", help="таблица маршрутов: домен, путь, источник, возраст")
+    # --json понимаем и здесь (не только до подкоманды): omavpn route list --json
+    rlist.add_argument("--json", dest="route_json", action="store_true",
+                       help="вывод в JSON (то же, что omavpn --json route list)")
+    rset = rsub.add_parser("set", help="поставить оверрайд маршрута домена")
+    rset.add_argument("domain")
+    rset.add_argument("path", choices=list(ROUTE_PATHS))
+    rset.add_argument("--reason", default="", help="почему так (сохраняется в оверрайде)")
+    rset.add_argument("--no-restart", action="store_true",
+                      help="не перезапускать VPN (правило применится при следующем on)")
+    runset = rsub.add_parser("unset", help="снять оверрайд домена")
+    runset.add_argument("domain")
+    runset.add_argument("--no-restart", action="store_true",
+                        help="не перезапускать VPN")
+
     args = p.parse_args(argv)
-    JSON_OUT = args.json
+    JSON_OUT = args.json or getattr(args, "route_json", False)
 
     try:
         if args.cmd == "update":
@@ -1448,6 +1695,29 @@ def main(argv: list) -> int:
         elif args.cmd == "logs":
             tail = {"xray": log_tail(XRAY_LOG, 40), "sing-box": log_tail(SB_LOG, 40)}
             emit({"ok": True, **tail}, f"xray: {tail['xray']}\n\nsing-box: {tail['sing-box']}")
+        elif args.cmd == "route":
+            if args.route_cmd == "list":
+                rows = route_entries()
+                over = route_overrides()
+                emit({"ok": True, "file": str(ROUTE_OVERRIDES_FILE),
+                      "overrides": [{"domain": dom, **ent} for dom, ent in over.items()],
+                      "routes": rows}, route_table_text(rows))
+            elif args.route_cmd == "set":
+                res = route_set(args.domain, args.path, args.reason, not args.no_restart)
+                note = " · перезапущено" if res["restarted"] else " · " + (res["note"] or "без перезапуска")
+                emit(res, f"{res['domain']} → {res['path']}{note}")
+            elif args.route_cmd == "unset":
+                res = route_unset(args.domain, not args.no_restart)
+                if not res["removed"]:
+                    text = f"{res['domain']}: оверрайда не было"
+                else:
+                    text = (f"{res['domain']}: снят оверрайд {res['previous']}"
+                            + (" · перезапущено" if res["restarted"]
+                               else " · " + (res["note"] or "без перезапуска")))
+                emit(res, text)
+            else:
+                srt.print_help()
+                return 0
         elif args.cmd == "best":
             res = probe_best(args.probes_quick, args.timeout_quick, args.probes_final,
                              args.timeout_final, args.url, args.apply)

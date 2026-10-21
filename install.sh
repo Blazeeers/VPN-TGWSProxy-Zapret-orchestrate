@@ -185,6 +185,80 @@ EOF
   systemctl --user enable omavpn-autostart.service >/dev/null 2>&1 || true
 fi
 
+# --- Аудит маршрутов --------------------------------------------------------
+# Каждые 10 минут проверяет домены из ROUTE_PROBES: если домен по текущему
+# маршруту не отвечает, а через VPN отвечает — ставит оверрайд
+# (omavpn route set ... proxy) и перезапускает sing-box. Раз в сутки —
+# перепроверка старых оверрайдов: снять и посмотреть, не работает ли direct.
+if [ -x "$LOCAL_BIN/bypass-status" ] && [ -x "$LOCAL_BIN/omavpn" ]; then
+  if command -v systemctl >/dev/null 2>&1; then
+    say "Ставлю таймеры аудита маршрутов (route-audit)…"
+    mkdir -p "$HOME_DIR/.config/systemd/user"
+
+    cat > "$HOME_DIR/.config/systemd/user/omavpn-route-audit.service" <<EOF
+[Unit]
+Description=Router audit: a domain that fails on its current route moves to a working one
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$LOCAL_BIN/bypass-status --route-audit
+Nice=10
+TimeoutStartSec=600
+EOF
+
+    cat > "$HOME_DIR/.config/systemd/user/omavpn-route-audit.timer" <<'EOF'
+[Unit]
+Description=Periodic route audit (direct/proxy per domain)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+RandomizedDelaySec=30
+Persistent=true
+Unit=omavpn-route-audit.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    cat > "$HOME_DIR/.config/systemd/user/omavpn-route-recheck.service" <<EOF
+[Unit]
+Description=Route overrides recheck: try direct again for old proxy overrides
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$LOCAL_BIN/bypass-status --route-audit-recheck
+Nice=10
+TimeoutStartSec=900
+EOF
+
+    cat > "$HOME_DIR/.config/systemd/user/omavpn-route-recheck.timer" <<'EOF'
+[Unit]
+Description=Daily route override recheck
+
+[Timer]
+OnBootSec=12min
+OnUnitActiveSec=24h
+RandomizedDelaySec=5min
+Persistent=true
+Unit=omavpn-route-recheck.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user enable --now omavpn-route-audit.timer >/dev/null 2>&1 || \
+      warn "Не удалось включить omavpn-route-audit.timer — включи вручную: systemctl --user enable --now omavpn-route-audit.timer"
+    systemctl --user enable --now omavpn-route-recheck.timer >/dev/null 2>&1 || \
+      warn "Не удалось включить omavpn-route-recheck.timer — включи вручную: systemctl --user enable --now omavpn-route-recheck.timer"
+  else
+    warn "systemctl не найден — таймеры аудита маршрутов не поставлены (bypass-status --route-audit можно запускать вручную)"
+  fi
+fi
+
 # --- Ежедневная проверка обновлений ----------------------------------------
 if [ -x "$LOCAL_BIN/bypass-status" ]; then
   say "Ставлю таймер проверки обновлений (zapret, tg-ws-proxy)…"

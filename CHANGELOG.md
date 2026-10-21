@@ -4,6 +4,55 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [2.2.0] — 2026-10-22
+
+### Added
+- **Оверрайды маршрутов домена** (`omavpn route list|set|unset`,
+  `~/.config/omavpn/route_overrides.json`). Запись вида
+  `{"youtubei.googleapis.com": {"path": "proxy", "reason": "...", "ts": ...}}`
+  сильнее всего остального: домен с `path: proxy` не попадёт в direct-правило,
+  даже если `zapret-autotune` записал его в `direct_domains.txt`. Чтение и
+  запись атомарные, битый JSON не роняет CLI — предупреждение в stderr, список
+  считается пустым. `route set/unset` перезапускают VPN через существующую
+  сборку конфига (`--no-restart` — без перезапуска).
+- **Аудит маршрутов** (`bypass-status --route-audit`): проверяет список доменов
+  (`ROUTE_PROBES` — YouTube, `youtubei`, `ytimg`, `googlevideo`, Discord,
+  Telegram Bot API, DeepSeek), и если домен по текущему пути не отвечает, а
+  через локальный SOCKS отвечает — ставит оверрайд `proxy`, перезапускает
+  sing-box и перепроверяет. Если домен не отвечает обоими путями, он не
+  переключается: это не про маршрут. Результат — `~/.cache/<cli>/route-audit.json`
+  и журнал systemd. Только маршруты: `omavpn heal` и перебор нод не вызываются.
+- **Перепроверка оверрайдов** (`bypass-status --route-audit-recheck`, раз в
+  сутки): оверрайды `proxy` старше 24 часов снимаются, домен проверяется
+  напрямую; работает — остаётся на direct, не работает — оверрайд возвращается.
+  Так блокировка, которую сняли, перестаёт гонять трафик через VPN.
+- Юниты `omavpn-route-audit.{service,timer}` (загрузка + 3 мин, затем каждые
+  10 мин) и `omavpn-route-recheck.{service,timer}` (раз в сутки).
+- В виджете — строка «маршруты: проверено N, исправлено M» / «маршруты в
+  порядке», та же строка в подсказке иконки и кнопка **«Проверить маршруты»**.
+- `docs/route-audit.md` — как работает аудит, какие домены проверяются, как
+  откатить вручную.
+
+### Fixed
+- **YouTube «тормозил» при живом видео.** `youtubei.googleapis.com` (служебный
+  API плеера) блокируется напрямую наглухо — все адреса дают таймаут 10 с, а
+  zapret его не пробивает: домена нет в `/opt/zapret/ipset/zapret-hosts-user.txt`.
+  При этом `www.youtube.com` отдаёт 200, а видео с `googlevideo.com` качается
+  10–24 МБ/с, поэтому поломка выглядела как «интернет медленный». Домен и
+  `youtube.googleapis.com` теперь в `ALWAYS_PROXY_DOMAINS` — всегда через VPN,
+  отдельным правилом **перед** direct-правилом. Проверено: напрямую таймаут,
+  через туннель ответ за 1–2 с (HTTP 405 на `GET /youtubei/v1/player` — норма).
+- `omavpn-guard` проверяет `youtubei.googleapis.com` в `svc_youtube_ok`: успех —
+  любой HTTP-ответ, `000` — поломка. Раньше сторож видел «YouTube работает»,
+  пока плеер висел.
+
+### Changed
+- Приоритет маршрутов в `build_singbox()`: **override → `ALWAYS_PROXY_DOMAINS` →
+  `direct_domains.txt` → `final=proxy`**. `youtube.googleapis.com` и
+  `youtubei.googleapis.com` убраны из `DEFAULT_DIRECT_DOMAINS`.
+- Без файла `route_overrides.json` поведение прежнее (кроме доменов из
+  `ALWAYS_PROXY_DOMAINS`).
+
 ## [2.1.0] — 2026-10-21
 
 ### Added

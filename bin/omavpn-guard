@@ -309,7 +309,14 @@ svc_youtube_ok() {
     [ "$code" = "200" ] && [ "${size:-0}" -gt 2000 ] 2>/dev/null && [[ "${ctype:-}" == image/* ]] || return 1
     code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 \
         https://redirector.googlevideo.com/generate_204 2>/dev/null)
-    [ "$code" = "204" ] || [ "$code" = "200" ]
+    { [ "$code" = "204" ] || [ "$code" = "200" ]; } || return 1
+    # Служебный API YouTube (youtubei.googleapis.com) блокируют наглухо: страница
+    # и картинки открываются, а плеер висит по 10 с на каждом запросе. Успех —
+    # любой HTTP-ответ (TLS-соединение и ответ состоялись): 405/400 норма,
+    # 000 — таймаут/обрыв. Домен всегда идёт через VPN (ALWAYS_PROXY_DOMAINS).
+    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 10 \
+        https://youtubei.googleapis.com/youtubei/v1/player 2>/dev/null)
+    [ -n "$code" ] && [ "$code" != "000" ]
 }
 
 svc_discord_ok() {

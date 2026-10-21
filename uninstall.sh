@@ -18,6 +18,14 @@ rm -f "$HOME_DIR/.config/systemd/user/omavpn-guard.service" \
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 rm -f "$HOME_DIR/.local/bin/omavpn-guard"
 
+# Аудит маршрутов: те же правила — сначала таймеры, потом файлы юнитов.
+systemctl --user disable --now omavpn-route-audit.timer omavpn-route-recheck.timer >/dev/null 2>&1 || true
+rm -f "$HOME_DIR/.config/systemd/user/omavpn-route-audit.service" \
+      "$HOME_DIR/.config/systemd/user/omavpn-route-audit.timer" \
+      "$HOME_DIR/.config/systemd/user/omavpn-route-recheck.service" \
+      "$HOME_DIR/.config/systemd/user/omavpn-route-recheck.timer"
+systemctl --user daemon-reload >/dev/null 2>&1 || true
+
 rm -rf "$HOME_DIR/.config/omarchy/plugins/io.github.blazeeers.omavpn"
 command -v omarchy-shell >/dev/null && omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
 
