@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import fcntl
 import hashlib
 import json
 import os
@@ -48,9 +49,15 @@ DEEPSEEK_URL = "https://api.deepseek.com/"
 ROUTE_AUDIT_MAX_AGE = 30 * 60
 ROUTE_AUDIT_LOCK = os.path.join(HOME, ".cache", "bypass-status", "route-audit.lock")
 ROUTE_AUDIT_REASON = "аудит: direct не отвечает"
+ROUTE_AUDIT_REASON_BACK = "аудит: proxy не отвечает"
+# По этому префиксу аудит узнаёт собственные оверрайды: ручные (`omavpn route
+# set`) не снимаются перепроверкой и не перебиваются аудитом никогда.
+ROUTE_REASON_PREFIX = "аудит"
 ROUTE_RECHECK_AGE = 24 * 3600      # оверрайд proxy старше суток перепроверяем
 ROUTE_RECHECK_GAP = 20 * 3600      # но сам перепроверочный прогон — не чаще раза в 20 ч
 ROUTE_PROBE_TIMEOUT = 10           # больше 10 с на пробу не ждём
+ROUTE_MAX_SWITCHES = 2             # переключений на домен за прогон (туда и обратно)
+ROUTE_SETTLE = 2.0                 # пауза после перезапуска: TUN перечитывает правила
 
 # Пробы маршрутов: домен → URL, способ проверки, что считается успехом.
 # Успех "answer" = получен любой HTTP-код (TLS-соединение и ответ состоялись);
@@ -68,10 +75,16 @@ ROUTE_PROBES = [
         "expect": "answer",        # 405/400 = нормальный ответ, главное не таймаут
     },
     {
+        # i.ytimg.com — CDN превью. Проба — generate_204 на его же хосте:
+        # раньше здесь стоял жёсткий id видео (dQw4w9WgXcQ), и если видео
+        # удалят, guard считал бы YouTube сломанным по кругу. generate_204 не
+        # зависит от конкретного видео и проверяет то же самое: DNS + TLS +
+        # ответ CDN (204/200). Отдельная проверка «картинка ли это» осталась в
+        # guard — через favicon.ico (image/*), у которого нет срока жизни.
         "domain": "i.ytimg.com",
-        "url": f"https://i.ytimg.com/vi/{YT_TEST_VIDEO}/hqdefault.jpg",
-        "expect": "image",
-        "min_size": 2000,
+        "url": "https://i.ytimg.com/generate_204",
+        "expect": "codes",
+        "codes": (200, 204),
     },
     {
         "domain": "redirector.googlevideo.com",
@@ -692,26 +705,41 @@ def cli_json(cli: str, *args) -> dict:
 # аудит маршрутов: домен, недоступный текущим путём, уходит на рабочий
 # --------------------------------------------------------------------------- #
 
-def _take_lock(path: str, stale_after: int) -> bool:
-    """Ставит файл-блокировку. False — уже идёт другой прогон."""
-    if os.path.exists(path):
-        try:
-            if time.time() - os.path.getmtime(path) < stale_after:
-                return False
-        except OSError:
-            pass
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def audit_lock(path: str) -> tuple[int, str]:
+    """Эксклюзивный flock на прогон аудита. (fd, "") либо (-1, причина).
+
+    Именно flock, а не файл с pid/mtime: старую схему («лок устарел, если
+    старше 600 с») ломает любой долгий прогон — второй процесс забирал лок, а
+    потом `finally` первого снимал уже чужой. С flock лок держится, пока жив
+    процесс, и снимается ядром даже при его падении.
+    """
     try:
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(str(os.getpid()))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        return -1, "не открыть лок " + path + ": " + str(exc)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        return True  # без лока работаем: лучше аудит, чем ничего
-    return True
-
-
-def _drop_lock(path: str) -> None:
+        os.close(fd)
+        return -1, "busy"
     try:
-        os.remove(path)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except OSError:
+        pass
+    return fd, ""
+
+
+def audit_unlock(fd: int) -> None:
+    if fd is None or fd < 0:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
     except OSError:
         pass
 
@@ -735,14 +763,19 @@ def socks_port(app: str) -> int:
     return 0
 
 
-def _cli_route_rules(cli: str) -> list:
-    """(путь, домены) из `omavpn --json route list` — единая логика приоритета."""
+def _cli_route_rules(cli: str) -> tuple[list, list, list]:
+    """(правила, «только напрямую», «только через VPN») из `route list --json`.
+
+    Путь считает сам CLI — единая логика приоритета, без дублирования. Списки
+    «всегда» нужны аудиту: домен из ALWAYS_DIRECT нельзя уводить в туннель
+    (ему нужен российский IP), а из ALWAYS_PROXY — выпускать напрямую.
+    """
     if not cli:
-        return []
+        return [], [], []
     data = cli_json(cli, "route", "list")
     routes = data.get("routes")
     if not isinstance(routes, list) or not routes:
-        return []
+        return [], [], []
     proxy, direct = [], []
     for row in routes:
         if not isinstance(row, dict) or not row.get("domain"):
@@ -753,7 +786,15 @@ def _cli_route_rules(cli: str) -> list:
         rules.append(("proxy", proxy))       # правило proxy стоит перед direct
     if direct:
         rules.append(("direct", direct))
-    return rules
+    always_direct = [str(d) for d in (data.get("always_direct") or []) if d]
+    always_proxy = [str(d) for d in (data.get("always_proxy") or []) if d]
+    if not always_direct and not always_proxy:
+        # CLI без списков «always»: берём их из источника строк таблицы
+        for row in routes:
+            if not isinstance(row, dict) or row.get("source") != "always" or not row.get("domain"):
+                continue
+            (always_proxy if row.get("path") == "proxy" else always_direct).append(str(row["domain"]))
+    return rules, always_direct, always_proxy
 
 
 def _cfg_route_rules(app: str) -> list:
@@ -779,8 +820,12 @@ def _cfg_route_rules(app: str) -> list:
     return rules
 
 
-def route_rules(app: str, cli: str) -> list:
-    return _cli_route_rules(cli) or _cfg_route_rules(app)
+def route_context(app: str, cli: str) -> dict:
+    """Правила в порядке sing-box + списки «всегда» + признак живого CLI."""
+    rules, always_direct, always_proxy = _cli_route_rules(cli)
+    if not rules:
+        rules = _cfg_route_rules(app)
+    return {"rules": rules, "always_direct": always_direct, "always_proxy": always_proxy}
 
 
 def route_path(domain: str, rules: list) -> str:
@@ -796,6 +841,16 @@ def route_path(domain: str, rules: list) -> str:
             if cand and (dom == cand or dom.endswith(cand)):
                 return path
     return "default"
+
+
+def in_list(domain: str, domains: list) -> bool:
+    """Попадает ли домен в список по тем же правилам суффикса, что и sing-box."""
+    dom = (domain or "").strip().lower()
+    for cand in domains:
+        cand = str(cand).strip().lower()
+        if cand and (dom == cand or dom.endswith(cand)):
+            return True
+    return False
 
 
 def _run_bytes(cmd: list[str], timeout: float) -> tuple[int, str]:
@@ -846,11 +901,6 @@ def probe_verdict(probe: dict, res: dict) -> tuple[bool, str]:
     if kind == "page":
         ok = code == 200 and probe.get("needle", "").lower() in res.get("body", "").lower()
         return ok, "HTTP " + str(code) + ("" if ok else " (в теле нет «" + probe.get("needle", "") + "»)")
-    if kind == "image":
-        ok = (code == 200 and str(res.get("ctype", "")).startswith("image/")
-              and int(res.get("size") or 0) > int(probe.get("min_size", 2000)))
-        return ok, ("HTTP " + str(code) + " · " + str(res.get("ctype") or "?")
-                    + " · " + str(res.get("size") or 0) + " Б")
     return False, "неизвестный тип проверки"
 
 
@@ -887,93 +937,261 @@ def read_route_overrides(app: str) -> dict:
 
 
 def _audit_summary(probes: list, actions: list) -> str:
-    if actions:
-        return "проверено " + str(len(probes)) + ", исправлено " + str(len(actions))
+    """Строка для виджета: что проверили, что исправили, что до сих пор лежит."""
+    fixed = [a for a in actions if a.get("ok")]
     bad = [p["domain"] for p in probes if not p.get("after")]
+    parts = []
+    if probes:
+        parts.append("проверено " + str(len(probes)))
+    if fixed:
+        parts.append("исправлено " + str(len(fixed)))
     if bad:
-        return "не отвечают: " + ", ".join(bad)
-    return "маршруты в порядке"
+        parts.append("не отвечают: " + ", ".join(bad))
+    return "; ".join(parts) if parts else "маршруты в порядке"
+
+
+def _probe_once(probe: dict, socks: int = 0) -> tuple[bool, dict, str]:
+    """Проба с подтверждением: (успех, результат, пояснение).
+
+    Одиночный обрыв на живой сети — не повод менять маршрут, поэтому провал
+    обязательно проверяется второй попыткой.
+    """
+    timeout = float(probe.get("timeout", ROUTE_PROBE_TIMEOUT))
+    res = http_probe(probe["url"], socks=socks, timeout=timeout)
+    ok, detail = probe_verdict(probe, res)
+    if ok:
+        return True, res, detail
+    again = http_probe(probe["url"], socks=socks, timeout=timeout)
+    ok2, detail2 = probe_verdict(probe, again)
+    if ok2:
+        return True, again, detail2 + " (со второй попытки)"
+    return False, again, detail2 + " (две попытки)"
+
+
+def _vpn_socks(app: str) -> int:
+    """Порт локального SOCKS, если VPN действительно поднят. Иначе 0.
+
+    Проверяем не только конфиг, но и живой порт: при выключенном VPN проба
+    «через VPN» всегда упрётся в мёртвый порт, и аудит начал бы переключать
+    маршруты из-за собственной ошибки.
+    """
+    socks = socks_port(app)
+    return socks if socks and port_open(socks) else 0
+
+
+def _own_override(overrides: dict, dom: str) -> bool:
+    """Оверрайд поставил аудит (его можно менять) или его нет вовсе."""
+    ent = overrides.get(dom)
+    if not ent:
+        return True
+    return str(ent.get("reason") or "").startswith(ROUTE_REASON_PREFIX)
+
+
+def _route_switch(cli: str, dom: str, path: str, reason: str) -> dict:
+    """Ставит оверрайд без перезапуска VPN: рестарт делается один на пачку."""
+    return cli_json_slow(cli, "route", "set", dom, path, "--reason", reason, "--no-restart")
+
+
+def _route_restore(cli: str, dom: str, previous: dict) -> dict:
+    """Возвращает домен к состоянию до прогона (был оверрайд — вернуть его)."""
+    if previous and str(previous.get("path") or "") in ("proxy", "direct"):
+        return cli_json_slow(cli, "route", "set", dom, str(previous["path"]),
+                             "--reason", str(previous.get("reason") or ""), "--no-restart")
+    return cli_json_slow(cli, "route", "unset", dom, "--no-restart")
+
+
+def _restart_vpn(cli: str) -> tuple[bool, str]:
+    """Один перезапуск VPN на весь пакет уже записанных правил."""
+    res = cli_json_slow(cli, "restart", timeout=240)
+    if res.get("ok"):
+        return True, ""
+    return False, str(res.get("error") or "нет ответа CLI")
 
 
 def run_route_audit() -> dict:
-    """Проверяет пробы маршрутов и переводит нерабочие домены на рабочий путь.
+    """Двусторонний аудит маршрутов.
 
-    Только маршруты: `omavpn heal` не вызывается, ноды не перебираются.
+    Смотрит в обе стороны: домен, которому плохо на текущем пути, проверяется
+    на противоположном.
+
+      * путь direct и проба провалилась → проверяем через SOCKS; хорошо —
+        ставим оверрайд proxy;
+      * путь proxy (или final=proxy) и проба провалилась → переводим в direct,
+        перезапускаем, проверяем; плохо и там — возвращаем как было.
+
+    Второе направление — ответ на случай 22.10.2026, когда `zapret-autotune`
+    перевёл сеть в режим vpn и видеотрафик googlevideo ушёл в туннель, где не
+    работает (видео `code=000`, страница при этом 200).
+
+    Границы: домены из ALWAYS_DIRECT в туннель не переводим (им нужен РФ-IP),
+    из ALWAYS_PROXY — не выпускаем напрямую; ручные оверрайды не трогаем; не
+    больше ROUTE_MAX_SWITCHES переключений на домен за прогон. Сначала все
+    пробы (ничего не меняя), потом оверрайды пачкой `--no-restart`, потом один
+    `omavpn restart` на пачку и одна перепроверка.
     """
-    if not _take_lock(ROUTE_AUDIT_LOCK, 600):
-        return {"ok": False, "reason": "already_running", "checked": time.time()}
+    fd, why = audit_lock(ROUTE_AUDIT_LOCK)
+    if why:
+        if why == "busy":
+            return {"ok": False, "reason": "already_running", "checked": time.time()}
+        return {"ok": False, "reason": "lock_error", "error": why, "checked": time.time()}
     started = time.time()
     app, cli = resolve_cli()
     result: dict = {"ok": False, "checked": time.time(), "probes": [], "actions": []}
     try:
-        rules = route_rules(app, cli)
-        socks = socks_port(app)
+        ctx = route_context(app, cli)
+        rules = ctx["rules"]
+        socks = _vpn_socks(app)
+        overrides = read_route_overrides(app)
         probes: list[dict] = []
         actions: list[dict] = []
+        forward: list[dict] = []   # прямому пути плохо → пробуем туннель
+        reverse: list[dict] = []   # туннелю плохо → пробуем напрямую
+        switches: dict = {}
+
+        # --- фаза 1: только пробы, ничего не меняем -------------------------
         for probe in ROUTE_PROBES:
             dom = probe["domain"]
-            timeout = float(probe.get("timeout", ROUTE_PROBE_TIMEOUT))
             path = route_path(dom, rules)
-            before_res = http_probe(probe["url"], timeout=timeout)
-            before_ok, before_detail = probe_verdict(probe, before_res)
-            if not before_ok:
-                # одиночный обрыв на живой сети — не повод менять маршрут
-                retry_res = http_probe(probe["url"], timeout=timeout)
-                retry_ok, retry_detail = probe_verdict(probe, retry_res)
-                if retry_ok:
-                    before_res, before_ok = retry_res, True
-                    before_detail = retry_detail + " (со второй попытки)"
-            item = {
-                "domain": dom, "path": path, "before": before_ok, "after": before_ok,
-                "action": "", "detail": before_detail, "code": before_res["code"],
-                "secs": before_res["secs"],
-            }
-            if not before_ok:
-                if path in ("proxy", "default"):
-                    # домен и так идёт в туннель: если не отвечает — проблема не в маршруте
-                    item["detail"] = before_detail + "; домен уже идёт через VPN"
-                elif not socks:
-                    item["detail"] = (before_detail
-                                      + "; путь VPN проверить нечем — в xray.json нет SOCKS")
-                elif not cli:
-                    item["detail"] = before_detail + "; VPN CLI не найден — переключить нечем"
-                else:
-                    vpn_res = http_probe(probe["url"], socks=socks, timeout=timeout)
-                    vpn_ok, vpn_detail = probe_verdict(probe, vpn_res)
-                    if not vpn_ok:
-                        # оба пути плохи — это не про маршрут, не воюем
-                        item["detail"] = ("domain недоступен обоими путями (direct: "
-                                          + before_detail + "; vpn: " + vpn_detail + ")")
-                    else:
-                        set_res = cli_json_slow(cli, "route", "set", dom, "proxy",
-                                                "--reason", ROUTE_AUDIT_REASON)
-                        if not set_res.get("ok"):
-                            item["detail"] = ("direct: " + before_detail
-                                              + "; не удалось поставить оверрайд: "
-                                              + str(set_res.get("error") or "нет ответа CLI"))
-                        else:
-                            if set_res.get("restarted"):
-                                time.sleep(1.0)  # дать TUN перечитать правила
-                            after_res = http_probe(probe["url"], timeout=timeout)
-                            after_ok, after_detail = probe_verdict(probe, after_res)
-                            item.update({
-                                "path": "proxy", "after": after_ok, "action": "proxy",
-                                "code": after_res["code"], "secs": after_res["secs"],
-                                "detail": ("direct: " + before_detail + "; vpn: " + vpn_detail
-                                           + "; после переключения: " + after_detail),
-                            })
-                            actions.append({"domain": dom, "from": path, "to": "proxy",
-                                            "reason": ROUTE_AUDIT_REASON})
+            ok, res, detail = _probe_once(probe)
+            item = {"domain": dom, "path": path, "before": ok, "after": ok, "action": "",
+                    "detail": detail, "code": res["code"], "secs": res["secs"]}
             probes.append(item)
+            if ok:
+                continue
+            job = {"probe": probe, "item": item, "from": path,
+                   "previous": overrides.get(dom) or {}}
+            if not _own_override(overrides, dom):
+                item["detail"] = detail + "; ручной оверрайд — не трогаю"
+            elif path == "direct":
+                if in_list(dom, ctx["always_direct"]):
+                    item["detail"] = (detail
+                                      + "; помечен «только напрямую» — не переключаю")
+                elif not socks:
+                    item["detail"] = (detail + "; путь VPN проверить нечем "
+                                      "(VPN выключен или в xray.json нет SOCKS)")
+                elif not cli:
+                    item["detail"] = detail + "; VPN CLI не найден — переключить нечем"
+                else:
+                    vpn_ok, _, vpn_detail = _probe_once(probe, socks=socks)
+                    if vpn_ok:
+                        item["detail"] = "direct: " + detail + "; vpn: " + vpn_detail
+                        forward.append(job)
+                    else:
+                        item["detail"] = ("direct: " + detail + "; vpn: " + vpn_detail
+                                          + "; недоступен обоими путями — не переключаю")
+            else:  # proxy или final=proxy
+                if in_list(dom, ctx["always_proxy"]):
+                    item["detail"] = (detail
+                                      + "; помечен «только через VPN» — в direct не перевожу")
+                elif not socks:
+                    item["detail"] = detail + "; VPN выключен — путь direct так не проверить"
+                elif not cli:
+                    item["detail"] = detail + "; VPN CLI не найден — переключить нечем"
+                else:
+                    item["detail"] = detail + "; проверяю напрямую"
+                    reverse.append(job)
+
+        # --- фаза 2: direct → proxy, один перезапуск на всю пачку ----------
+        if forward:
+            applied = []
+            for job in forward:
+                dom = job["probe"]["domain"]
+                if switches.get(dom, 0) >= ROUTE_MAX_SWITCHES:
+                    continue
+                res = _route_switch(cli, dom, "proxy", ROUTE_AUDIT_REASON)
+                if not res.get("ok"):
+                    job["item"]["detail"] += ("; не удалось поставить оверрайд: "
+                                              + str(res.get("error") or "нет ответа CLI"))
+                    continue
+                switches[dom] = switches.get(dom, 0) + 1
+                job["item"]["path"] = "proxy"
+                applied.append(job)
+            restarted, why_restart = _restart_vpn(cli) if applied else (False, "")
+            if not restarted:
+                for job in applied:
+                    job["item"]["detail"] += ("; VPN не перезапустился: " + why_restart
+                                              + " — правило применится позже")
+            else:
+                time.sleep(ROUTE_SETTLE)
+            for job in applied:
+                dom = job["probe"]["domain"]
+                after_ok, after_res, after_detail = _probe_once(job["probe"])
+                job["item"].update({
+                    "after": after_ok, "action": "proxy",
+                    "code": after_res["code"], "secs": after_res["secs"],
+                    "detail": job["item"]["detail"] + "; после переключения: " + after_detail,
+                })
+                if after_ok and restarted:
+                    actions.append({"domain": dom, "from": job["from"], "to": "proxy",
+                                    "reason": ROUTE_AUDIT_REASON, "ok": True})
+
+        # --- фаза 3: proxy → direct (обратное направление) ------------------
+        if reverse:
+            applied = []
+            for job in reverse:
+                dom = job["probe"]["domain"]
+                if switches.get(dom, 0) >= ROUTE_MAX_SWITCHES:
+                    continue
+                res = _route_switch(cli, dom, "direct", ROUTE_AUDIT_REASON_BACK)
+                if not res.get("ok"):
+                    job["item"]["detail"] += ("; не удалось поставить оверрайд: "
+                                              + str(res.get("error") or "нет ответа CLI"))
+                    continue
+                switches[dom] = switches.get(dom, 0) + 1
+                applied.append(job)
+            restarted, why_restart = _restart_vpn(cli) if applied else (False, "")
+            if not restarted:
+                # без перезапуска правило не применилось — проверять нечего
+                for job in applied:
+                    _route_restore(cli, job["probe"]["domain"], job["previous"])
+                    switches[job["probe"]["domain"]] = switches.get(job["probe"]["domain"], 0) + 1
+                    job["item"].update({
+                        "after": False, "path": job["from"],
+                        "detail": job["item"]["detail"] + "; VPN не перезапустился: "
+                                  + why_restart + " — оставил как было",
+                    })
+            else:
+                time.sleep(ROUTE_SETTLE)
+                bad = []
+                for job in applied:
+                    dom = job["probe"]["domain"]
+                    after_ok, after_res, after_detail = _probe_once(job["probe"])
+                    job["item"].update({
+                        "after": after_ok, "code": after_res["code"],
+                        "secs": after_res["secs"],
+                        "detail": job["item"]["detail"] + "; direct: " + after_detail,
+                    })
+                    if after_ok:
+                        job["item"].update({"path": "direct", "action": "direct"})
+                        actions.append({"domain": dom, "from": job["from"], "to": "direct",
+                                        "reason": ROUTE_AUDIT_REASON_BACK, "ok": True})
+                    else:
+                        bad.append(job)
+                if bad:
+                    for job in bad:
+                        dom = job["probe"]["domain"]
+                        _route_restore(cli, dom, job["previous"])
+                        switches[dom] = switches.get(dom, 0) + 1
+                        job["item"].update({
+                            "path": job["from"], "action": "rollback",
+                            "detail": job["item"]["detail"]
+                                      + "; вернул прежний путь — не отвечает ни там, ни там",
+                        })
+                        actions.append({"domain": dom, "from": "direct",
+                                        "to": job["from"],
+                                        "reason": "аудит: proxy и direct не отвечают",
+                                        "ok": False})
+                    _restart_vpn(cli)  # откат тоже надо применить
 
         ok = all(p["after"] for p in probes)
+        fixed = any(a.get("ok") for a in actions)
         result = {
             "ok": ok,
             "checked": time.time(),
-            "verdict": "fixed" if actions else ("ok" if ok else "bad"),
+            "verdict": "fixed" if fixed else ("ok" if ok else "bad"),
             "summary": _audit_summary(probes, actions),
             "count": len(probes),
-            "fixed": len(actions),
+            "fixed": len([a for a in actions if a.get("ok")]),
             "socks_port": socks,
             "probes": probes,
             "actions": actions,
@@ -985,20 +1203,26 @@ def run_route_audit() -> dict:
                   "probes": [], "actions": [], "error": str(exc),
                   "secs": round(time.time() - started, 1)}
     finally:
-        _drop_lock(ROUTE_AUDIT_LOCK)
+        audit_unlock(fd)
     if app:
         write_json_cache(app, "route-audit.json", result)
     return result
 
 
 def run_route_recheck(force: bool = False) -> dict:
-    """Раз в сутки: снять оверрайды proxy старше суток и проверить direct заново.
+    """Раз в сутки: снять оверрайды аудита старше суток и проверить direct заново.
 
     Блокировки снимают, и zapret учат новые домены — тогда домен пора вернуть
     на прямой путь. Если direct снова не отвечает, оверрайд возвращается.
+
+    Трогаем **только свои** оверрайды (причина начинается с «аудит»): ручной
+    `omavpn route set` — решение человека, и перепроверка его не снимает.
     """
-    if not _take_lock(ROUTE_AUDIT_LOCK, 600):
-        return {"ok": False, "reason": "already_running", "checked": time.time()}
+    fd, why = audit_lock(ROUTE_AUDIT_LOCK)
+    if why:
+        if why == "busy":
+            return {"ok": False, "reason": "already_running", "checked": time.time()}
+        return {"ok": False, "reason": "lock_error", "error": why, "checked": time.time()}
     started = time.time()
     app, cli = resolve_cli()
     result: dict = {"ok": False, "checked": time.time(), "probes": [], "actions": []}
@@ -1023,6 +1247,8 @@ def run_route_recheck(force: bool = False) -> dict:
         for dom, ent in overrides.items():
             if str(ent.get("path") or "") != "proxy":
                 continue
+            if not str(ent.get("reason") or "").startswith(ROUTE_REASON_PREFIX):
+                continue          # ручной оверрайд — не трогаем никогда
             try:
                 ts = float(ent.get("ts") or 0)
             except (TypeError, ValueError):
@@ -1040,50 +1266,67 @@ def run_route_recheck(force: bool = False) -> dict:
                       "probes": [], "actions": [],
                       "secs": round(time.time() - started, 1)}
         else:
-            socks = socks_port(app)
+            socks = _vpn_socks(app)
             probes: list[dict] = []
             actions: list[dict] = []
+            stripped: list[dict] = []
             for dom in candidates:
-                probe = probe_for(dom)
-                timeout = float(probe.get("timeout", ROUTE_PROBE_TIMEOUT))
                 item = {"domain": dom, "path": "proxy", "before": True, "after": True,
                         "action": "", "detail": "был override proxy"}
-                unset = cli_json_slow(cli, "route", "unset", dom)
-                if not unset.get("ok"):
-                    item["detail"] = ("не удалось снять оверрайд: "
-                                      + str(unset.get("error") or "нет ответа CLI"))
-                    probes.append(item)
-                    continue
-                time.sleep(1.0)
-                direct_res = http_probe(probe["url"], timeout=timeout)
-                direct_ok, direct_detail = probe_verdict(probe, direct_res)
-                if direct_ok:
-                    item.update({"path": "direct", "after": True,
-                                "detail": "direct снова работает (" + direct_detail + ") — оверрайд снят"})
-                    actions.append({"domain": dom, "from": "proxy", "to": "direct",
-                                    "reason": "direct отвечает"})
-                else:
-                    vpn_ok, vpn_detail = (False, "нет SOCKS в xray.json")
-                    if socks:
-                        vpn_res = http_probe(probe["url"], socks=socks, timeout=timeout)
-                        vpn_ok, vpn_detail = probe_verdict(probe, vpn_res)
-                    restore = cli_json_slow(cli, "route", "set", dom, "proxy",
-                                            "--reason", "аудит: direct всё ещё не отвечает")
-                    item.update({"path": "proxy", "after": bool(restore.get("ok")),
-                                 "detail": ("direct: " + direct_detail + "; vpn: " + vpn_detail
-                                            + "; оверрайд возвращён")})
-                    if restore.get("ok"):
-                        actions.append({"domain": dom, "from": "direct", "to": "proxy",
-                                        "reason": "direct всё ещё не отвечает"})
                 probes.append(item)
+                res = cli_json_slow(cli, "route", "unset", dom, "--no-restart")
+                if not res.get("ok"):
+                    item["detail"] = ("не удалось снять оверрайд: "
+                                      + str(res.get("error") or "нет ответа CLI"))
+                    continue
+                stripped.append({"domain": dom, "item": item})
+            # один перезапуск на всю пачку снятых оверрайдов
+            if stripped and socks:
+                restarted, why_restart = _restart_vpn(cli)
+                if restarted:
+                    time.sleep(ROUTE_SETTLE)
+                else:
+                    for job in stripped:
+                        job["item"]["detail"] += "; VPN не перезапустился: " + why_restart
+            restored: list[str] = []
+            for job in stripped:
+                dom = job["domain"]
+                item = job["item"]
+                probe = probe_for(dom)
+                direct_ok, res, direct_detail = _probe_once(probe)
+                item.update({"code": res["code"], "secs": res["secs"]})
+                if direct_ok:
+                    item.update({"path": "direct", "after": True, "action": "direct",
+                                 "detail": "direct снова работает (" + direct_detail
+                                           + ") — оверрайд снят"})
+                    actions.append({"domain": dom, "from": "proxy", "to": "direct",
+                                    "reason": "direct отвечает", "ok": True})
+                    continue
+                proxy_ok, proxy_detail = False, "нет SOCKS в xray.json"
+                if socks:
+                    proxy_ok, _, proxy_detail = _probe_once(probe, socks=socks)
+                restore = _route_switch(cli, dom, "proxy", "аудит: direct всё ещё не отвечает")
+                if restore.get("ok"):
+                    restored.append(dom)
+                item.update({"path": "proxy", "after": proxy_ok, "action": "restore",
+                             "detail": ("direct: " + direct_detail + "; vpn: " + proxy_detail
+                                        + ("; оверрайд возвращён" if restore.get("ok")
+                                           else "; оверрайд вернуть не удалось: "
+                                              + str(restore.get("error") or "нет ответа CLI")))})
+                actions.append({"domain": dom, "from": "direct", "to": "proxy",
+                                "reason": "direct всё ещё не отвечает",
+                                "ok": bool(restore.get("ok")) and proxy_ok})
+            if restored and socks:
+                _restart_vpn(cli)  # вернуть правила в силу
             ok = all(p["after"] for p in probes)
             result = {
                 "ok": ok,
                 "checked": time.time(),
-                "verdict": "fixed" if actions else ("ok" if ok else "bad"),
+                "verdict": "fixed" if any(a.get("ok") for a in actions)
+                           else ("ok" if ok else "bad"),
                 "summary": _audit_summary(probes, actions),
                 "count": len(probes),
-                "fixed": len(actions),
+                "fixed": len([a for a in actions if a.get("ok")]),
                 "probes": probes,
                 "actions": actions,
                 "secs": round(time.time() - started, 1),
@@ -1094,7 +1337,7 @@ def run_route_recheck(force: bool = False) -> dict:
                   "probes": [], "actions": [], "error": str(exc),
                   "secs": round(time.time() - started, 1)}
     finally:
-        _drop_lock(ROUTE_AUDIT_LOCK)
+        audit_unlock(fd)
     if app:
         write_json_cache(app, "route-audit-recheck.json", result)
     return result

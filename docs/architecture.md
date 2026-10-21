@@ -93,6 +93,8 @@ DNS: сервер `1.1.1.1` через прокси (`remote`), финальны
 | `~/.local/state/omavpn/singbox.json` | omavpn | генерируется при `on/restart` |
 | `~/.local/state/omavpn/xray.json` | omavpn | конфиг из подписки + правки |
 | `~/.config/omavpn/route_overrides.json` | omavpn / аудит | ручные оверрайды маршрутов (сильнее `direct_domains.txt`) |
+| `~/.local/state/omavpn/ctrl.lock` | omavpn | `flock` на управление VPN: `on`, `off`, `restart`, `route set/unset` |
+| `~/.cache/bypass-status/route-audit.lock` | bypass-status | `flock` аудита и перепроверки маршрутов |
 | `~/.cache/<cli>/route-audit.json` | bypass-status | результат последнего аудита маршрутов |
 | `/opt/zapret/config` | zapret/автотюн | `NFQWS_OPT`, `IFACE_WAN`, `MODE_FILTER` |
 | `/etc/network/…` (nft rules) | zapret | таблица `inet zapret` |

@@ -26,6 +26,13 @@ rm -f "$HOME_DIR/.config/systemd/user/omavpn-route-audit.service" \
       "$HOME_DIR/.config/systemd/user/omavpn-route-recheck.timer"
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 
+# Оверрайды маршрутов и кэш аудита — состояние машины, а не данные пользователя.
+# Оставленные после удаления, они тихо ломают маршруты после переустановки:
+# домен «навсегда» уходит в туннель по правилу, которое ставил аудит под другую
+# сеть. Поэтому чистим в любом режиме, не только в --purge.
+rm -f "$HOME_DIR/.config/omavpn/route_overrides.json"
+rm -f "$HOME_DIR"/.cache/omavpn/route-audit*.json 2>/dev/null || true
+
 rm -rf "$HOME_DIR/.config/omarchy/plugins/io.github.blazeeers.omavpn"
 command -v omarchy-shell >/dev/null && omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
 

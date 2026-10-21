@@ -147,6 +147,11 @@ ExecStart=%h/.local/bin/omavpn-guard
 TimeoutStartSec=3600
 SuccessExitStatus=1
 Nice=10
+# KillMode=process обязателен: аудит/guard перезапускают VPN, а xray и sing-box
+# живут в cgroup юнита (omavpn запускает их через setsid, но из cgroup не выводит).
+# Без этого systemd по завершении oneshot-юнита убивает их вместе с собой, и VPN
+# ложится после каждого исправленного маршрута, а guard — после каждой проверки.
+KillMode=process
 EOF
 
   cat > "$HOME_DIR/.config/systemd/user/omavpn-guard.timer" <<'EOF'
@@ -205,6 +210,11 @@ Type=oneshot
 ExecStart=$LOCAL_BIN/bypass-status --route-audit
 Nice=10
 TimeoutStartSec=600
+# KillMode=process обязателен: аудит/guard перезапускают VPN, а xray и sing-box
+# живут в cgroup юнита (omavpn запускает их через setsid, но из cgroup не выводит).
+# Без этого systemd по завершении oneshot-юнита убивает их вместе с собой, и VPN
+# ложится после каждого исправленного маршрута, а guard — после каждой проверки.
+KillMode=process
 EOF
 
     cat > "$HOME_DIR/.config/systemd/user/omavpn-route-audit.timer" <<'EOF'
@@ -232,6 +242,11 @@ Type=oneshot
 ExecStart=$LOCAL_BIN/bypass-status --route-audit-recheck
 Nice=10
 TimeoutStartSec=900
+# KillMode=process обязателен: аудит/guard перезапускают VPN, а xray и sing-box
+# живут в cgroup юнита (omavpn запускает их через setsid, но из cgroup не выводит).
+# Без этого systemd по завершении oneshot-юнита убивает их вместе с собой, и VPN
+# ложится после каждого исправленного маршрута, а guard — после каждой проверки.
+KillMode=process
 EOF
 
     cat > "$HOME_DIR/.config/systemd/user/omavpn-route-recheck.timer" <<'EOF'

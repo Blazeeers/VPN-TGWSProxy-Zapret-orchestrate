@@ -300,20 +300,32 @@ svc_youtube_ok() {
     [ "$code" = "200" ] || return 1
     body=$(curl -4 -s --max-time 8 https://www.youtube.com/ 2>/dev/null | head -c 150000)
     grep -qiE 'ytimg|youtube' <<<"$body" || return 1
+    # CDN превью — generate_204 на самом i.ytimg.com. Раньше здесь стоял жёсткий
+    # id видео (dQw4w9WgXcQ/hqdefault.jpg): если видео удалят, guard считал бы
+    # YouTube сломанным по кругу и лечил несуществующую поломку. generate_204
+    # от конкретного видео не зависит и проверяет то же самое: DNS + TLS + ответ CDN.
+    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 \
+        https://i.ytimg.com/generate_204 2>/dev/null)
+    { [ "$code" = "204" ] || [ "$code" = "200" ]; } || return 1
+    # ...и что картинки реально отдаются картинками (favicon — вечный image/*).
     img=$(curl -4 -s -o /dev/null -w '%{http_code} %{content_type} %{size_download}' \
-        --max-time 8 https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg 2>/dev/null)
+        --max-time 8 https://www.youtube.com/favicon.ico 2>/dev/null)
     code=${img%% *}
     rest=${img#* }
     ctype=${rest%% *}
     size=${rest##* }
-    [ "$code" = "200" ] && [ "${size:-0}" -gt 2000 ] 2>/dev/null && [[ "${ctype:-}" == image/* ]] || return 1
+    [ "$code" = "200" ] && [ "${size:-0}" -gt 500 ] 2>/dev/null && [[ "${ctype:-}" == image/* ]] || return 1
     code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 \
         https://redirector.googlevideo.com/generate_204 2>/dev/null)
     { [ "$code" = "204" ] || [ "$code" = "200" ]; } || return 1
     # Служебный API YouTube (youtubei.googleapis.com) блокируют наглухо: страница
     # и картинки открываются, а плеер висит по 10 с на каждом запросе. Успех —
     # любой HTTP-ответ (TLS-соединение и ответ состоялись): 405/400 норма,
-    # 000 — таймаут/обрыв. Домен всегда идёт через VPN (ALWAYS_PROXY_DOMAINS).
+    # 000 — таймаут/обрыв. Домен всегда идёт через VPN (ALWAYS_PROXY_DOMAINS),
+    # поэтому проверять его напрямую бессмысленно: при выключенном VPN и в
+    # режиме «proxy» (без TUN) он недоступен по определению — и guard каждые
+    # 10 минут «лечил» бы несуществующую поломку (rescan zapret + включение VPN).
+    tun_up || return 0
     code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 10 \
         https://youtubei.googleapis.com/youtubei/v1/player 2>/dev/null)
     [ -n "$code" ] && [ "$code" != "000" ]

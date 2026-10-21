@@ -1231,7 +1231,7 @@ Panel {
             foreground: root.foreground
             fontFamily: root.fontFamily
             fontSize: Style.font.bodySmall
-            enabled: root.busy === ""
+            enabled: root.cliPath !== "" && root.busy === ""
             onClicked: {
               if (root.busy !== "" || auditProc.running) return
               root.busy = "audit"
