@@ -651,7 +651,7 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
             "tag": "tun-in",
             "interface_name": TUN_IFACE,
             "address": [TUN_ADDR],
-            "mtu": 9000,
+            "mtu": 1500,
             "stack": "gvisor",
             "auto_route": True,
             "strict_route": bool(strict),
@@ -801,6 +801,9 @@ def cmd_off(quiet: bool = False) -> dict:
     stop_proc(XRAY_PID, "xray")
     st = load_json(RUNTIME, {})
     st["running"] = False
+    # выключение пользователем — намеренное действие: ошибки прошлого запуска
+    # к нему отношения не имеют (иначе сторож решит, что VPN упал сам)
+    st["last_error"] = ""
     save_json(RUNTIME, st)
     if not quiet:
         print("Отключено")

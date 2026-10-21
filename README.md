@@ -30,10 +30,12 @@
   - [3. tg-ws-proxy](#3-tg-ws-proxy)
 - [Подписки: форматы и совместимость](#подписки-форматы-и-совместимость)
 - [Поведение по сетям](#поведение-по-сетям)
+  - [Надзиратель (omavpn-guard)](#надзиратель-omavpn-guard)
 - [Использование](#использование)
 - [Файлы и пути](#файлы-и-пути)
 - [Документация](#документация)
 - [Зависимости и привилегии](#зависимости-и-привилегии)
+  - [Пароль при включении VPN](#пароль-при-включении-vpn)
 - [Публикация в Omarchy Marketplace](#публикация-в-omarchy-marketplace)
 - [Благодарности](#благодарности)
 - [Безопасность](#безопасность)
@@ -73,6 +75,11 @@
 **Bot API Telegram намеренно остаётся в VPN**: прямой доступ к `api.telegram.org`
 у провайдера режется, а `tg-ws-proxy` умеет только MTProto, не Bot API.
 
+Сверху за всем этим следит `omavpn-guard`: раз в 10 минут проверяет, что
+YouTube, Discord и Telegram действительно открываются, и лечит, если нет —
+поднимает VPN, чинит профиль, перезапускает прокси, перебирает ноды или просит
+автотюн перепроверить стратегии. VPN при этом не выключается никогда.
+
 ---
 
 ## Компоненты
@@ -82,6 +89,7 @@
 | `omavpn` (CLI) | управление VPN | `~/.local/bin/omavpn` |
 | `shell-plugin/omavpn` | виджет управления VPN в панели Omarchy | `~/.config/omarchy/plugins/io.github.blazeeers.omavpn` |
 | `bin/bypass-status` | агрегатор статуса всех обходов (JSON) | `~/.local/bin/bypass-status` |
+| `bin/omavpn-guard` | надзиратель: следит, что YouTube/Discord/Telegram работают, и лечит | `~/.local/bin/omavpn-guard` |
 | `shell-plugin/bypass-status` | виджет «Обходы» — статусы всего | `~/.config/omarchy/plugins/io.github.blazeeers.bypass-status` |
 | `zapret/*` | DPI-обход и автотюн | `/usr/local/bin`, `/opt/zapret`, `/etc`, `/var/lib` |
 | `tgwsproxy/install.sh` | установка tg-ws-proxy | `~/.local/bin/tg-ws-proxy` |
@@ -98,8 +106,18 @@ cd omavpn
 ```
 
 Скрипт скачает Xray и sing-box в `~/.local/share/omavpn/bin`, выдаст
-`cap_net_admin,cap_net_raw` на `sing-box` (нужен `sudo` один раз), поставит CLI и
-виджет панели.
+`cap_net_admin,cap_net_raw` на `sing-box` (нужен `sudo` один раз), поставит CLI,
+виджет панели и **надзиратель `omavpn-guard`** с его таймерами.
+
+**Чтобы VPN включался без запроса пароля**, поставь правило polkit (один раз):
+
+```bash
+sudo install -m 0644 docs/polkit/49-omavpn-resolved.rules /etc/polkit-1/rules.d/
+sudo systemctl restart polkit
+```
+
+Перед установкой замени `USER_NAME` в файле на своё имя пользователя. Подробнее —
+[Пароль при включении VPN](#пароль-при-включении-vpn).
 
 **Задай URL подписки** (в коде его нет):
 
@@ -201,6 +219,27 @@ omavpn nodes        # узлы выбранного профиля
 (`OnBootSec=3min`), периодически (`OnUnitActiveSec=15min`). Применяется только
 изменившееся — VPN и zapret не «мигают».
 
+### Надзиратель (omavpn-guard)
+
+Автотюн выбирает путь, но не следит за результатом. Это делает `omavpn-guard`:
+каждые 10 минут проверяет, что YouTube (страница + превью + медиа-CDN), Discord
+(шлюз + сайт) и Telegram (юнит `tg-ws-proxy` + API) действительно открываются.
+
+Если что-то не работает, лечение идёт от мягкого к жёсткому: перезапуск
+`tg-ws-proxy` → `omavpn heal` → перепрос стратегий zapret → перебор нод → и лишь
+в крайнем случае сломанный сервис уходит в VPN.
+
+Что важно понимать:
+
+- **VPN не выключается** — он нужен для остальных заблокированных сайтов.
+  Меняется только путь YouTube/Discord/Telegram: пока обход справляется, они
+  идут мимо VPN.
+- Ручная смена пути — не чаще раза в 15 минут и не больше трёх раз в час: если
+  автотюн и сторож начнут тянуть файл в разные стороны, сторож отступает.
+- После трёх неудач подряд — пауза по нарастающей (до часа) и уведомление.
+
+Подробности — [docs/guard.md](docs/guard.md).
+
 ---
 
 ## Использование
@@ -209,7 +248,7 @@ omavpn nodes        # узлы выбранного профиля
 
 ```bash
 omavpn on | off | toggle | restart
-omavpn status --json
+omavpn --json status
 omavpn profiles | nodes
 omavpn profile 5 | node 0
 omavpn mode tun|proxy
@@ -234,7 +273,7 @@ omavpn mode proxy
 
 # понять, что реально работает
 omavpn check            # сравнит внешний IP напрямую и через прокси
-omavpn status --json | python3 -m json.tool | head -30
+omavpn --json status | python3 -m json.tool | head -30
 ```
 
 Автоподключение при входе — тумблер «Подключаться при входе» в настройках
@@ -436,6 +475,11 @@ sudo bash zapret/zapret-blockcheck.sh standard
 | `shell-plugin/omavpn/Panel.qml` | QML-виджет панели |
 | `~/.config/omarchy/plugins/io.github.blazeeers.omavpn/` | установленный плагин VPN |
 | `~/.local/bin/bypass-status` | агрегатор статусов обходов (JSON) |
+| `~/.local/bin/omavpn-guard` | надзиратель за обходами |
+| `~/.local/state/omavpn-guard/` | его журнал, намерение, история переключений (0700) |
+| `~/.config/systemd/user/omavpn-guard.*` | юнит и таймер надзирателя |
+| `~/.config/systemd/user/omavpn-autostart.service` | поднятие VPN при входе |
+| `~/.local/state/omavpn-guard/intent` | включён ли VPN по решению пользователя |
 | `shell-plugin/bypass-status/` | QML виджета «Обходы» |
 | `~/.config/omarchy/plugins/io.github.blazeeers.bypass-status/` | установленный виджет «Обходы» |
 
@@ -444,6 +488,7 @@ sudo bash zapret/zapret-blockcheck.sh standard
 ## Документация
 
 - [docs/architecture.md](docs/architecture.md) — как устроена маршрутизация и связка сервисов.
+- [docs/guard.md](docs/guard.md) — надзиратель за обходами: что проверяет и как лечит.
 - [docs/zapret.md](docs/zapret.md) — DPI-обход: конфиг, стратегии, автотюн, blockcheck.
 - [docs/telegram.md](docs/telegram.md) — Telegram Desktop, tg-ws-proxy и бот.
 - [docs/troubleshooting.md](docs/troubleshooting.md) — что делать, если что-то отвалилось.
@@ -472,10 +517,36 @@ sudo bash zapret/zapret-blockcheck.sh standard
 | `zapret.service` | root (systemd) | nfqws от пользователя `zapret` (`--user`) |
 | `zapret-autotune.timer` + NM dispatcher | root (systemd) | автоподбор стратегии по сети |
 | CLI `omavpn`, виджет, tg-ws-proxy | обычный пользователь | — |
+| `omavpn-guard` и его таймеры | обычный пользователь (`systemd --user`) | надзор за обходами |
+| правило polkit для `resolve1` | **root, разово** | VPN без запроса пароля |
+
+### Пароль при включении VPN
+
+`sing-box` при поднятии TUN (`auto_route`) перенастраивает DNS через
+systemd-resolved — это действие D-Bus `org.freedesktop.resolve1`, и polkit по
+умолчанию спрашивает на него пароль: по запросу на каждое `omavpn on/off`,
+включая перезапуски из таймера.
+
+Правило `docs/polkit/49-omavpn-resolved.rules` разрешает шесть нужных действий
+своему пользователю в локальной активной сессии. Отключение DNSSEC и публикация
+mDNS-записей по-прежнему требуют пароля.
+
+```bash
+# замени USER_NAME в файле на свой логин
+sudo install -m 0644 docs/polkit/49-omavpn-resolved.rules /etc/polkit-1/rules.d/
+sudo systemctl restart polkit
+```
+
+Без правила всё работает, но при каждом включении и выключении VPN будет
+появляться запрос пароля.
 
 Сетевые обращения: загрузка подписки по HTTPS, Xray/sing-box к серверам
 провайдера, tg-ws-proxy к Telegram. Секретов в репозитории нет. Внешних сборок
 кроме скачивания готовых бинарей нет; симлинков в каталоге плагина нет.
+
+Утилиты, которые нужны в системе (проверяются `install.sh`): `curl`, `python3`,
+`tar`, `sha256sum`, `jq`, `ip`, `flock`, `getcap`; опционально `notify-send`
+(уведомления надзирателя) и `nmcli` (определение сети).
 
 ---
 

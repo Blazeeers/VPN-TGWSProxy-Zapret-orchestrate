@@ -8,7 +8,7 @@
 
 ```bash
 systemctl is-active zapret.service zapret-autotune.timer
-omavpn status --json | python3 -m json.tool | head
+omavpn --json status | python3 -m json.tool | head
 zapret-autotune show
 curl -s -o /dev/null -w 'youtube %{http_code}\n' https://www.youtube.com/
 curl -s -o /dev/null -w 'discord %{http_code}\n' https://discord.com/
@@ -34,12 +34,12 @@ tail -20 /var/log/zapret-autotune.log
 1. **Режим сети.** `zapret-autotune show`. Если `vpn` — Discord/YouTube должны
    идти через туннель. Проверь `~/.config/omavpn/direct_domains.txt` (в режиме
    `vpn` там только `max.ru`).
-2. **VPN реально работает.** `omavpn status --json`, `omavpn check`. Если узел
+2. **VPN реально работает.** `omavpn --json status`, `omavpn check`. Если узел
    мёртв — `omavpn nodes`, выбери живой `omavpn profile N` / `omavpn node M`.
 3. **Зависший/битый кэш.** `sudo zapret-autotune rescan`.
-4. **Фантомная сеть.** Если в логе `net-unknown-` — это лечится с версии с
-   guard’ом по WAN (запуск пропускается). Убедись, что установлена актуальная
-   версия: `sudo bash zapret/zapret-autotune-install.sh`.
+4. **Фантомная сеть.** Если в логе `net-unknown-` — обнови автотюн
+   (`sudo bash zapret/zapret-autotune-install.sh`): в актуальной версии запуск
+   на неопределённой сети пропускается.
 
 ---
 
@@ -83,7 +83,7 @@ grep -m1 NFQWS_OPT /opt/zapret/config
 ## VPN не поднимается / медленный
 
 ```bash
-omavpn status --json | python3 -m json.tool
+omavpn --json status | python3 -m json.tool
 omavpn check        # сравнить IP напрямую и через прокси
 tail -40 ~/.local/state/omavpn/xray.log
 tail -40 ~/.local/state/omavpn/singbox.log

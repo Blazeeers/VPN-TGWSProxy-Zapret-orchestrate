@@ -1,0 +1,33 @@
+// Разрешить локальному пользователю менять DNS через systemd-resolved
+// без пароля. Причина: sing-box при включении и выключении TUN (auto_route)
+// перенастраивает DNS через D-Bus org.freedesktop.resolve1, и polkit каждый
+// раз показывал запрос пароля — по одному на каждое omavpn on/off.
+//
+// Установка (один раз, нужен пароль):
+//   sudo install -m 0644 49-omavpn-resolved.rules /etc/polkit-1/rules.d/
+//   sudo systemctl restart polkit
+//
+// Набор действий ограничен тем, что реально вызывает sing-box. Намеренно НЕ
+// разрешены set-dnssec (отключение проверки DNSSEC), register-service и
+// unregister-service (публикация mDNS-записей в локальной сети) — на них
+// пароль остаётся.
+//
+// Замени USER_NAME на своё имя пользователя, если оно другое.
+polkit.addRule(function (action, subject) {
+    var USER_NAME = "USER_NAME";
+    if (subject.user !== USER_NAME || !subject.local || !subject.active) {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var allowed = [
+        "org.freedesktop.resolve1.set-dns-servers",
+        "org.freedesktop.resolve1.set-domains",
+        "org.freedesktop.resolve1.set-default-route",
+        "org.freedesktop.resolve1.set-llmnr",
+        "org.freedesktop.resolve1.set-mdns",
+        "org.freedesktop.resolve1.revert"
+    ];
+    if (allowed.indexOf(action.id) >= 0) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

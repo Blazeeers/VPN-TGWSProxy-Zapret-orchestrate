@@ -4,6 +4,54 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [2.1.0] — 2026-10-21
+
+### Added
+- **`omavpn-guard` — надзиратель за обходами.** Фоновый сторож (`systemd --user`,
+  проверка каждые 10 минут и через 2 минуты после загрузки) следит, чтобы
+  YouTube, Discord и Telegram **работали**, а не просто «были настроены».
+  - YouTube проверяется по-настоящему: страница с содержимым, превью картинкой
+    (`image/*`, >2 КБ) и доступность медиа-CDN `googlevideo`;
+  - Discord — шлюз `/api/v9/gateway` и сайт;
+  - Telegram — живой юнит `tg-ws-proxy`, `api.telegram.org` и `web.telegram.org`.
+- Лечение по цепочке, от мягкого к жёсткому: перезапуск `tg-ws-proxy` →
+  `omavpn heal` → просьба к `zapret-autotune` перепроверить стратегии
+  (`rescan.request`, ожидание по `.lastscan`) → перебор нод → и только в крайнем
+  случае сломанный сервис уходит в VPN.
+- Защита от «мигания»: кулдаун 15 минут на ручную смену пути, не больше трёх
+  переключений в час, экспоненциальный бэкофф (до часа) после серии неудач,
+  сброс счётчика при смене сети. Если `zapret-autotune` только что переписал
+  `direct_domains.txt`, сторож в него не лезет.
+- Юниты `omavpn-guard.service` / `omavpn-guard.timer` / `omavpn-autostart.service`
+  (последний поднимает VPN при входе, если он был включён).
+- Уведомления `notify-send` о том, что не чинится само (не чаще раза в час).
+- `docs/guard.md` — как устроен надзиратель и когда он вмешивается.
+
+### Fixed
+- **YouTube рвался примерно на каждом пятом соединении**: TUN поднимался с
+  `mtu 9000` при стеке `gvisor`. Теперь 1500 — на замерах 40/40 запросов вместо
+  30/40.
+- **Стек `mixed` полностью ломал VPN** (0 из 25 соединений) — зафиксирован
+  `gvisor`.
+- **Пароль при каждом `omavpn on/off`.** Причина: sing-box при `auto_route`
+  перенастраивает DNS через D-Bus `org.freedesktop.resolve1`, и polkit каждый раз
+  просил пароль. Добавлен шаблон правила
+  `docs/polkit/49-omavpn-resolved.rules` (шесть действий, только свой
+  пользователь, только локальная сессия).
+- `omavpn off` теперь очищает `last_error`: раньше намеренное выключение
+  выглядело как падение, и сторож поднимал VPN обратно.
+- Ключ сети в `omavpn-guard` строится так же, как в `zapret-autotune`
+  (интерфейс + SSID + MAC шлюза), поэтому решение автотюна читается и на
+  проводном подключении.
+- `omavpn status --json` в документации не работал — правильно
+  `omavpn --json status`.
+
+### Changed
+- `omavpn-guard` **не выключает VPN**: он нужен для остальных заблокированных
+  сайтов. Меняется только путь YouTube/Discord/Telegram — мимо VPN, пока обход
+  справляется; в VPN они уходят лишь при отказе обхода.
+- Каталог состояния сторожа — `0700` (там имена сетей и узлов).
+
 ## [2.0.0] — 2026-10-19
 
 ### Added
@@ -273,6 +321,8 @@
   `docs/troubleshooting.md`; атрибуция сторонних проектов в `THIRD_PARTY.md`.
 - Манифест Omarchy Marketplace (`manifest.json` в корне) и лицензия MIT.
 
+[2.1.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.7.0...v2.0.0
 [1.7.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/compare/v1.5.2...v1.6.0

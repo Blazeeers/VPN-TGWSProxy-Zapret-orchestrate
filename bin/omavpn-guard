@@ -1,0 +1,753 @@
+#!/usr/bin/env bash
+# omavpn-guard — надзиратель за обходами.
+#
+# Что должно работать само:
+#   * YouTube, Discord — через обход (zapret), а не через VPN; в VPN только если
+#     обход в этой сети не справляется;
+#   * Telegram — через локальный tg-ws-proxy; в VPN только если прокси не тянет
+#     (и для Bot API, который напрямую из РФ не работает);
+#   * всё остальное (заблокированные сайты) — через VPN, он включён постоянно.
+#
+# Разделение ролей:
+#   * zapret-autotune (root, таймер) — арбитр пути для YouTube/Discord: подбирает
+#     стратегию, держит direct_domains.txt и решает по каждой сети, работает ли
+#     обход. Решение — /var/lib/zapret-autotune/wifi-<ключ>.strategy (число = zapret,
+#     "vpn" = нужен VPN).
+#   * omavpn-guard (этот скрипт) — надзор: проверяет сервисы, поднимает упавший
+#     VPN, чинит профиль sing-box, перезапускает tg-ws-proxy, перебирает ноды,
+#     просит autotune перепровериться, и лишь в крайнем случае сам трогает путь.
+#
+# Режимы:
+#   omavpn-guard              проверка и лечение (таймер)
+#   omavpn-guard --autostart  поднять VPN при входе, если был включён
+#   omavpn-guard --status     короткий JSON для отладки (без блокировки)
+
+set -uo pipefail
+
+HOME_DIR="${HOME:?}"
+OMAVPN="$HOME_DIR/.local/bin/omavpn"
+STATE_DIR="$HOME_DIR/.local/state/omavpn-guard"
+LOG="$STATE_DIR/guard.log"
+LOCK="$STATE_DIR/guard.lock"
+INTENT_FILE="$STATE_DIR/intent"
+STREAK_FILE="$STATE_DIR/fail_streak"
+NEXT_TRY_FILE="$STATE_DIR/next_try"
+LAST_SWITCH="$STATE_DIR/last_switch"
+SWITCH_HISTORY="$STATE_DIR/switch_history"
+LAST_NET_FILE="$STATE_DIR/last_net"
+VPN_STATE="$HOME_DIR/.local/state/omavpn/state.json"
+SINGBOX_CFG="$HOME_DIR/.local/state/omavpn/singbox.json"
+DIRECT_FILE="$HOME_DIR/.config/omavpn/direct_domains.txt"
+SB_BIN="$HOME_DIR/.local/share/omavpn/bin/sing-box"
+AUTOTUNE_DIR="/var/lib/zapret-autotune"
+RESCAN_REQUEST="$HOME_DIR/.cache/zapret-autotune/rescan.request"
+TG_UNIT='app-tg\x2dws\x2dproxy@autostart.service'
+
+COOLDOWN=900        # ручное вмешательство в путь не чаще раза в 15 минут
+MAX_BACKOFF=3600    # потолок паузы после серии неудач
+TUN_WAIT=25         # сколько ждать интерфейс после запуска
+RESCAN_WAIT=600     # сколько ждать, пока autotune переберёт стратегии
+MAX_NODES=5         # сколько нод перебрать за один прогон
+
+YT_DOMAINS="youtube.com
+youtu.be
+ytimg.com
+ggpht.com
+googlevideo.com
+youtube-nocookie.com
+youtubekids.com
+youtubegaming.com
+youtubeeducation.com
+youtubemusic.com
+ytstatic.com
+youtube.googleapis.com
+youtubei.googleapis.com"
+
+DISCORD_DOMAINS="discord.com
+discord.gg
+discordapp.com
+discordapp.net
+discord.co
+discord.dev
+discord.new
+discord.media
+discordmerch.com
+discordstatus.com
+discord-activities.com
+discordactivities.com
+discordpartygames.com
+discordapp.io
+discordcdn.com"
+
+mkdir -p -m 700 "$STATE_DIR" 2>/dev/null || { echo "omavpn-guard: нет каталога состояния" >&2; exit 1; }
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+umask 077
+
+log() {
+    printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null || return 0
+    local n
+    n=$(wc -l <"$LOG" 2>/dev/null || echo 0)
+    if [ "${n:-0}" -gt 800 ]; then
+        tail -n 400 "$LOG" >"$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG" 2>/dev/null
+    fi
+}
+
+# Уведомление пользователю. Одинаковый текст — не чаще раза в час.
+notify() {
+    local msg="$1" last_file="$STATE_DIR/last_notify" last_msg last_ts
+    last_msg=$(head -1 "$last_file" 2>/dev/null)
+    last_ts=$(sed -n '2p' "$last_file" 2>/dev/null || echo 0)
+    if [ "$msg" = "$last_msg" ] && [ $(( $(now) - ${last_ts:-0} )) -lt 3600 ]; then
+        return 0
+    fi
+    printf '%s\n%s\n' "$msg" "$(now)" >"$last_file" 2>/dev/null
+    command -v notify-send >/dev/null 2>&1 || return 0
+    notify-send -a "Обходы" -u normal "Обходы" "$msg" >/dev/null 2>&1
+}
+
+now() { date +%s; }
+
+# --- состояние -------------------------------------------------------------
+
+tun_up() { ip link show omavpn0 >/dev/null 2>&1; }
+
+wait_tun() {
+    local i
+    for i in $(seq 1 "$TUN_WAIT"); do
+        tun_up && return 0
+        sleep 1
+    done
+    return 1
+}
+
+runtime_field() {
+    [ -f "$VPN_STATE" ] || { echo ""; return; }
+    jq -r ".$1 // empty" "$VPN_STATE" 2>/dev/null
+}
+
+# intent: включён ли VPN по воле пользователя.
+# omavpn пишет running=false и при ошибке запуска, и в переходные моменты,
+# поэтому живой TUN = «включён», а непустой last_error = «упало, не выключали».
+intent_read() {
+    local running err prev
+    if [ ! -f "$VPN_STATE" ]; then
+        cat "$INTENT_FILE" 2>/dev/null || echo on
+        return
+    fi
+    running=$(runtime_field running)
+    err=$(runtime_field last_error)
+    prev=$(cat "$INTENT_FILE" 2>/dev/null || echo "on")
+
+    if [ "$running" = "true" ] || tun_up; then
+        echo on
+        return
+    fi
+    if [ -n "$err" ]; then
+        echo "$prev"
+        return
+    fi
+    echo off
+}
+
+intent_update() {
+    local want
+    want=$(intent_read)
+    printf '%s\n' "$want" >"$INTENT_FILE" 2>/dev/null
+    echo "$want"
+}
+
+caps_ok() {
+    [ -x "$SB_BIN" ] || return 1
+    # без getcap (нет libcap) не можем судить — не блокируем работу
+    command -v getcap >/dev/null 2>&1 || return 0
+    local caps
+    caps=$(getcap "$SB_BIN" 2>/dev/null)
+    [[ "$caps" == *cap_net_admin* ]]
+}
+
+# Установлен ли tg-ws-proxy вообще. Если компонента нет, Telegram не считаем
+# сломанным (иначе guard будет зря включать VPN и слать тревоги).
+tg_installed() {
+    command -v tg-ws-proxy >/dev/null 2>&1 && return 0
+    systemctl --user cat "$TG_UNIT" >/dev/null 2>&1
+}
+
+# Есть ли домены сервиса в direct-списке (= идут мимо VPN).
+service_in_direct() {
+    local list="$1" dom
+    [ -f "$SINGBOX_CFG" ] || return 1
+    while IFS= read -r dom; do
+        [ -n "$dom" ] || continue
+        if python3 - "$SINGBOX_CFG" "$dom" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    dom = sys.argv[2]
+    for rule in d.get("route", {}).get("rules", []):
+        if rule.get("outbound") != "direct":
+            continue
+        doms = rule.get("domain_suffix") or rule.get("domain") or []
+        if dom in doms:
+            sys.exit(0)
+    sys.exit(1)
+except Exception:
+    sys.exit(2)
+PY
+        then
+            return 0
+        fi
+    done <<<"$list"
+    return 1
+}
+
+path_now() {
+    if service_in_direct "$YT_DOMAINS"; then echo "direct"; return; fi
+    [ -f "$SINGBOX_CFG" ] && echo "vpn" || echo unknown
+}
+
+# --- сеть и autotune -------------------------------------------------------
+
+current_ssid() {
+    nmcli -t -f active,ssid dev wifi 2>/dev/null | sed -n 's/^yes://p' | head -1 | sed 's/\\:/:/g'
+}
+
+# Логика ключа сети повторяет netkey() из zapret-autotune один в один,
+# иначе на кабеле и на нестандартных сетях решение autotune не читается.
+wan_iface() {
+    ip -o route show default 2>/dev/null | awk '{
+        d="";
+        for (i=1;i<=NF;i++) if ($i=="dev") d=$(i+1);
+        if (d!="" && d!="omavpn0" && d!="tailscale0" && d !~ /^tun/) { print d; exit }
+    }'
+}
+
+net_key() {
+    local iface ssid gw mac key
+    iface=$(wan_iface)
+    [ -n "$iface" ] || iface="unknown"
+    ssid=""
+    case "$iface" in
+        wl*|wlan*|wlp*) ssid=$(iwgetid -r "$iface" 2>/dev/null || true) ;;
+    esac
+    [ -n "$ssid" ] || ssid=$(nmcli -t -f GENERAL.CONNECTION device show "$iface" 2>/dev/null | cut -d: -f2-)
+    if [ -n "$ssid" ] && [ "$iface" != "unknown" ]; then
+        key="wifi-$ssid"
+    else
+        gw=$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')
+        mac=$(ip neigh show "$gw" 2>/dev/null | awk '/lladdr/{print $5; exit}')
+        key="net-$iface-${mac:-$gw}"
+    fi
+    printf '%s' "$key" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+autotune_mode() {
+    local key f v
+    key=$(net_key)
+    [ -n "$key" ] || { echo unknown; return; }
+    f="$AUTOTUNE_DIR/$key.strategy"
+    if [ -r "$f" ]; then
+        v=$(head -c 32 "$f" 2>/dev/null | tr -d '[:space:]')
+        [ -n "$v" ] && { echo "$v"; return; }
+    fi
+    echo unknown
+}
+
+autotune_lastscan() {
+    local key f
+    key=$(net_key)
+    [ -n "$key" ] || { echo 0; return; }
+    f="$AUTOTUNE_DIR/$key.lastscan"
+    cat "$f" 2>/dev/null | tr -d '[:space:]' || echo 0
+}
+
+zapret_active() { systemctl is-active --quiet zapret.service 2>/dev/null; }
+
+request_rescan() {
+    mkdir -p "$(dirname "$RESCAN_REQUEST")" 2>/dev/null
+    rm -f "$RESCAN_REQUEST" 2>/dev/null
+    printf '%s\n' "$(now)" >"$RESCAN_REQUEST" 2>/dev/null || return 1
+    log "запросил перебор стратегий zapret"
+    return 0
+}
+
+wait_rescan_result() {
+    local before deadline retried=0
+    before=$(autotune_lastscan)
+    deadline=$(( $(now) + RESCAN_WAIT ))
+    while [ "$(now)" -lt "$deadline" ]; do
+        sleep 20
+        if [ "$(autotune_lastscan)" != "$before" ] && [ "$(autotune_lastscan)" != "0" ]; then
+            log "autotune закончил перебор (режим $(autotune_mode))"
+            sleep 3
+            health_ok_quiet && return 0
+            return 1
+        fi
+        if [ "$retried" = "0" ] && [ "$(now)" -gt $(( deadline - RESCAN_WAIT + 90 )) ]; then
+            retried=1
+            log "перебор не начался — повторяю запрос"
+            request_rescan >/dev/null 2>&1
+        fi
+    done
+    log "перебор не завершился за $((RESCAN_WAIT / 60)) мин"
+    return 1
+}
+
+# --- проверки сервисов -----------------------------------------------------
+
+svc_youtube_ok() {
+    local code ctype size body img rest
+    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 https://www.youtube.com/ 2>/dev/null)
+    [ "$code" = "200" ] || return 1
+    body=$(curl -4 -s --max-time 8 https://www.youtube.com/ 2>/dev/null | head -c 150000)
+    grep -qiE 'ytimg|youtube' <<<"$body" || return 1
+    img=$(curl -4 -s -o /dev/null -w '%{http_code} %{content_type} %{size_download}' \
+        --max-time 8 https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg 2>/dev/null)
+    code=${img%% *}
+    rest=${img#* }
+    ctype=${rest%% *}
+    size=${rest##* }
+    [ "$code" = "200" ] && [ "${size:-0}" -gt 2000 ] 2>/dev/null && [[ "${ctype:-}" == image/* ]] || return 1
+    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 \
+        https://redirector.googlevideo.com/generate_204 2>/dev/null)
+    [ "$code" = "204" ] || [ "$code" = "200" ]
+}
+
+svc_discord_ok() {
+    local code
+    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 \
+        https://discord.com/api/v9/gateway 2>/dev/null)
+    [ "$code" = "200" ] || return 1
+    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 https://discord.com/ 2>/dev/null)
+    [ "$code" = "200" ]
+}
+
+svc_telegram_ok() {
+    local code
+    systemctl --user is-active --quiet "$TG_UNIT" 2>/dev/null || return 1
+    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 https://api.telegram.org/ 2>/dev/null)
+    [ "$code" = "200" ] || [ "$code" = "302" ] || return 1
+    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 https://web.telegram.org/ 2>/dev/null)
+    [ "$code" = "200" ]
+}
+
+# Список сломанных сервисов через пробел.
+broken_services_quiet() {
+    local broken=""
+    svc_youtube_ok || broken="$broken youtube"
+    svc_discord_ok || broken="$broken discord"
+    if tg_installed; then
+        svc_telegram_ok || broken="$broken telegram"
+    fi
+    echo "${broken# }"
+}
+
+health_ok_quiet() { [ -z "$(broken_services_quiet)" ]; }
+
+# --- профиль omavpn --------------------------------------------------------
+# Миграция установок до 2.1.0: в старых версиях TUN поднимался с mtu 9000 и
+# стеком mixed, из-за чего рвалось ~20% TLS-соединений к YouTube, а mixed
+# ломал туннель целиком. Здесь правим установленный CLI один раз.
+# Когда 2.1.0 разойдётся, блок можно удалить (2.2.0).
+
+ensure_profile() {
+    local cnt changed=0
+    cnt=$(grep -c '"mtu": 9000' "$OMAVPN" 2>/dev/null); cnt=${cnt:-0}
+    if [ "${cnt:-0}" -eq 1 ]; then
+        cp -p "$OMAVPN" "$OMAVPN.bak-guard" 2>/dev/null
+        sed -i 's/"mtu": 9000/"mtu": 1500/' "$OMAVPN" && changed=1
+    fi
+    cnt=$(grep -c '"stack": "mixed"' "$OMAVPN" 2>/dev/null); cnt=${cnt:-0}
+    if [ "${cnt:-0}" -eq 1 ]; then
+        cp -p "$OMAVPN" "$OMAVPN.bak-guard" 2>/dev/null
+        sed -i 's/"stack": "mixed"/"stack": "gvisor"/' "$OMAVPN" && changed=1
+    fi
+    if [ "$changed" = "1" ]; then
+        if python3 -B -m py_compile "$OMAVPN" 2>/dev/null; then
+            log "профиль omavpn поправлен (mtu 1500 / stack gvisor)"
+        else
+            log "ОШИБКА: правка профиля сломала синтаксис — откатываю"
+            [ -f "$OMAVPN.bak-guard" ] && cp -p "$OMAVPN.bak-guard" "$OMAVPN"
+            return 1
+        fi
+        return 0
+    fi
+    return 2
+}
+
+# --- VPN -------------------------------------------------------------------
+
+vpn_up() {
+    tun_up && return 0
+    timeout 90 "$OMAVPN" on >/dev/null 2>&1
+    wait_tun
+}
+
+vpn_restart() {
+    timeout 90 "$OMAVPN" restart >/dev/null 2>&1
+    wait_tun || vpn_up
+}
+
+vpn_consistent() {
+    tun_up || return 0
+    pgrep -x xray >/dev/null 2>&1
+}
+
+try_nodes() {
+    local orig node_count node tries=0
+    orig=$(timeout 20 "$OMAVPN" --json status 2>/dev/null | jq -r '.node_index // -1' 2>/dev/null)
+    node_count=$(timeout 20 "$OMAVPN" --json status 2>/dev/null | jq -r '.nodes | length' 2>/dev/null)
+    [ -n "$orig" ] || orig=-1
+    [ -n "$node_count" ] || node_count=0
+    [ "$node_count" -gt 0 ] || return 1
+
+    for node in $(seq 0 $(( node_count - 1 ))); do
+        [ "$node" = "$orig" ] && continue
+        tries=$((tries + 1))
+        [ "$tries" -gt "$MAX_NODES" ] && break
+        log "пробую ноду $node"
+        timeout 90 "$OMAVPN" node "$node" >/dev/null 2>&1
+        wait_tun || vpn_up
+        if health_ok_quiet; then
+            log "помогла нода $node"
+            return 0
+        fi
+    done
+
+    if [ "${orig:--1}" != "-1" ] && [ "${orig:-0}" -ge 0 ] 2>/dev/null; then
+        timeout 90 "$OMAVPN" node "$orig" >/dev/null 2>&1
+        wait_tun || vpn_up
+        log "вернул прежнюю ноду $orig"
+    fi
+    return 1
+}
+
+# --- крайняя мера: ручная смена пути ---------------------------------------
+
+switches_last_hour() {
+    local cutoff cnt ts
+    cutoff=$(( $(now) - 3600 ))
+    cnt=0
+    [ -f "$SWITCH_HISTORY" ] || { echo 0; return; }
+    while read -r ts; do
+        [ -n "$ts" ] || continue
+        [ "$ts" -ge "$cutoff" ] 2>/dev/null && cnt=$((cnt + 1))
+    done <"$SWITCH_HISTORY"
+    echo "$cnt"
+}
+
+note_switch() {
+    date +%s >>"$SWITCH_HISTORY" 2>/dev/null
+    tail -n 20 "$SWITCH_HISTORY" >"$SWITCH_HISTORY.tmp" 2>/dev/null && mv "$SWITCH_HISTORY.tmp" "$SWITCH_HISTORY" 2>/dev/null
+}
+
+can_switch() {
+    [ -f "$LAST_SWITCH" ] || return 0
+    local last
+    last=$(cat "$LAST_SWITCH" 2>/dev/null)
+    last=${last:-0}
+    case "$last" in *[!0-9]*|"") last=0 ;; esac
+    [ $(( $(now) - last )) -ge "$COOLDOWN" ]
+}
+
+direct_file_settled() {
+    [ -f "$DIRECT_FILE" ] || return 0
+    local age
+    age=$(( $(now) - $(stat -c %Y "$DIRECT_FILE" 2>/dev/null || echo 0) ))
+    [ "$age" -ge 60 ]
+}
+
+# set_path <vpn|direct> <список доменов>
+set_path() {
+    local want="$1" list="$2" tmp dom changed=0 rc
+    if [ ! -f "$DIRECT_FILE" ]; then
+        # не создаём файл с нуля: иначе вместе со сломанным сервисом
+        # в VPN уедет второй, который пока работает
+        log "direct_domains.txt отсутствует — ручную смену пути не делаю"
+        return 1
+    fi
+    tmp=$(mktemp "$DIRECT_FILE.XXXXXX" 2>/dev/null) || return 1
+    cp -p "$DIRECT_FILE" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+
+    while IFS= read -r dom; do
+        [ -n "$dom" ] || continue
+        if [ "$want" = "vpn" ]; then
+            if grep -qxF "$dom" "$tmp"; then
+                grep -vxF "$dom" "$tmp" >"$tmp.n" 2>/dev/null
+                rc=$?
+                if [ "$rc" -le 1 ]; then
+                    mv -f "$tmp.n" "$tmp" 2>/dev/null && [ "$rc" -eq 0 ] && changed=1
+                else
+                    log "ОШИБКА: не смог переписать direct_domains (код $rc)"
+                    rm -f "$tmp" "$tmp.n"
+                    return 1
+                fi
+            fi
+        else
+            if ! grep -qxF "$dom" "$tmp"; then
+                printf '%s\n' "$dom" >>"$tmp" && changed=1
+            fi
+        fi
+    done <<<"$list"
+
+    if [ "$changed" = "0" ]; then
+        rm -f "$tmp"
+        return 2
+    fi
+    cp -p "$DIRECT_FILE" "$DIRECT_FILE.bak-guard" 2>/dev/null
+    mv "$tmp" "$DIRECT_FILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    date +%s >"$LAST_SWITCH"
+    log "путь «$want» применён (ручная мера)"
+    vpn_restart
+    return 0
+}
+
+# --- лечение ---------------------------------------------------------------
+
+restart_tg() {
+    log "перезапускаю tg-ws-proxy"
+    systemctl --user restart "$TG_UNIT" >/dev/null 2>&1
+    sleep 5
+    svc_telegram_ok
+}
+
+heal() {
+    local mode broken svc fixed=0
+
+    mode=$(autotune_mode)
+    log "лечение: путь $(path_now), autotune=$mode, zapret=$(zapret_active && echo on || echo off)"
+
+    if ! tun_up; then
+        if vpn_up; then log "туннель поднят"; else log "туннель не поднимается"; return 1; fi
+    fi
+
+    broken=$(broken_services_quiet)
+    [ -n "$broken" ] || { log "всё уже работает"; return 0; }
+
+    # Telegram — своя логика: локальный прокси, VPN только как последнее средство
+    if [[ " $broken " == *" telegram "* ]]; then
+        if restart_tg; then
+            broken=$(broken_services_quiet)
+            log "помог перезапуск tg-ws-proxy${broken:+, осталось: $broken}"
+            [ -z "$broken" ] && return 0
+        else
+            log "tg-ws-proxy не ожил — проверю через VPN"
+            vpn_up
+        fi
+    fi
+
+    # Общие меры для YouTube/Discord
+    if [[ " $broken " == *" youtube "* || " $broken " == *" discord "* ]]; then
+        timeout 240 "$OMAVPN" --json heal >/dev/null 2>&1
+        wait_tun
+        if health_ok_quiet; then log "помогло: omavpn heal"; return 0; fi
+
+        if [ "$mode" = "vpn" ]; then
+            log "autotune считает, что нужен VPN — перебираю ноды"
+            try_nodes && return 0
+        else
+            log "autotune в режиме стратегии $mode — прошу перебор"
+            if request_rescan; then
+                wait_rescan_result && { log "помог перебор стратегий"; return 0; }
+            fi
+            log "перебор не помог — пробую VPN"
+            if vpn_up && try_nodes; then return 0; fi
+        fi
+
+        # Крайняя мера: направить сломанный сервис через VPN.
+        if [ "$(switches_last_hour)" -ge 3 ]; then
+            log "путь переключался 3+ раза за час — не воюю с autotune"
+        elif ! can_switch; then
+            log "ручная смена пути на кулдауне"
+        elif ! direct_file_settled; then
+            log "autotune только что писал direct_domains — не вмешиваюсь"
+        else
+            for svc in $broken; do
+                case "$svc" in
+                    youtube)
+                        if service_in_direct "$YT_DOMAINS"; then
+                            set_path vpn "$YT_DOMAINS" && note_switch && fixed=1
+                            log "YouTube переведён на VPN"
+                        fi
+                        ;;
+                    discord)
+                        if service_in_direct "$DISCORD_DOMAINS"; then
+                            set_path vpn "$DISCORD_DOMAINS" && note_switch && fixed=1
+                            log "Discord переведён на VPN"
+                        fi
+                        ;;
+                esac
+            done
+            if [ "$fixed" = "1" ]; then
+                vpn_restart
+                health_ok_quiet && return 0
+            fi
+        fi
+    fi
+
+    log "лечение не помогло: $(broken_services_quiet)"
+    return 1
+}
+
+# --- бэкофф ----------------------------------------------------------------
+
+streak() {
+    local s
+    s=$(cat "$STREAK_FILE" 2>/dev/null || echo 0)
+    case "$s" in *[!0-9]*|"") echo 0 ;; *) echo "$s" ;; esac
+}
+
+in_backoff() {
+    [ -f "$NEXT_TRY_FILE" ] || return 1
+    local next_try
+    next_try=$(cat "$NEXT_TRY_FILE" 2>/dev/null || echo 0)
+    [ "$(now)" -lt "${next_try:-0}" ]
+}
+
+mark_fail() {
+    local s delay
+    s=$(( $(streak) + 1 ))
+    [ "$s" -gt 10 ] && s=10
+    printf '%s\n' "$s" >"$STREAK_FILE"
+    if [ "$s" -ge 3 ]; then
+        delay=$(( 900 * (1 << (s - 3)) ))
+        [ "$delay" -gt "$MAX_BACKOFF" ] && delay=$MAX_BACKOFF
+        printf '%s\n' "$(( $(now) + delay ))" >"$NEXT_TRY_FILE"
+        log "неудач подряд: $s — пауза $((delay / 60)) мин"
+        [ "$s" -eq 3 ] && notify "Обходы не работают: $(broken_services_quiet). Автолечение не помогло."
+    fi
+}
+
+mark_ok() {
+    printf '0\n' >"$STREAK_FILE"
+    rm -f "$NEXT_TRY_FILE"
+}
+
+reset_on_net_change() {
+    local key prev
+    key=$(net_key)
+    prev=$(cat "$LAST_NET_FILE" 2>/dev/null || echo "")
+    if [ "$key" != "$prev" ]; then
+        printf '%s\n' "$key" >"$LAST_NET_FILE" 2>/dev/null
+        if [ -n "$prev" ]; then
+            rm -f "$NEXT_TRY_FILE" 2>/dev/null
+            printf '0\n' >"$STREAK_FILE" 2>/dev/null
+            log "сеть сменилась ($prev → $key) — счётчик неудач сброшен"
+        fi
+    fi
+}
+
+# --- режимы ----------------------------------------------------------------
+
+cmd_autostart() {
+    local want
+    want=$(intent_read)
+    if [ "$want" = "on" ] && ! tun_up; then
+        log "автозапуск: VPN был включён — поднимаю"
+        vpn_up || { log "автозапуск: поднять VPN не удалось"; notify "VPN не поднялся при входе"; }
+    fi
+    caps_ok || { log "ВНИМАНИЕ: у sing-box нет cap_net_admin"; notify "У sing-box нет cap_net_admin: VPN не поднимется без пароля"; }
+}
+
+cmd_status() {
+    printf '{"tun_up":%s,"intent":"%s","path":"%s","autotune":"%s","zapret":%s,"caps_ok":%s,"streak":%s,"broken":"%s"}\n' \
+        "$(tun_up && echo true || echo false)" \
+        "$(intent_read)" \
+        "$(path_now)" \
+        "$(autotune_mode)" \
+        "$(zapret_active && echo true || echo false)" \
+        "$(caps_ok && echo true || echo false)" \
+        "$(streak)" \
+        "$(broken_services_quiet)"
+}
+
+cmd_check() {
+    local want broken
+
+    reset_on_net_change
+    want=$(intent_update)
+
+    if ! caps_ok; then
+        log "нет cap_net_admin у sing-box — нужен sudo setcap, лечить нечем"
+        notify "VPN не может подняться: у sing-box нет cap_net_admin"
+        return 1
+    fi
+
+    if in_backoff && ! { [ "$want" = "on" ] && ! tun_up; }; then
+        log "пауза после неудач — пропускаю до $(date -d "@$(cat "$NEXT_TRY_FILE")" '+%F %T' 2>/dev/null)"
+        return 0
+    fi
+
+    if [ "$want" = "on" ]; then
+        if ensure_profile; then vpn_restart; fi
+        if ! vpn_consistent; then
+            log "туннель есть, но xray мёртв — перезапускаю VPN"
+            vpn_restart
+        fi
+        if ! tun_up; then
+            log "туннеля нет, хотя VPN должен быть включён — поднимаю"
+            vpn_up || log "туннель не поднялся"
+        fi
+    fi
+
+    broken=$(broken_services_quiet)
+    if [ -z "$broken" ]; then
+        mark_ok
+        log "всё в порядке (путь $(path_now), autotune $(autotune_mode))"
+        return 0
+    fi
+
+    if [ "$want" = "off" ] && ! tun_up; then
+        # VPN выключен пользователем: сначала чиним каждый сервис по его природе,
+        # VPN — только если обход действительно не тянет.
+        log "VPN выключен, не работают:$broken — чиню без VPN"
+        if [[ " $broken " == *" telegram "* ]] && restart_tg; then
+            broken=$(broken_services_quiet)
+            [ -z "$broken" ] && { mark_ok; log "Telegram поднялся перезапуском прокси"; return 0; }
+        fi
+        if [[ " $broken " == *" youtube "* || " $broken " == *" discord "* ]]; then
+            if request_rescan && wait_rescan_result; then
+                mark_ok
+                log "обход починился без VPN"
+                return 0
+            fi
+        fi
+        log "обход не тянет — поднимаю VPN"
+        if vpn_up && health_ok_quiet; then
+            mark_ok
+            notify "Обход в этой сети не справляется, включил VPN"
+            return 0
+        fi
+        mark_fail
+        return 1
+    fi
+
+    if heal; then
+        mark_ok
+        return 0
+    fi
+
+    mark_fail
+    return 1
+}
+
+# --- точка входа -----------------------------------------------------------
+
+if [ "${1:-}" = "--status" ]; then
+    cmd_status
+    exit 0
+fi
+
+exec 9>"$LOCK"
+if [ "${1:-}" = "--autostart" ]; then
+    flock -w 120 9 || { log "автозапуск: не дождался блокировки"; exit 0; }
+else
+    if ! flock -n 9; then
+        log "пропуск: идёт другой прогон"
+        exit 0
+    fi
+fi
+
+case "${1:-}" in
+    --autostart) cmd_autostart ;;
+    *)           cmd_check ;;
+esac

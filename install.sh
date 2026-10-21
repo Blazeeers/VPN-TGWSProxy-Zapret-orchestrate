@@ -38,7 +38,7 @@ verify_sha256() { # $1 — файл, $2 — ожидаемый sha256, $3 — и
   say "sha256 $3 — ок"
 }
 
-for tool in curl python3 tar sha256sum; do
+for tool in curl python3 tar sha256sum jq ip flock getcap; do
   command -v "$tool" >/dev/null || { echo "Нужен '$tool' в PATH"; exit 1; }
 done
 
@@ -126,6 +126,63 @@ fi
 # --- CLI виджета «Обходы» --------------------------------------------------
 if [ -f "$HERE/bin/bypass-status" ]; then
   install -m 0755 "$HERE/bin/bypass-status" "$LOCAL_BIN/bypass-status"
+fi
+
+# --- Надзиратель за обходами (omavpn-guard) --------------------------------
+# Проверяет YouTube/Discord/Telegram и лечит: поднимает VPN, чинит профиль,
+# перезапускает tg-ws-proxy, перебирает ноды, просит zapret-autotune
+# перепроверить стратегии. VPN никогда не выключает.
+if [ -f "$HERE/bin/omavpn-guard" ]; then
+  say "Ставлю надзиратель omavpn-guard и его таймеры…"
+  install -m 0755 "$HERE/bin/omavpn-guard" "$LOCAL_BIN/omavpn-guard"
+  mkdir -p "$HOME_DIR/.config/systemd/user"
+
+  cat > "$HOME_DIR/.config/systemd/user/omavpn-guard.service" <<EOF
+[Unit]
+Description=Проверка и самовосстановление VPN/YouTube/Discord/Telegram (omavpn-guard)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omavpn-guard
+TimeoutStartSec=3600
+SuccessExitStatus=1
+Nice=10
+EOF
+
+  cat > "$HOME_DIR/.config/systemd/user/omavpn-guard.timer" <<'EOF'
+[Unit]
+Description=Периодическая проверка обходов
+
+[Timer]
+OnBootSec=120s
+OnUnitInactiveSec=10min
+AccuracySec=30s
+Unit=omavpn-guard.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  cat > "$HOME_DIR/.config/systemd/user/omavpn-autostart.service" <<'EOF'
+[Unit]
+Description=Поднять VPN при входе, если он был включён (omavpn)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omavpn-guard --autostart
+RemainAfterExit=yes
+TimeoutStartSec=180
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  systemctl --user enable --now omavpn-guard.timer >/dev/null 2>&1 || \
+    warn "Не удалось включить omavpn-guard.timer — включи вручную: systemctl --user enable --now omavpn-guard.timer"
+  systemctl --user enable omavpn-autostart.service >/dev/null 2>&1 || true
 fi
 
 # --- Ежедневная проверка обновлений ----------------------------------------
