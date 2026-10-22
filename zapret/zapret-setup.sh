@@ -4,7 +4,8 @@
 #     sudo bash ~/.local/share/omavpn/zapret-setup.sh
 #
 # Что делает:
-#   1. задаёт IFACE_WAN (физический интерфейс), включает nfqws, MODE_FILTER=none;
+#   1. определяет WAN-интерфейс (или берёт WAN_IFACE), задаёт IFACE_WAN,
+#      включает nfqws, MODE_FILTER=none;
 #   2. пишет IP серверов omavpn в nozapret-исключение (чтобы не ломать туннель);
 #   3. включает и перезапускает zapret.service.
 set -euo pipefail
@@ -18,7 +19,23 @@ USER_NAME="${SUDO_USER:-$USER}"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 CFG=/opt/zapret/config
 EXCL=/opt/zapret/ipset/zapret-ip-exclude.txt
-WAN="${WAN_IFACE:-wlp2s0}"
+
+# WAN определяется сам (раньше здесь было жёстко wlp2s0 — на кабеле и на другой
+# машине zapret вставал не на тот интерфейс и не ловил трафик). VPN-интерфейсы
+# (omavpn0, tailscale0, tun*) пропускаем: WAN — это физический выход в сеть.
+wan_iface() {
+  ip -o route show default 2>/dev/null | awk '{
+    d="";
+    for (i=1;i<=NF;i++) if ($i=="dev") d=$(i+1);
+    if (d!="" && d!="omavpn0" && d!="tailscale0" && d !~ /^tun/) { print d; exit }
+  }'
+}
+WAN="${WAN_IFACE:-$(wan_iface)}"
+[ -n "$WAN" ] || {
+  echo "Не удалось определить WAN-интерфейс (нет маршрута по умолчанию?)."
+  echo "Запусти с явным указанием: sudo WAN_IFACE=wlp2s0 bash $0"
+  exit 1
+}
 
 [ -f "$CFG" ] || { echo "Нет $CFG — zapret не установлен?"; exit 1; }
 

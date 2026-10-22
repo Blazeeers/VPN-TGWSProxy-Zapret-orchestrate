@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.blazeeers.bypass-status",
+  "id": "io.github.blazeeers.omavpn",
   "name": "Bypass Status",
-  "version": "2.1.0",
+  "version": "2.3.0",
   "author": "blazeeers",
   "license": "MIT",
-  "description": "Bar widget for all bypasses at once: VPN with region+server autotune, zapret DPI, tg-ws-proxy, plus a 5-minute health monitor (YouTube, Discord, DeepSeek, Telegram).",
+  "description": "Bar widget for all bypasses at once: VPN with region+server autotune, zapret DPI, tg-ws-proxy, route audit (a blocked domain moves to a working route itself) and a 5-minute health monitor (YouTube, Discord, DeepSeek, Telegram).",
   "kinds": [
     "bar-widget"
   ],
@@ -14,11 +14,20 @@
   },
   "barWidget": {
     "displayName": "Обходы",
-    "description": "Статус VPN, zapret и tg-ws-proxy: подбор лучшего региона и сервера, проверка работоспособности каждые 5 минут",
+    "description": "Статус VPN, zapret и tg-ws-proxy: подбор лучшего региона и сервера, аудит маршрутов доменов, проверка работоспособности каждые 5 минут",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
-    "defaults": {},
-    "schema": []
+    "defaults": {
+      "autoconnect": false
+    },
+    "schema": [
+      {
+        "key": "autoconnect",
+        "type": "boolean",
+        "label": "Подключаться при входе",
+        "defaultValue": false
+      }
+    ]
   }
 }
