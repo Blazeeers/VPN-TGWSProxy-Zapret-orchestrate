@@ -49,7 +49,8 @@ RETRY_SECONDS="${RETRY_SECONDS:-1800}"
 # Глубокая проверка YouTube: страница + реальная скорость видео с googlevideo
 # (иначе «страница открывается, а видео не грузится»). yt-dlp — опционально.
 YTDLP_BIN="$(command -v yt-dlp 2>/dev/null || true)"
-YT_TEST_URL="https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+# Big Buck Bunny: dQw4w9WgXcQ отдаётся с троттлингом, проверка ложно падала
+YT_TEST_URL="https://www.youtube.com/watch?v=aqz-KE-bpKQ"
 YT_MIN_BYTES=131072   # минимум скачанных байт
 YT_MIN_KBPS=100       # минимальная скорость, КиБ/с
 YT_DL_SECONDS=10      # бюджет на загрузку куска видео

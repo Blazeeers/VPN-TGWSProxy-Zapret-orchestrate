@@ -4,6 +4,23 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [2.2.3] — 2026-10-22
+
+### Fixed
+- **Виджет пропадал из бара после установки.** `manifest.json` в репозитории указывал
+  `entryPoints.barWidget = "shell-plugin/bypass-status/Panel.qml"`, хотя установщик кладёт
+  файл в корень плагина. Теперь `Panel.qml` — и в репозитории, и в установке.
+- **Проверка видео YouTube врала** и уводила `zapret-autotune` в режим `vpn`.
+  `yt-dlp` с клиентом по умолчанию (`visionos`) отдаёт только аудио и сториборды →
+  «Requested format is not available» → «видео не качается» → обход признавался
+  нерабочим. Теперь используется `--extractor-args youtube:player_client=android`
+  (с откатом на дефолт).
+- **Тестовое видео** заменено с `dQw4w9WgXcQ` (отдаётся с троттлингом ~17 КБ/с, проверка
+  скорости ложно падала) на `aqz-KE-bpKQ` (Big Buck Bunny, Blender) — в `bypass-status`
+  и в `zapret-autotune`.
+- **Виджет краснел из-за zapret в режиме `vpn`.** Если autotune выбрал для сети режим VPN,
+  служба zapret выключена намеренно — теперь это `warn` с пояснением, а не `bad`.
+
 ## [2.2.2] — 2026-10-22
 
 Правки по ревью 2.2.1: обратное направление аудита рвало трафик каждые 10 минут,

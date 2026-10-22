@@ -34,7 +34,9 @@ TGWS_VERSION_FILE = os.path.join(HOME, ".local", "share", "tgwsproxy", "version"
 UPDATES_MAX_AGE = 7 * 24 * 3600
 YOUTUBE_CACHE_AGE = 30 * 60
 RESCAN_REQUEST = os.path.join(HOME, ".cache", "zapret-autotune", "rescan.request")
-YT_TEST_VIDEO = "dQw4w9WgXcQ"
+# Big Buck Bunny (Blender, официальный, стабилен). Прежний dQw4w9WgXcQ
+# отдаётся с троттлингом (17 КБ/с) — проверка скорости ложно падала.
+YT_TEST_VIDEO = "aqz-KE-bpKQ"
 # Файлы прогресса теста серверов (пишет omavpn probe) — читаем первый свежий.
 PROBE_APPS = ("omavpn", "wowvpn")
 PROBE_MAX_AGE = 12 * 3600
@@ -328,16 +330,27 @@ def youtube_video_check() -> dict:
     youtube работать «нормально» не считается.
     """
     if YTDLP:
+        # Клиент по умолчанию (visionos) с 22.10.2026 отдаёт только аудио и
+        # сториборды, и yt-dlp падает с «Requested format is not available» —
+        # проверка видео врала, а zapret-autotune из-за неё уходил в режим vpn.
+        # Рабочий клиент — android (проверено: ссылка с ip=<РФ IP>, качается 206).
         url = ""
-        try:
-            proc = subprocess.run(
-                [YTDLP, "-q", "--no-warnings", "-f", "worst", "-g",
-                 f"https://www.youtube.com/watch?v={YT_TEST_VIDEO}"],
-                capture_output=True, text=True, timeout=45)
-            lines = (proc.stdout or "").strip().splitlines()
-            url = lines[0] if lines else ""
-        except (OSError, subprocess.TimeoutExpired):
-            url = ""
+        attempts = (
+            ["--extractor-args", "youtube:player_client=android"],
+            [],
+        )
+        for extra in attempts:
+            try:
+                proc = subprocess.run(
+                    [YTDLP, "-q", "--no-warnings", *extra, "-f", "worst", "-g",
+                     f"https://www.youtube.com/watch?v={YT_TEST_VIDEO}"],
+                    capture_output=True, text=True, timeout=45)
+                lines = (proc.stdout or "").strip().splitlines()
+                url = lines[0] if lines else ""
+            except (OSError, subprocess.TimeoutExpired):
+                url = ""
+            if url:
+                break
         if not url:
             return {"ok": False, "error": "yt-dlp не вернул ссылку"}
         out = run(["curl", "-4", "-sL", "--max-time", "25", "-o", "/dev/null",
@@ -571,6 +584,11 @@ def health_items(app: str, cli: str) -> tuple[list, dict]:
     elif z.get("mode") == "off":
         items.append({"id": "zapret", "name": "zapret", "state": "ok",
                       "detail": "сеть чистая, обход не нужен"})
+    elif z.get("mode") == "vpn":
+        # autotune в этой сети выбрал режим VPN: zapret выключен намеренно.
+        # Это не поломка — иначе виджет краснел бы всегда, хотя всё работает.
+        items.append({"id": "zapret", "name": "zapret", "state": "warn",
+                      "detail": "в этой сети выбран режим VPN, обход не используется"})
     elif z.get("service") != "active":
         items.append({"id": "zapret", "name": "zapret", "state": "bad",
                       "detail": "служба zapret не работает"})
