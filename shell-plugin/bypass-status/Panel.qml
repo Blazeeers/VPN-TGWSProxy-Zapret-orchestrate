@@ -66,6 +66,31 @@ Panel {
   readonly property string verdict: root.hl.verdict || ""
   readonly property bool healthStale: root.hl.stale === true
 
+  // ---- аудит маршрутов (route-audit.json из bypass-status --route-audit) ----
+  readonly property var ra: (root.bs && root.bs.route_audit) ? root.bs.route_audit : ({})
+  readonly property var raProbes: (root.ra.probes instanceof Array) ? root.ra.probes : []
+  readonly property int raCount: Number(root.ra.count) || root.raProbes.length
+  // Только fixed: в actions теперь попадают и откаты (rollback), и длину
+  // actions нельзя выдавать за «исправлено» — виджет врал «исправлено: 1»
+  // после отката.
+  readonly property int raFixed: Number(root.ra.fixed) || 0
+  readonly property bool raHas: Number(root.ra.checked || 0) > 0
+  readonly property var raBroken: {
+    var bad = []
+    for (var i = 0; i < root.raProbes.length; i++)
+      if (!root.raProbes[i].after) bad.push(root.raProbes[i].domain)
+    return bad
+  }
+  readonly property string raText: {
+    if (!root.raHas) return ""
+    if (root.raFixed > 0)
+      return "маршруты: проверено " + root.raCount + ", исправлено " + root.raFixed
+    if (root.raBroken.length > 0) return "маршруты: не отвечают " + root.raBroken.join(", ")
+    return "маршруты в порядке"
+  }
+  readonly property color raColor: root.raFixed > 0 ? root.warn
+    : (root.raBroken.length > 0 ? root.urgent : root.okColor)
+
   function hItem(id) {
     var it = root.hl && root.hl.items ? root.hl.items : []
     for (var i = 0; i < it.length; i++) if (it[i].id === id) return it[i]
@@ -396,6 +421,27 @@ Panel {
     }
   }
 
+  // Аудит маршрутов: домен, который не отвечает по текущему пути, уходит на
+  // рабочий (omavpn route set ... proxy). Настройки VPN не трогает.
+  Process {
+    id: auditProc
+    command: [root.scriptPath, "--route-audit"]
+    stdout: StdioCollector { id: auditOut; waitForEnd: true }
+    onExited: function(code) {
+      root.busy = ""
+      var msg = "не удалось проверить маршруты"
+      try {
+        var d = JSON.parse(auditOut.text)
+        if (d && d.reason === "already_running") msg = "аудит маршрутов уже идёт"
+        else if (d && d.reason === "lock_error") msg = "уже идёт проверка — лок занят"
+        else if (d && d.summary) msg = d.summary
+      } catch (e) { /* ignore */ }
+      root.notice = msg
+      noticeTimer.restart()
+      if (!statusProc.running) statusProc.running = true
+    }
+  }
+
   Process {
     id: updProc
     command: [root.scriptPath, "--update-components"]
@@ -462,7 +508,7 @@ Panel {
     bar: root.bar
     active: true
     activeColor: root.healthColor
-    tooltipText: "Обходы: " + root.healthText
+    tooltipText: "Обходы: " + root.healthText + (root.raText !== "" ? " · " + root.raText : "")
     iconComponent: Component {
       Pictogram {
         name: root.healthIcon
@@ -1183,6 +1229,22 @@ Panel {
           }
 
           Button {
+            text: root.busy === "audit" ? "… маршруты" : "Проверить маршруты"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            // Аудит запускает scriptPath (bypass-status), а не cliPath (omavpn):
+            // проверять надо именно его, иначе кнопка мертва без CLI.
+            enabled: root.scriptPath !== "" && root.busy === ""
+            onClicked: {
+              if (root.busy !== "" || auditProc.running) return
+              root.busy = "audit"
+              auditProc.running = true
+            }
+          }
+
+          Button {
             text: root.busy === "update" ? "…" : "Обновить подписку"
             bordered: true
             foreground: root.foreground
@@ -1229,6 +1291,19 @@ Panel {
             elide: Text.ElideRight
             width: parent.width * 0.5
           }
+        }
+
+        Text {
+          width: parent.width
+          visible: root.raText !== ""
+          textFormat: Text.PlainText
+          text: root.raText
+            + (root.raHas ? (" · " + root.fmtAge(root.ra.age || 0)) : "")
+            + (root.ra.stale === true ? " · устарело" : "")
+          color: root.raColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
         }
       }
     }

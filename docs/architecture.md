@@ -33,17 +33,27 @@
 1. `sniff` — определять протокол/домен из пакета.
 2. `protocol: dns → hijack-dns` — DNS заворачивается в sing-box.
 3. `ip_is_private` → `direct` — LAN, loopback.
-4. `domain_suffix: direct_domains()` → `direct` — MAX, Яндекс, Discord, YouTube
-   (список `ALWAYS_DIRECT_DOMAINS` — MAX/Яндекс — применяется всегда и не
-   перетирается автотюном; Discord/YouTube берутся из `DEFAULT_DIRECT_DOMAINS`
-   либо `~/.config/omavpn/direct_domains.txt`).
-5. `process_name: tg-ws-proxy, TgWsProxy, Telegram, telegram-desktop` → `direct` —
+4. **`domain_suffix: proxy_domains()` → `proxy`** — домены, которым положено в
+   туннель: `ALWAYS_PROXY_DOMAINS` (`youtubei.googleapis.com`,
+   `youtube.googleapis.com` — напрямую блокируются наглухо) плюс оверрайды
+   `proxy` из `~/.config/omavpn/route_overrides.json`. Стоит **перед**
+   direct-правилом, поэтому автотюн не может вытолкнуть их из туннеля.
+5. `domain_suffix: direct_domains()` → `direct` — MAX, Яндекс, Discord, YouTube
+   (`ALWAYS_DIRECT_DOMAINS` — MAX/Яндекс — применяется всегда; Discord/YouTube
+   берутся из `DEFAULT_DIRECT_DOMAINS` либо `~/.config/omavpn/direct_domains.txt`;
+   оверрайды `direct` тоже попадают сюда).
+6. `process_name: tg-ws-proxy, TgWsProxy, Telegram, telegram-desktop` → `direct` —
    локальный MTProto-прокси и Telegram Desktop.
-6. `bypass` — адреса серверов подписки (`ip_cidr`/`domain`) → `direct`,
+7. `bypass` — адреса серверов подписки (`ip_cidr`/`domain`) → `direct`,
    чтобы туннель не зациклился.
-7. `port: 25,465,587` → `direct` — SMTP.
-8. `process_name: xray` → `direct` — соединения самого Xray.
-9. `ip_version: 6` → `block` — IPv6 выключен.
+8. `port: 25,465,587` → `direct` — SMTP.
+9. `process_name: xray` → `direct` — соединения самого Xray.
+10. `ip_version: 6` → `block` — IPv6 выключен.
+
+Полный приоритет источников: **overrides → `ALWAYS_PROXY_DOMAINS` →
+`direct_domains.txt` → `final = proxy`**. Оверрайды правятся командой
+`omavpn route set|unset` и автоматически — аудитом маршрутов
+([docs/route-audit.md](route-audit.md)).
 
 DNS: сервер `1.1.1.1` через прокси (`remote`), финальный резолвер — тоже remote.
 Это важно: провайдерский DNS для заблокированных доменов может отдавать
@@ -66,10 +76,15 @@ DNS: сервер `1.1.1.1` через прокси (`remote`), финальны
 `bin/omavpn` читает `~/.config/omavpn/direct_domains.txt`, если файл существует:
 
 - есть домены → используется этот список;
-- файла нет или пуст → используется встроенный `DEFAULT_DIRECT_DOMAINS`.
+- файла нет → используется встроенный `DEFAULT_DIRECT_DOMAINS`.
 
 Это позволяет `zapret-autotune` управлять тем, что выводится из туннеля:
 режим `vpn` пишет туда только `max.ru`, режим `off`/`custom`/пресет — полный список.
+
+Поверх этого работают оверрайды `~/.config/omavpn/route_overrides.json`
+(`omavpn route set|unset`): они сильнее `direct_domains.txt`, потому что этот
+файл автотюн перезаписывает сам, а оверрайд — решение о конкретном домене,
+принятое по реальной доступности. См. [route-audit.md](route-audit.md).
 
 ## Временные файлы и процессы
 
@@ -77,6 +92,11 @@ DNS: сервер `1.1.1.1` через прокси (`remote`), финальны
 |---|---|---|
 | `~/.local/state/omavpn/singbox.json` | omavpn | генерируется при `on/restart` |
 | `~/.local/state/omavpn/xray.json` | omavpn | конфиг из подписки + правки |
+| `~/.config/omavpn/route_overrides.json` | omavpn / аудит | ручные оверрайды маршрутов (сильнее `direct_domains.txt`) |
+| `~/.local/state/omavpn/ctrl.lock` | omavpn | `flock` на управление VPN: `on`, `off`, `restart`, `route set/unset` |
+| `~/.cache/bypass-status/route-audit.lock` | bypass-status | `flock` аудита и перепроверки маршрутов |
+| `~/.cache/<cli>/route-audit.json` | bypass-status | результат последнего аудита маршрутов |
+| `~/.cache/<cli>/route-audit-state.json` | bypass-status | гистерезис: когда и сколько раз переключали домен (`ts`, `fails`) |
 | `/opt/zapret/config` | zapret/автотюн | `NFQWS_OPT`, `IFACE_WAN`, `MODE_FILTER` |
 | `/etc/network/…` (nft rules) | zapret | таблица `inet zapret` |
 | `/var/lib/zapret-autotune/*.strategy` | автотюн | решение по каждой сети |
