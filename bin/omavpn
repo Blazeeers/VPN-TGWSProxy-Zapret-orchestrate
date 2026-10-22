@@ -1217,7 +1217,7 @@ def _cmd_off(quiet: bool = False) -> dict:
     # к нему отношения не имеют (иначе сторож решит, что VPN упал сам)
     st["last_error"] = ""
     save_json(RUNTIME, st)
-    if not quiet:
+    if not quiet and not JSON_OUT:
         print("Отключено")
     return {"ok": True, "running": False}
 
@@ -1290,7 +1290,7 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
         "started_at": time.time(),
         "last_error": "",
     })
-    if not quiet:
+    if not quiet and not JSON_OUT:
         name = profiles()[profile_index]["name"]
         print(f"Подключено · {name}" + (" · TUN" if mode == "tun" else " · SOCKS/HTTP"))
     return {"ok": True, "running": True}

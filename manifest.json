@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.blazeeers.omavpn",
   "name": "VPN-TGWSProxy-Zapret-orchestrate",
-  "version": "2.2.3",
+  "version": "2.2.4",
   "author": "blazeeers",
   "license": "MIT",
   "description": "Xray + sing-box (TUN) VPN with a single bar widget for all bypasses: per-region/per-server autotune, zapret DPI, tg-ws-proxy, route audit (a blocked domain moves to a working route itself) and a 5-minute health monitor (YouTube, Discord, DeepSeek, Telegram).",

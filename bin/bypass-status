@@ -73,16 +73,32 @@ ROUTE_STATE_MAX_DOUBLINGS = 3      # 6 ч → 12 → 24 → 48 ч, дальше 
 # переводить туда домен нельзя (это и был блокер 2.2.1). Остальные домены
 # (deepseek, telegram) от zapret не зависят — предохранитель к ним не применяем.
 BYPASS_DEPENDENT_DOMAINS = (
+    "discord.com",
+    "discord.gg",
+    "discordapp.com",
+    "discordapp.net",
+    "telegram.org",
+    "t.me",
+)
+
+# Домены, которым VPN заведомо хуже: видео YouTube качается напрямую в 10–25 МБ/с
+# и без zapret (проверено 22–23.10.2026: без обхода youtube.com 200, ytimg 204,
+# redirector.googlevideo 204), а через туннель googlevideo не отдаёт вовсе.
+# Поэтому аудит их в proxy не переводит никогда — только сообщает, что проба
+# не прошла. Обратное направление (proxy → direct) для них всегда разрешено:
+# залипший в туннеле видеодомен обязан вернуться на прямой путь.
+NEVER_PROXY_DOMAINS = (
     "youtube.com",
     "youtu.be",
     "ytimg.com",
     "ggpht.com",
     "googlevideo.com",
     "youtube-nocookie.com",
-    "discord.com",
-    "discord.gg",
-    "discordapp.com",
-    "discordapp.net",
+    "youtubekids.com",
+    "youtubegaming.com",
+    "youtubeeducation.com",
+    "youtubemusic.com",
+    "ytstatic.com",
 )
 
 # Пробы маршрутов: домен → URL, способ проверки, что считается успехом.
@@ -960,10 +976,26 @@ def probe_for(domain: str) -> dict:
 
 
 def cli_json_slow(cli: str, *args, timeout: float = 150) -> dict:
-    """Вызов CLI, который может перезапускать VPN (`route set/unset`)."""
+    """Вызов CLI, который может перезапускать VPN (`route set/unset`).
+
+    CLI может напечатать перед JSON человеческую строку («Подключено · …»),
+    поэтому берём последнюю строку, которая начинается с «{»: раньше
+    json.loads на всём выводе возвращал {} — и аудит считал любой рестарт
+    неудачным, то есть не мог применить ни одного исправления.
+    """
     raw = run([cli, "--json", *args], timeout=timeout)
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
     try:
-        return json.loads(raw)
+        return json.loads(text)
     except ValueError:
         return {}
 
@@ -1221,6 +1253,45 @@ def run_route_audit() -> dict:
         socks = _vpn_socks(app)
         overrides = read_route_overrides(app)
         state = read_route_state(app)
+
+        # --- фаза 0: залипшие видео-домены возвращаем на прямой путь ----------
+        # Видео YouTube через туннель не работает вовсе, значит оверрайд
+        # "proxy" для него — всегда ошибка (например, оставшаяся от версии,
+        # которая считала видео зависимым от обхода). Снимаем сразу, не
+        # дожидаясь суточной перепроверки, и перечитываем правила после одного
+        # рестарта — иначе пробы пойдут по устаревшему конфигу.
+        stuck = [dom for dom, ent in overrides.items()
+                 if in_list(dom, NEVER_PROXY_DOMAINS)
+                 and str((ent or {}).get("path") or "") == "proxy"
+                 and str((ent or {}).get("reason") or "").startswith(ROUTE_REASON_PREFIX)]
+        if stuck and cli and socks:
+            # Без живого туннеля перезапускать нельзя: `omavpn restart` — это
+            # off+on, он поднял бы VPN, который человек выключил.
+            freed = []
+            saved: dict = {}
+            for dom in stuck:
+                res = cli_json_slow(cli, "route", "unset", dom, "--no-restart")
+                if res.get("ok"):
+                    saved[dom] = overrides.get(dom) or {}
+                    overrides.pop(dom, None)
+                    freed.append(dom)
+            if freed:
+                restarted, why_restart = _restart_vpn(cli)
+                if restarted:
+                    time.sleep(ROUTE_SETTLE)
+                    ctx = route_context(app, cli)
+                    rules = ctx["rules"]
+                    for dom in freed:
+                        result["actions"].append({
+                            "domain": dom, "from": "proxy", "to": "direct",
+                            "reason": "видео ходит только напрямую", "ok": True})
+                else:
+                    # конфиг не применился — возвращаем как было (и причину, и ts)
+                    for dom in freed:
+                        prev = saved.get(dom) or {"path": "proxy",
+                                                 "reason": ROUTE_AUDIT_REASON}
+                        _route_restore(cli, dom, prev)
+                        overrides[dom] = prev
         probes: list[dict] = []
         actions: list[dict] = []
         forward: list[dict] = []   # прямому пути плохо → пробуем туннель
@@ -1251,6 +1322,10 @@ def run_route_audit() -> dict:
                 if in_list(dom, ctx["always_direct"]):
                     item["detail"] = (detail
                                       + "; помечен «только напрямую» — не переключаю")
+                elif in_list(dom, NEVER_PROXY_DOMAINS):
+                    # видео YouTube: через туннель оно не работает вовсе
+                    item["detail"] = (detail + "; видео ходит только напрямую — "
+                                      "в VPN не переключаю")
                 elif not socks:
                     item["detail"] = (detail + "; путь VPN проверить нечем "
                                       "(VPN выключен или в xray.json нет SOCKS)")
@@ -1388,17 +1463,21 @@ def run_route_audit() -> dict:
                     _restart_vpn(cli)  # откат тоже надо применить
 
         ok = all(p["after"] for p in probes)
-        fixed = any(a.get("ok") for a in actions)
+        # действия фазы 0 (снятые залипшие видео-оверрайды) не теряем:
+        # result пересоздаётся ниже, а они уже лежат в старом result["actions"]
+        pre_actions = [a for a in (result.get("actions") or []) if a.get("ok")]
+        all_actions = pre_actions + actions
+        fixed = any(a.get("ok") for a in all_actions)
         result = {
             "ok": ok,
             "checked": time.time(),
             "verdict": "fixed" if fixed else ("ok" if ok else "bad"),
-            "summary": _audit_summary(probes, actions),
+            "summary": _audit_summary(probes, all_actions),
             "count": len(probes),
-            "fixed": len([a for a in actions if a.get("ok")]),
+            "fixed": len([a for a in all_actions if a.get("ok")]),
             "socks_port": socks,
             "probes": probes,
-            "actions": actions,
+            "actions": all_actions,
             "secs": round(time.time() - started, 1),
         }
     except Exception as exc:  # noqa: BLE001
@@ -1536,6 +1615,17 @@ def run_route_recheck(force: bool = False) -> dict:
                     proxy_ok, proxy_detail = False, "нет SOCKS в xray.json"
                     if socks:
                         proxy_ok, _, proxy_detail = _probe_once(probe, socks=socks)
+                    if in_list(dom, NEVER_PROXY_DOMAINS):
+                        # видео YouTube в туннель не возвращаем никогда: там оно
+                        # не работает (см. NEVER_PROXY_DOMAINS)
+                        item.update({"path": "direct", "after": False,
+                                     "action": "leave-direct",
+                                     "detail": "direct: " + direct_detail + "; vpn: "
+                                               + proxy_detail
+                                               + "; видео в туннель не возвращаю"})
+                        actions.append({"domain": dom, "from": "proxy", "to": "direct",
+                                        "reason": "видео ходит только напрямую", "ok": False})
+                        continue
                     restore = _route_switch(cli, dom, "proxy", "аудит: direct всё ещё не отвечает")
                     if restore.get("ok"):
                         restored.append(dom)
@@ -1549,17 +1639,20 @@ def run_route_recheck(force: bool = False) -> dict:
                                     "ok": bool(restore.get("ok")) and proxy_ok})
                 if restored and socks:
                     _restart_vpn(cli)  # вернуть правила в силу
+            # действия фазы 0 (снятые залипшие видео-оверрайды) сохраняем
+            pre_actions = [a for a in (result.get("actions") or []) if a.get("ok")]
+            all_actions = pre_actions + actions
             ok = all(p["after"] for p in probes)
             result = {
                 "ok": ok,
                 "checked": time.time(),
-                "verdict": "fixed" if any(a.get("ok") for a in actions)
+                "verdict": "fixed" if any(a.get("ok") for a in all_actions)
                            else ("ok" if ok else "bad"),
-                "summary": _audit_summary(probes, actions),
+                "summary": _audit_summary(probes, all_actions),
                 "count": len(probes),
-                "fixed": len([a for a in actions if a.get("ok")]),
+                "fixed": len([a for a in all_actions if a.get("ok")]),
                 "probes": probes,
-                "actions": actions,
+                "actions": all_actions,
                 "secs": round(time.time() - started, 1),
             }
     except Exception as exc:  # noqa: BLE001
