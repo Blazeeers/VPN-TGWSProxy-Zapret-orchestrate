@@ -209,7 +209,10 @@ After=network-online.target
 Type=oneshot
 ExecStart=$LOCAL_BIN/bypass-status --route-audit
 Nice=10
-TimeoutStartSec=600
+# 1200 с, а не 600: прогон двусторонний (7 проб × 2 попытки × 10 с) и может
+# сделать до трёх перезапусков VPN. С 600 с systemd убивал юнит между
+# переключением и откатом — домен оставался на непроверенном пути.
+TimeoutStartSec=1200
 # KillMode=process обязателен: аудит/guard перезапускают VPN, а xray и sing-box
 # живут в cgroup юнита (omavpn запускает их через setsid, но из cgroup не выводит).
 # Без этого systemd по завершении oneshot-юнита убивает их вместе с собой, и VPN
@@ -241,7 +244,9 @@ After=network-online.target
 Type=oneshot
 ExecStart=$LOCAL_BIN/bypass-status --route-audit-recheck
 Nice=10
-TimeoutStartSec=900
+# 1200 с: снятие пачки оверрайдов, перезапуск, проба каждого домена (2 попытки
+# по 10 с) и ещё один перезапуск на возврат. 900 с не хватало на 10+ доменов.
+TimeoutStartSec=1200
 # KillMode=process обязателен: аудит/guard перезапускают VPN, а xray и sing-box
 # живут в cgroup юнита (omavpn запускает их через setsid, но из cgroup не выводит).
 # Без этого systemd по завершении oneshot-юнита убивает их вместе с собой, и VPN

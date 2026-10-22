@@ -96,6 +96,7 @@ DNS: сервер `1.1.1.1` через прокси (`remote`), финальны
 | `~/.local/state/omavpn/ctrl.lock` | omavpn | `flock` на управление VPN: `on`, `off`, `restart`, `route set/unset` |
 | `~/.cache/bypass-status/route-audit.lock` | bypass-status | `flock` аудита и перепроверки маршрутов |
 | `~/.cache/<cli>/route-audit.json` | bypass-status | результат последнего аудита маршрутов |
+| `~/.cache/<cli>/route-audit-state.json` | bypass-status | гистерезис: когда и сколько раз переключали домен (`ts`, `fails`) |
 | `/opt/zapret/config` | zapret/автотюн | `NFQWS_OPT`, `IFACE_WAN`, `MODE_FILTER` |
 | `/etc/network/…` (nft rules) | zapret | таблица `inet zapret` |
 | `/var/lib/zapret-autotune/*.strategy` | автотюн | решение по каждой сети |

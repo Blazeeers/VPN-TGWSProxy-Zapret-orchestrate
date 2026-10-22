@@ -119,11 +119,40 @@ ALWAYS_PROXY_DOMAINS = [
     "youtube.googleapis.com",
 ]
 
-# Дополнительно выводим напрямую Discord/YouTube — блокировку снимает zapret.
+# Видео YouTube: встроенные direct-домены, которые НЕ зависят от
+# direct_domains.txt и стоят в direct-правиле ПЕРЕД ним.
+#
+# Почему отдельным списком, а не строкой в DEFAULT_DIRECT_DOMAINS: файл
+# перезаписывает zapret-autotune, и когда стратегия сети = `vpn` он выкидывает
+# видео из файла целиком — трафик уходит в туннель, где не работает (22.10.2026:
+# видео `code=000` при живой странице). Проверено руками в тот же день: при
+# **выключенном** zapret видео с googlevideo качается 12–20 МБ/с напрямую, то
+# есть обход видеотрафику не нужен вовсе. Блокирован только
+# `youtubei.googleapis.com` — он в ALWAYS_PROXY_DOMAINS.
+#
+# Это не «только напрямую» (ALWAYS_DIRECT): российский IP видео не требуется, и
+# увести его в туннель аудит по-прежнему имеет право. Переопределить список
+# может человек: `omavpn route set youtube.com proxy` попадает в правило proxy,
+# которое стоит перед direct.
+BUILTIN_DIRECT_DOMAINS = [
+    "youtube.com",
+    "youtu.be",
+    "ytimg.com",
+    "googlevideo.com",
+    "youtube-nocookie.com",
+    "youtubekids.com",
+    "youtubegaming.com",
+    "youtubeeducation.com",
+    "youtubemusic.com",
+    "ytstatic.com",
+]
+
+# Дополнительно выводим напрямую Discord — блокировку снимает zapret.
 # Список можно переопределить файлом ~/.config/omavpn/direct_domains.txt
 # (по одному домену на строку, '#' — комментарий). Этим пользуется
-# zapret-autotune: если обход в сети не работает, он убирает Discord/YouTube
-# из этого файла, и они идут через VPN. ALWAYS_DIRECT_DOMAINS при этом остаются.
+# zapret-autotune: если обход в сети не работает, он убирает Discord из этого
+# файла, и он идёт через VPN. ALWAYS_DIRECT_DOMAINS при этом остаются, а видео
+# YouTube держится отдельным встроенным списком (BUILTIN_DIRECT_DOMAINS).
 DEFAULT_DIRECT_DOMAINS = [
     *ALWAYS_DIRECT_DOMAINS,
     # Discord
@@ -142,19 +171,9 @@ DEFAULT_DIRECT_DOMAINS = [
     "discordpartygames.com",
     "discordapp.io",
     "discordcdn.com",
-    # YouTube
-    "youtube.com",
-    "youtu.be",
-    "ytimg.com",
-    "googlevideo.com",
-    "youtube-nocookie.com",
-    "youtubekids.com",
-    "youtubegaming.com",
-    "youtubeeducation.com",
-    "youtubemusic.com",
-    "ytstatic.com",
-    # youtube.googleapis.com и youtubei.googleapis.com сюда НЕ входят: они в
-    # ALWAYS_PROXY_DOMAINS (напрямую недоступны, см. комментарий выше).
+    # Видео YouTube здесь НЕТ: оно в BUILTIN_DIRECT_DOMAINS — встроено и не
+    # зависит от этого списка/файла (см. комментарий выше). youtube.googleapis.com
+    # и youtubei.googleapis.com — в ALWAYS_PROXY_DOMAINS: напрямую недоступны.
 ]
 DIRECT_DOMAINS_FILE = CONF / "direct_domains.txt"
 # Ручные оверрайды маршрута домена:
@@ -188,21 +207,39 @@ def norm_domain(value: str) -> str:
 
 
 def valid_domain(domain: str) -> bool:
-    """Годится ли строка в domain_suffix sing-box (после norm_domain)."""
-    return bool(DOMAIN_RE.fullmatch(domain))
+    """Годится ли строка в domain_suffix sing-box — БЕЗ молчаливой починки.
+
+    Проверяется то, что ввёл пользователь: регистр и пробелы по краям прощаем,
+    точку в конце FQDN — тоже, но ведущую точку и пустые метки (`..example.com`,
+    `a..b`) отклоняем. Раньше `norm_domain` срезал точки и `..example.com`
+    превращался в `example.com`: опечатка выглядела как успешная команда, а
+    `domain_suffix` в sing-box — не regex, и «почти домен» молча не совпал бы.
+    """
+    dom = str(domain).strip().lower()
+    if not dom or ".." in dom or dom.startswith("."):
+        return False
+    return bool(DOMAIN_RE.fullmatch(dom.rstrip(".")))
 
 
 # Глубина вложенности ctrl_lock: cmd_on внутри route_set (перезапуск после
 # смены правила) не должен упираться в собственный же лок.
 _ctrl_lock = {"depth": 0}
 
+# Пауза между повторами захвата лока для быстрых операций (`--no-restart`).
+CTRL_LOCK_RETRY_DELAY = 0.2
+
 
 @contextlib.contextmanager
-def ctrl_lock():
+def ctrl_lock(retries: int = 0):
     """Эксклюзивный (неблокирующий) лок на управление VPN.
 
     Неблокирующий намеренно: лучше честно сказать «занято», чем подвесить
     виджет на минуту, пока идёт чужой heal или аудит маршрутов.
+
+    `retries` — короткие повторы для быстрых операций (`route set --no-restart`):
+    аудит ставит десяток правил подряд, и падать на «занято» всей пачкой из-за
+    чужого секундного лока бессмысленно. Для действий, поднимающих VPN, повторы
+    не нужны — там лок держится долго, и ждать его бессмысленно.
     """
     if _ctrl_lock["depth"]:
         _ctrl_lock["depth"] += 1
@@ -213,12 +250,16 @@ def ctrl_lock():
         return
     STATE.mkdir(parents=True, exist_ok=True)
     fd = os.open(CTRL_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
-        raise RuntimeError("другой процесс управляет VPN (перезапуск, аудит маршрутов "
-                           "или heal) — повторите через несколько секунд")
+    for attempt in range(max(0, int(retries)) + 1):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if attempt >= retries:
+                os.close(fd)
+                raise RuntimeError("другой процесс управляет VPN (перезапуск, аудит "
+                                   "маршрутов или heal) — повторите через несколько секунд")
+            time.sleep(CTRL_LOCK_RETRY_DELAY)
     try:
         os.ftruncate(fd, 0)
         os.write(fd, f"{os.getpid()}\n".encode())
@@ -299,12 +340,16 @@ def proxy_domains(overrides: dict | None = None) -> list:
 
 
 def direct_domains() -> list:
-    """Список direct-правила: ALWAYS_DIRECT + файл/умолчания + оверрайды direct.
+    """Список direct-правила: ALWAYS_DIRECT + встроенные + файл/умолчания + оверрайды.
 
     Приоритет (он же порядок правил в build_singbox):
     override → ALWAYS_PROXY_DOMAINS → direct_domains.txt → final=proxy.
     Поэтому домены, которым положено идти в туннель, отсюда вычищаются — даже
     если их записал zapret-autotune (этот файл он перезаписывает сам).
+
+    BUILTIN_DIRECT_DOMAINS (видео YouTube) идут ПЕРЕД файлом: автотюн не должен
+    уводить видеотрафик в туннель. Снять их оттуда может только оверрайд
+    `route set <домен> proxy` — правило proxy стоит первым.
     """
     over = route_overrides()
     proxied = set(proxy_domains(over))
@@ -316,6 +361,8 @@ def direct_domains() -> list:
             result.append(dom)
 
     for dom in ALWAYS_DIRECT_DOMAINS:
+        add(dom)
+    for dom in BUILTIN_DIRECT_DOMAINS:
         add(dom)
     try:
         lines = DIRECT_DOMAINS_FILE.read_text(encoding="utf-8").splitlines()
@@ -359,14 +406,16 @@ def _direct_file_domains() -> tuple[list, bool]:
 def _rule_hit(dom: str, rule: list):
     """Первое правило группы, которое ловит домен: сначала точное, потом суффикс.
 
-    sing-box сопоставляет domain_suffix — «домен или его поддомен», поэтому
-    `foo.youtubei.googleapis.com` попадает в правило `youtubei.googleapis.com`.
+    sing-box сопоставляет domain_suffix — «домен или его поддомен по границе
+    метки», поэтому `foo.youtubei.googleapis.com` попадает в правило
+    `youtubei.googleapis.com`, а `notyoutubei.googleapis.com` — нет. Раньше здесь
+    стоял голый `endswith`, и проверка расходилась с поведением sing-box.
     """
     for entry in rule:
         if dom == entry[0]:
             return entry
     for entry in rule:
-        if dom.endswith(entry[0]):
+        if dom.endswith("." + entry[0]):
             return entry
     return None
 
@@ -393,10 +442,16 @@ def route_entries() -> list:
     proxy_rule: list = [(dom, "always", "", 0)
                         for dom in ALWAYS_PROXY_DOMAINS if dom not in forced_direct]
     proxy_rule += [(dom, "override", ent["reason"], ent["ts"]) for dom, ent in proxy_over]
-    direct_rule: list = [(dom, "always", "", 0) for dom in ALWAYS_DIRECT_DOMAINS]
+    # Оверрайды direct — первыми в группе: путь от этого не меняется, но источник
+    # должен быть честным (`override`, а не `default-direct`/`file`), иначе
+    # `route list` прячет решение человека за встроенным списком.
+    direct_rule: list = [(dom, "override", ent["reason"], ent["ts"])
+                         for dom, ent in direct_over]
+    direct_rule += [(dom, "always", "", 0) for dom in ALWAYS_DIRECT_DOMAINS]
+    # Видео YouTube: встроенный список, приоритетнее direct_domains.txt.
+    direct_rule += [(dom, "default-direct", "", 0) for dom in BUILTIN_DIRECT_DOMAINS]
     direct_rule += [(dom, "file" if file_exists else "default", "", 0)
                     for dom in file_domains]
-    direct_rule += [(dom, "override", ent["reason"], ent["ts"]) for dom, ent in direct_over]
     rules = (("proxy", proxy_rule), ("direct", direct_rule))
 
     known: list = []
@@ -422,10 +477,14 @@ def route_table_text(rows: list) -> str:
     if not rows:
         return "маршруты не заданы"
     width = max(len(row["domain"]) for row in rows)
-    head = (f"{'домен':<{width}}  {'путь':<6}  {'источник':<8}  {'возраст':<7}  причина")
+    # Ширина колонки источника считается, а не задана числом: `default-direct`
+    # длиннее остальных источников и разъезжался с заголовком.
+    src_width = max([len("источник")] + [len(row["source"]) for row in rows])
+    head = (f"{'домен':<{width}}  {'путь':<6}  {'источник':<{src_width}}  {'возраст':<7}  причина")
     lines = [head, "-" * len(head)]
     for row in rows:
-        lines.append(f"{row['domain']:<{width}}  {row['path']:<6}  {row['source']:<8}  "
+        lines.append(f"{row['domain']:<{width}}  {row['path']:<6}  "
+                     f"{row['source']:<{src_width}}  "
                      f"{fmt_age(row['age']):<7}  {row['reason']}")
     return "\n".join(lines)
 
@@ -447,17 +506,21 @@ def route_set(domain: str, path: str, reason: str = "", restart: bool = True) ->
 
     Идемпотентна: если домен уже идёт этим путём, файл не трогается и VPN не
     перезапускается (аудит ставит десяток правил подряд и перезапускает один раз).
+
+    Домен проверяется **до** нормализации: `..example.com` — отказ, а не тихое
+    `example.com`. При `--no-restart` лок берётся с короткими повторами: аудит
+    ставит правила пачкой, и секундный чужой лок не должен рушить всю пачку.
     """
-    dom = norm_domain(domain)
-    if not valid_domain(dom):
+    if not valid_domain(domain):
         raise RuntimeError(
             f"некорректный домен: {domain!r} — нужно обычное DNS-имя (например example.com): "
-            "без «*», IP, «#», пробелов, пустых меток и кириллицы")
+            "без «*», IP, «#», пробелов, пустых меток (`a..b`), ведущей точки и кириллицы")
+    dom = norm_domain(domain)
     path = str(path).strip().lower()
     if path not in ROUTE_PATHS:
         raise RuntimeError(f"неизвестный путь: {path!r} (нужно proxy или direct)")
     reason = reason.strip()
-    with ctrl_lock():
+    with ctrl_lock(0 if restart else 4):
         over = route_overrides()
         current = over.get(dom) or {}
         previous = str(current.get("path") or "")
@@ -479,7 +542,7 @@ def route_unset(domain: str, restart: bool = True) -> dict:
     dom = norm_domain(domain)
     if not dom:
         raise RuntimeError("пустой домен")
-    with ctrl_lock():
+    with ctrl_lock(0 if restart else 4):
         over = route_overrides()
         previous = over.pop(dom, None)
         if previous is not None:

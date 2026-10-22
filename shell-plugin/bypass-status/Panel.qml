@@ -70,8 +70,10 @@ Panel {
   readonly property var ra: (root.bs && root.bs.route_audit) ? root.bs.route_audit : ({})
   readonly property var raProbes: (root.ra.probes instanceof Array) ? root.ra.probes : []
   readonly property int raCount: Number(root.ra.count) || root.raProbes.length
-  readonly property int raFixed: Number(root.ra.fixed)
-    || ((root.ra.actions instanceof Array) ? root.ra.actions.length : 0)
+  // Только fixed: в actions теперь попадают и откаты (rollback), и длину
+  // actions нельзя выдавать за «исправлено» — виджет врал «исправлено: 1»
+  // после отката.
+  readonly property int raFixed: Number(root.ra.fixed) || 0
   readonly property bool raHas: Number(root.ra.checked || 0) > 0
   readonly property var raBroken: {
     var bad = []
@@ -431,6 +433,7 @@ Panel {
       try {
         var d = JSON.parse(auditOut.text)
         if (d && d.reason === "already_running") msg = "аудит маршрутов уже идёт"
+        else if (d && d.reason === "lock_error") msg = "уже идёт проверка — лок занят"
         else if (d && d.summary) msg = d.summary
       } catch (e) { /* ignore */ }
       root.notice = msg
@@ -1231,7 +1234,9 @@ Panel {
             foreground: root.foreground
             fontFamily: root.fontFamily
             fontSize: Style.font.bodySmall
-            enabled: root.cliPath !== "" && root.busy === ""
+            // Аудит запускает scriptPath (bypass-status), а не cliPath (omavpn):
+            // проверять надо именно его, иначе кнопка мертва без CLI.
+            enabled: root.scriptPath !== "" && root.busy === ""
             onClicked: {
               if (root.busy !== "" || auditProc.running) return
               root.busy = "audit"
