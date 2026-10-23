@@ -31,6 +31,9 @@ PROXY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "wire
 ZAPRET_REPOS = ("bol-van/zapret",)
 TGWS_REPO = "Flowseal/tg-ws-proxy"
 TGWS_VERSION_FILE = os.path.join(HOME, ".local", "share", "tgwsproxy", "version")
+# Юнит автозапуска tg-ws-proxy, который systemd-xdg-autostart-generator делает
+# из ~/.config/autostart/tg-ws-proxy.desktop (дефис в имени экранирован).
+TGWS_UNIT = "app-tg\\x2dws\\x2dproxy@autostart.service"
 UPDATES_MAX_AGE = 7 * 24 * 3600
 YOUTUBE_CACHE_AGE = 30 * 60
 RESCAN_REQUEST = os.path.join(HOME, ".cache", "zapret-autotune", "rescan.request")
@@ -2272,6 +2275,13 @@ def _launch_in_terminal(command: str) -> bool:
         return False
 
 
+def tgws_unit_active() -> bool:
+    """Запущен ли tg-ws-proxy как юнит автозапуска, а не как случайный процесс."""
+    rc, _ = run_rc(["systemctl", "--user", "is-active", "--quiet", TGWS_UNIT],
+                   timeout=8)
+    return rc == 0
+
+
 def update_tgwsproxy() -> dict:
     """Обновляет tg-ws-proxy из последнего релиза GitHub (sha256-дайджест из API)."""
     asset_name = "TgWsProxy_linux_amd64"
@@ -2292,7 +2302,8 @@ def update_tgwsproxy() -> dict:
         return {"ok": False, "error": "sha256 не совпал — обновление отменено"}
     binary = os.path.join(HOME, ".local", "bin", "tg-ws-proxy")
     os.makedirs(os.path.dirname(binary), exist_ok=True)
-    was_running = bool(run(["pgrep", "-x", "tg-ws-proxy"]))
+    unit_active = tgws_unit_active()
+    was_running = bool(run(["pgrep", "-x", "tg-ws-proxy"])) or unit_active
     if os.path.exists(binary):
         shutil.copy2(binary, binary + ".bak")
     try:
@@ -2307,6 +2318,15 @@ def update_tgwsproxy() -> dict:
     with open(version_file, "w", encoding="utf-8") as handle:
         handle.write(version + "\n")
     if was_running:
+        # Если прокси живёт под юнитом автозапуска — перезапускаем юнит, а не
+        # плодим второй экземпляр. Раньше здесь был pkill: он убивал MainPID
+        # юнита, systemd помечал юнит завершённым, а guard следом поднимал его
+        # заново. Второй экземпляр не мог занять 1443, но оставался висеть
+        # с треем — и в системе оказывались два tg-ws-proxy.
+        if unit_active:
+            rc, _ = run_rc(["systemctl", "--user", "restart", TGWS_UNIT], timeout=90)
+            if rc == 0:
+                return {"ok": True, "version": version, "restarted": True}
         run(["pkill", "-x", "tg-ws-proxy"])
         time.sleep(0.7)
         subprocess.Popen([binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
