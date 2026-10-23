@@ -44,6 +44,16 @@ mkdir -p /var/lib/zapret-autotune
 # подчистить мусорные записи от моментов без сети
 find /var/lib/zapret-autotune -maxdepth 1 -name '*unknown*.strategy' -delete 2>/dev/null || true
 find /var/lib/zapret-autotune -maxdepth 1 -name '*unknown*.opt' -delete 2>/dev/null || true
+# Прежний конфиг сохраняем: установщик перезаписывает его целиком, а там могли
+# быть правки пользователя (AUTO_VPN, RETRY_SECONDS, PROBE_USER).
+if [ -f /etc/zapret-autotune.conf ]; then
+  BAK="/etc/zapret-autotune.conf.bak.$(date +%Y%m%d-%H%M%S)"
+  if cp -p /etc/zapret-autotune.conf "$BAK" 2>/dev/null; then
+    echo "==> Прежний конфиг сохранён: $BAK"
+  else
+    echo "    [!] не удалось сохранить копию /etc/zapret-autotune.conf — перезаписываю как есть"
+  fi
+fi
 cat > /etc/zapret-autotune.conf <<EOF
 # Пользователь, чьи omavpn/direct_domains обслуживаются автотюнером.
 USER_NAME=$USER_NAME
@@ -84,6 +94,11 @@ Type=oneshot
 ExecStart=/usr/local/bin/zapret-autotune run
 Nice=5
 TimeoutStartSec=2400
+# KillMode=process обязателен: автотюн изнутри поднимает и перезапускает VPN
+# (ensure_vpn, omavpn_restart), а xray/sing-box остаются в cgroup юнита.
+# Без process systemd по завершении oneshot-запуска гасит всю контрольную
+# группу — VPN ложится после каждого перебора, и обход остаётся не с чем.
+KillMode=process
 EOF
 
 cat > /etc/systemd/system/zapret-autotune.timer <<'EOF'
@@ -149,6 +164,9 @@ ExecStart=/usr/local/bin/zapret-autotune rescan
 # Кавычки обязательны: $USER_HOME может содержать пробел, а без них systemd
 # разбирает строку на аргументы и rm получает мусор (или удаляет не то).
 ExecStopPost=/usr/bin/rm -f "$REQUEST_FILE"
+# То же, что у zapret-autotune.service: rescan поднимает и перезапускает VPN,
+# и без process systemd убил бы xray/sing-box вместе с завершением юнита.
+KillMode=process
 EOF
 
 cat > /etc/systemd/system/zapret-autotune-rescan.path <<EOF

@@ -42,6 +42,11 @@ WAN="${WAN_IFACE:-$(wan_iface)}"
 stamp="$(date +%Y%m%d-%H%M%S)"
 [ -f "$CFG.orig" ] || cp -a "$CFG" "$CFG.orig"
 cp -a "$CFG" "$CFG.bak.$stamp"
+# Бэкапы копились без чистки: каждый запуск setup оставлял ещё один файл
+# навсегда. Держим последние 3 — этого хватает, чтобы откатить текущий и
+# предыдущий прогон (то же правило, что у zapret-strategy.sh).
+{ ls -1dt "$CFG".bak.[0-9]* 2>/dev/null || true; } \
+  | tail -n +4 | while IFS= read -r old; do rm -f -- "$old"; done
 echo "==> Конфиг сохранён: $CFG.bak.$stamp"
 
 echo "==> WAN=$WAN, пользователь=$USER_NAME"

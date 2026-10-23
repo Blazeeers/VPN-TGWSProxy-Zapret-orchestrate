@@ -34,10 +34,75 @@ LOG=/var/log/zapret-blockcheck.log
 BCDOMAIN="www.youtube.com"
 
 KEY="$(netkey)"
+
+# --- восстановление ---------------------------------------------------------
+# Без трапа Ctrl-C, падение blockcheck или обрыв ssh оставляли машину БЕЗ
+# zapret и БЕЗ VPN: скрипт гасит оба ради «честного» теста, а вернуть их мог
+# только он же, дойдя до конца. Теперь состояние возвращается на INT/TERM/EXIT:
+#   * NFQWS_OPT — прежний (перебор успевает записать проверяемый кандидат);
+#   * zapret — включён, если был включён до запуска;
+#   * VPN — поднят, если был поднят.
+# Функция идемпотентна: RESTORE_DONE ставится сразу, повторный вызов ничего не
+# делает (в нормальном финале она вызывается явно, а потом ещё раз трапом).
+#
+# По INT/TERM восстановления мало: вернув состояние, скрипт продолжал работу,
+# blockcheck (и его частичный лог) доигрывались, и уже после восстановления
+# могла примениться «найденная» в обрезанном логе стратегия — то есть ровно то,
+# от чего трап и защищает. Поэтому прерывание завершает скрипт с кодом 130.
+RESTORE_DONE=0
+restore_state() {
+  [ "$RESTORE_DONE" = 1 ] && return 0
+  RESTORE_DONE=1
+  trap - INT TERM EXIT
+
+  if [ "${OPT_TOUCHED:-0}" = 1 ] && [ -n "${ORIG_OPT:-}" ]; then
+    set_opt "$ORIG_OPT" >/dev/null 2>&1 || true
+    # Конфиг вернули — если zapret был включён, его надо перечитать.
+    if [ "${ZAPRET_WAS_ON:-0}" = 1 ]; then activate || true; fi
+  fi
+  if [ "${ZAPRET_WAS_ON:-0}" = 1 ]; then
+    ensure_zapret_on || true
+  fi
+  if [ "${WOW_WAS_ON:-0}" = 1 ]; then
+    echo "==> Возвращаю VPN"
+    if [ "$(cat "$CACHE/$KEY.strategy" 2>/dev/null)" != custom ]; then
+      ensure_direct_min
+    fi
+    if omavpn_running; then omavpn_restart; else omavpn_start; fi
+  fi
+}
+
+# Трап по сигналу: восстановить состояние и гарантированно выйти (130 = SIGINT).
+# restore_state снимает все трапы и ставит RESTORE_DONE, так что повторного
+# восстановления не будет.
+abort_restore() {
+  restore_state
+  exit 130
+}
+
 echo "==> Сеть: $KEY, уровень перебора: $LEVEL, домен: $BCDOMAIN"
 echo "==> Останавливаю zapret и VPN (для честного теста, бот временно молчит)"
+# Состояние фиксируем ДО остановки: по нему восстанавливаемся в трапе.
+ZAPRET_WAS_ON=0
+systemctl is-active --quiet zapret.service 2>/dev/null && ZAPRET_WAS_ON=1
+WOW_WAS_ON=0
+omavpn_running && WOW_WAS_ON=1
+OPT_TOUCHED=0
+ORIG_OPT="$(python3 - "$CFG" <<'PY'
+import re, sys
+try:
+    t = open(sys.argv[1], encoding="utf-8").read()
+except OSError:
+    sys.exit(0)
+m = re.search(r'NFQWS_OPT="(.*?)"', t, re.S)
+print(m.group(1).strip() if m else "")
+PY
+)"
+trap abort_restore INT TERM
+trap restore_state EXIT
+
 zapret_off
-if omavpn_running; then WOW_WAS_ON=1; omavpn_off; else WOW_WAS_ON=0; fi
+[ "$WOW_WAS_ON" = 1 ] && omavpn_off
 
 echo "==> Запускаю blockcheck (может занять 10-30 минут, не прерывай)"
 BATCH=1 DOMAINS="$BCDOMAIN" IPVS=4 SCANLEVEL="$LEVEL" \
@@ -58,22 +123,23 @@ else
 --filter-udp=443 --hostlist=$GOOGLE --hostlist=$ULIST --dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fake-quic=$F/quic_initial_www_google_com.bin"
 
   ensure_direct_all
-  if set_opt "$OPT"; then activate; else ensure_zapret_on; fi
-  if test_targets; then
+  OPT_TOUCHED=1   # после этой точки трап обязан вернуть прежний NFQWS_OPT
+  apply_opt "$OPT"; APPLY_RC=$?
+  if [ "$APPLY_RC" = 2 ]; then
+    echo "==> Не удалось записать NFQWS_OPT в $CFG — стратегия не сохранена."
+  elif test_targets; then
     printf '%s\n' "$OPT" > "$CACHE/$KEY.opt"
     printf 'custom\n' > "$CACHE/$KEY.strategy"
+    OPT_TOUCHED=0   # рабочая стратегия осталась в конфиге — откатывать нечего
     echo "==> УСПЕХ: стратегия применена и сохранена в автотюн (custom) для сети $KEY."
   else
     echo "==> Стратегия применилась, но цели не открылись. Смотри лог."
   fi
 fi
 
-echo "==> Возвращаю VPN"
-if [ "${WOW_WAS_ON:-0}" = 1 ]; then
-  if [ "$(cat "$CACHE/$KEY.strategy" 2>/dev/null)" != custom ]; then
-    ensure_direct_min
-  fi
-  if omavpn_running; then omavpn_restart; else omavpn_start; fi
-fi
+# Возврат состояния — restore_state (см. начало файла): он же сработает по
+# INT/TERM, если прогон прервут. Вызов явный, чтобы сообщение «Готово» шло
+# уже после возврата VPN.
+restore_state
 
 echo "==> Готово."

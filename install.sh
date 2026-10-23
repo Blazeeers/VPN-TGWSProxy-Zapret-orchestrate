@@ -177,6 +177,13 @@ if [ -f "$HERE/bin/bypass-status" ]; then
   install -m 0755 "$HERE/bin/bypass-status" "$LOCAL_BIN/bypass-status"
 fi
 
+# --- Проверка и установка обновлений --------------------------------------
+# Виджет умеет скачать его сам, но установка должна ставить всё сразу: иначе
+# раздел «Обновления» до первого запуска панели остаётся пустым.
+if [ -f "$HERE/bin/omavpn-updater" ]; then
+  install -m 0755 "$HERE/bin/omavpn-updater" "$LOCAL_BIN/omavpn-updater"
+fi
+
 # --- Надзиратель за обходами (omavpn-guard) --------------------------------
 # Проверяет YouTube/Discord/Telegram и лечит: поднимает VPN, чинит профиль,
 # перезапускает tg-ws-proxy, перебирает ноды, просит zapret-autotune
@@ -227,7 +234,10 @@ PartOf=graphical-session.target
 Type=oneshot
 ExecStart=%h/.local/bin/omavpn-guard --autostart
 RemainAfterExit=yes
-TimeoutStartSec=180
+# Таймаут больше ожидания лока в --autostart (AUTOSTART_LOCK_WAIT=1260 с):
+# иначе systemd убивал юнит раньше, чем guard дожидался идущего прогона, и VPN
+# после входа не поднимался. 1500 с — ожидание лока плюс запас на подъём VPN.
+TimeoutStartSec=1500
 # KillMode=process, как у guard/аудита: omavpn поднимает xray и sing-box из
 # cgroup этого юнита, и без process они умерли бы вместе с oneshot-запуском,
 # то есть VPN ложился бы сразу после автозапуска.
@@ -260,7 +270,10 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$LOCAL_BIN/bypass-status --route-audit
+# %h, а не подставленный абсолютный путь: если в домашнем каталоге есть
+# пробел, ExecStart без кавычек systemd разбирает по словам и юнит не
+# запускается вовсе.
+ExecStart=%h/.local/bin/bypass-status --route-audit
 Nice=10
 # 1200 с, а не 600: прогон двусторонний (7 проб × 2 попытки × 10 с) и может
 # сделать до четырёх перезапусков VPN. С 600 с systemd убивал юнит между
@@ -295,7 +308,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$LOCAL_BIN/bypass-status --route-audit-recheck
+ExecStart=%h/.local/bin/bypass-status --route-audit-recheck
 Nice=10
 # 1200 с: снятие пачки оверрайдов, перезапуск, проба каждого домена (2 попытки
 # по 10 с) и ещё один перезапуск на возврат. 900 с не хватало на 10+ доменов.
@@ -342,7 +355,7 @@ Description=Check component updates (zapret, tg-ws-proxy)
 
 [Service]
 Type=oneshot
-ExecStart=$LOCAL_BIN/bypass-status --updates
+ExecStart=%h/.local/bin/bypass-status --updates
 EOF
   write_unit "$HOME_DIR/.config/systemd/user/omavpn-updates.timer" <<'EOF'
 [Unit]

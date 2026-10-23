@@ -113,6 +113,19 @@ NEVER_PROXY_DOMAINS = (
 # Пробы маршрутов: домен → URL, способ проверки, что считается успехом.
 # Успех "answer" = получен любой HTTP-код (TLS-соединение и ответ состоялись);
 # 000/таймаут — провал. Это важно для служебных API: 405 на GET — норма.
+# Резервные копии списков «всегда» из bin/omavpn (ALWAYS_DIRECT_DOMAINS /
+# ALWAYS_PROXY_DOMAINS). Нужны, если CLI старый и не отдаёт их в `route list`:
+# без них предохранитель не работает и аудит уводил `api.deepseek.com` в
+# туннель, где он рвётся. При изменении списков в omavpn — обновить и здесь.
+ALWAYS_DIRECT_FALLBACK = (
+    "max.ru", "deepseek.com", "deepseek.ai", "yandex.ru", "ya.ru", "yandex.com",
+    "yandex.net", "yandex-team.ru", "yastatic.net", "tailscale.com",
+    "tailscale.io", "ts.net",
+)
+ALWAYS_PROXY_FALLBACK = (
+    "youtubei.googleapis.com", "youtube.googleapis.com",
+)
+
 ROUTE_PROBES = [
     {
         "domain": "www.youtube.com",
@@ -206,6 +219,38 @@ def _seconds(value) -> float:
     return _num(value)
 
 
+def _d(value) -> dict:
+    """Вложенный объект из внешнего JSON: dict, иначе {}.
+
+    Провайдер подписки вправе отдать `realitySettings`/`tlsSettings`/
+    `xhttpSettings` списком или строкой. `.get` на таком значении ронял
+    `--vpn` (rc=1, пустой stdout), и виджет молча оставался на старом снимке.
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _read_text(path: str) -> str:
+    """Текст файла; нет файла, нет прав, не UTF-8 — пустая строка."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except (OSError, ValueError):
+        return ""
+
+
+def _read_json(path: str):
+    """JSON из файла или None (нет файла, битый файл, не UTF-8).
+
+    Дескриптор закрывается всегда: прежний `json.load(open(...))` оставлял его
+    открытым до сборки мусора.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
 def resolve_cli() -> tuple[str, str]:
     """(app_name, cli_path). Поддерживает оба имени — omavpn и wowvpn."""
     for env in ("OMAVPN_CLI", "BYPASS_CLI"):
@@ -217,6 +262,19 @@ def resolve_cli() -> tuple[str, str]:
         if os.path.exists(path):
             return name, path
     return "", ""
+
+
+def _cache_app() -> str:
+    """Имя приложения для кэша, когда CLI уже не найти (`--route-audit` без CLI).
+
+    Аудит без CLI раньше возвращался до записи кэша, и виджет показывал старый
+    снимок, будто ничего не проверяли. Пишем в существующую папку кэша — там же,
+    откуда кэш потом читается.
+    """
+    for name in APP_CANDIDATES:
+        if os.path.isdir(os.path.join(HOME, ".cache", name)):
+            return name
+    return ""
 
 
 def fmt_uptime(seconds: int) -> str:
@@ -290,19 +348,16 @@ def vpn_status(cli: str) -> dict:
 
 def autotune_retry_seconds() -> int:
     try:
-        for line in open("/etc/zapret-autotune.conf", encoding="utf-8"):
+        for line in _read_text("/etc/zapret-autotune.conf").splitlines():
             if line.strip().startswith("RETRY_SECONDS="):
                 return int((line.split("=", 1)[1].strip() or "1800"))
-    except (OSError, ValueError):
+    except ValueError:
         pass
     return 1800
 
 
 def _cache_text(key: str, suffix: str) -> str:
-    try:
-        return open(os.path.join(AUTOTUNE_DIR, f"{key}.{suffix}"), encoding="utf-8").read().strip()
-    except OSError:
-        return ""
+    return _read_text(os.path.join(AUTOTUNE_DIR, f"{key}.{suffix}")).strip()
 
 
 def probe_state() -> dict:
@@ -312,10 +367,7 @@ def probe_state() -> dict:
     этой проверки «идёт подбор стратегии» висело в баре сутками.
     """
     path = os.path.join(AUTOTUNE_DIR, "probe.json")
-    try:
-        data = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    data = _read_json(path)
     if not isinstance(data, dict) or not data.get("active"):
         return {}
     updated = _num(data.get("updated"))
@@ -331,11 +383,7 @@ def probe_state() -> dict:
 
 def zapret_status(iface: str) -> dict:
     key = net_key(iface)
-    mode = ""
-    try:
-        mode = open(os.path.join(AUTOTUNE_DIR, f"{key}.strategy"), encoding="utf-8").read().strip()
-    except OSError:
-        pass
+    mode = _read_text(os.path.join(AUTOTUNE_DIR, f"{key}.strategy")).strip()
     st = {
         "service": run(["systemctl", "is-active", "zapret.service"]) or "unknown",
         "autotune": run(["systemctl", "is-active", "zapret-autotune.service"]) or "unknown",
@@ -356,8 +404,8 @@ def zapret_status(iface: str) -> dict:
     retry = autotune_retry_seconds()
     last = 0
     try:
-        last = int(open(os.path.join(AUTOTUNE_DIR, f"{key}.lastscan"), encoding="utf-8").read().strip() or "0")
-    except (OSError, ValueError):
+        last = int(_read_text(os.path.join(AUTOTUNE_DIR, f"{key}.lastscan")).strip() or "0")
+    except ValueError:
         last = 0
     st["retry_seconds"] = retry
     st["retry_in"] = max(0, retry - (int(time.time()) - last)) if last else 0
@@ -376,10 +424,7 @@ def tgwsproxy_status() -> dict:
     running = bool(run(["pgrep", "-x", "tg-ws-proxy"]))
     conf = os.path.join(HOME, ".config", "TgWsProxy", "config.json")
     port = 1443
-    try:
-        cfg = json.load(open(conf, encoding="utf-8"))
-    except (OSError, ValueError):
-        cfg = {}
+    cfg = _read_json(conf)
     if isinstance(cfg, dict):
         port = int(_num(cfg.get("port"), 1443)) or 1443
     return {"running": running, "port": port, "listening": port_open(port)}
@@ -389,10 +434,8 @@ def direct_status(app: str) -> dict:
     path = os.path.join(HOME, ".config", app, "direct_domains.txt") if app else ""
     count, has_file = 0, bool(path and os.path.exists(path))
     if has_file:
-        try:
-            count = sum(1 for l in open(path, encoding="utf-8") if l.strip() and not l.startswith("#"))
-        except OSError:
-            pass
+        count = sum(1 for line in _read_text(path).splitlines()
+                    if line.strip() and not line.startswith("#"))
     return {"file": path if has_file else "", "count": count}
 
 
@@ -519,10 +562,7 @@ def write_json_cache(app: str, name: str, data: dict) -> None:
 
 def cached_youtube(app: str) -> dict:
     path = os.path.join(HOME, ".cache", app, "yt.json") if app else ""
-    try:
-        data = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    data = _read_json(path)
     if not isinstance(data, dict):
         return {}
     if time.time() - _num(data.get("checked")) > YOUTUBE_CACHE_AGE:
@@ -566,10 +606,7 @@ def read_vpn_test(app: str) -> dict:
     for name in (app, *PROBE_APPS):
         if not name:
             continue
-        try:
-            data = json.load(open(os.path.join(HOME, ".cache", name, "probe.json"), encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
+        data = _read_json(os.path.join(HOME, ".cache", name, "probe.json"))
         if isinstance(data, dict) and _num(data.get("updated")) > _num(best.get("updated")):
             best = data
     if not best:
@@ -683,10 +720,7 @@ def _inbound_port(app: str, protocol: str) -> int:
     path = os.path.join(HOME, ".local", "state", app, "xray.json") if app else ""
     if not path:
         return 0
-    try:
-        cfg = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError):
-        return 0
+    cfg = _read_json(path)
     if not isinstance(cfg, dict):
         return 0
     for inb in cfg.get("inbounds") or []:
@@ -825,7 +859,11 @@ def health_items(app: str, cli: str) -> tuple[list, dict]:
     if _responsive(tg_code):
         tg_state, tg_detail = "ok", "HTTP " + str(tg_code) + (" · через прокси VPN" if proxy else "")
     elif v.get("running"):
-        tg_state, tg_detail = "bad", "нет ответа через прокси VPN"
+        # Ответ 5xx — это ответ, а не «нет ответа»: раньше 502 через прокси
+        # писался как «нет ответа через прокси VPN», и причину искали не там.
+        tg_state = "bad"
+        tg_detail = ("через прокси VPN ответ HTTP " + str(tg_code) + " — сервер ошибся"
+                     if tg_code else "нет ответа через прокси VPN")
     else:
         # без VPN Bot API в РФ и не должен открываться — это не поломка
         tg_state, tg_detail = "idle", "нет ответа (нужен VPN — включится при подключении)"
@@ -855,10 +893,7 @@ def heal_allowed(app: str) -> tuple[bool, float]:
     path = heal_state_path(app)
     if not path:
         return True, 0.0
-    try:
-        data = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError):
-        return True, 0.0
+    data = _read_json(path)
     if not isinstance(data, dict):
         return True, 0.0
     last = _num(data.get("ts"))
@@ -882,7 +917,8 @@ def run_health(heal_vpn: bool = True) -> dict:
             pass
     os.makedirs(os.path.dirname(HEALTH_LOCK), exist_ok=True)
     try:
-        open(HEALTH_LOCK, "w").write(str(os.getpid()))
+        with open(HEALTH_LOCK, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
     except OSError:
         pass
     started = time.time()
@@ -960,10 +996,7 @@ def run_health(heal_vpn: bool = True) -> dict:
 
 def cached_health(app: str) -> dict:
     path = os.path.join(HOME, ".cache", app, "health.json") if app else ""
-    try:
-        data = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    data = _read_json(path)
     if not isinstance(data, dict):
         return {}
     checked = _num(data.get("checked"))
@@ -1071,9 +1104,8 @@ def _cfg_route_rules(app: str) -> list:
     Нужен, если установленный omavpn старее и подкоманды `route` ещё нет.
     """
     path = os.path.join(HOME, ".local", "state", app, "singbox.json") if app else ""
-    try:
-        cfg = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError):
+    cfg = _read_json(path)
+    if not isinstance(cfg, dict):
         return []
     rules = []
     for rule in (cfg.get("route") or {}).get("rules") or []:
@@ -1093,6 +1125,12 @@ def route_context(app: str, cli: str) -> dict:
     rules, always_direct, always_proxy = _cli_route_rules(cli)
     if not rules:
         rules = _cfg_route_rules(app)
+    # Старый CLI не отдаёт списки «всегда» — берём резервные, иначе
+    # предохранители (ALWAYS_DIRECT/ALWAYS_PROXY) молча не работают.
+    if not always_direct:
+        always_direct = list(ALWAYS_DIRECT_FALLBACK)
+    if not always_proxy:
+        always_proxy = list(ALWAYS_PROXY_FALLBACK)
     return {"rules": rules, "always_direct": always_direct, "always_proxy": always_proxy}
 
 
@@ -1170,10 +1208,16 @@ def probe_verdict(probe: dict, res: dict) -> tuple[bool, str]:
         want = "/".join(str(c) for c in probe["codes"])
         return ok, "HTTP " + str(code) + ("" if ok else " (ждали " + want + ")")
     if kind == "below500":
-        return code < 500, "HTTP " + str(code)
+        return code < 500, "HTTP " + str(code) + ("" if code < 500 else " — сервер ответил ошибкой")
     if kind == "page":
-        ok = code == 200 and probe.get("needle", "").lower() in res.get("body", "").lower()
-        return ok, "HTTP " + str(code) + ("" if ok else " (в теле нет «" + probe.get("needle", "") + "»)")
+        # Тот же набор, что у _yt_reachability (200/301/302): раньше здесь был
+        # только 200, и две проверки одного и того же YouTube расходились —
+        # health считал прямой путь живым, аудит писал «не отвечает».
+        needle = str(probe.get("needle") or "").lower()
+        if code in (301, 302):
+            return True, "HTTP " + str(code) + " (редирект)"
+        ok = code == 200 and (not needle or needle in str(res.get("body") or "").lower())
+        return ok, "HTTP " + str(code) + ("" if ok else " (в теле нет «" + needle + "»)")
     return False, "неизвестный тип проверки"
 
 
@@ -1225,10 +1269,7 @@ def read_route_overrides(app: str) -> dict:
     (неизвестный путь, не строка и не объект) пропускается.
     """
     path = route_audit_path(app)
-    try:
-        data = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    data = _read_json(path)
     if not isinstance(data, dict):
         return {}
     clean: dict = {}
@@ -1257,8 +1298,13 @@ def _audit_summary(probes: list, actions: list) -> str:
     """Строка для виджета: что проверили, что исправили, что откатили, что лежит."""
     fixed = [a for a in actions if a.get("ok")]
     rolled = [a for a in actions if a.get("rollback")]
+    kept = [a for a in actions if a.get("kept") and not a.get("ok")]
+    # not_applied — правило записано в файл, но VPN не перезапустился: это не
+    # «домен не отвечает», а «переключение не применено». Разные строки, потому
+    # что лечатся по-разному (рестарт против маршрута).
+    pending = [p["domain"] for p in probes if p.get("not_applied")]
     bad = [p["domain"] for p in probes
-           if not p.get("after") and not p.get("advisory")]
+           if not p.get("after") and not p.get("advisory") and not p.get("not_applied")]
     slow = [p["domain"] for p in probes
             if not p.get("after") and p.get("advisory")]
     parts = []
@@ -1268,6 +1314,10 @@ def _audit_summary(probes: list, actions: list) -> str:
         parts.append("исправлено " + str(len(fixed)))
     if rolled:
         parts.append("откатил: " + ", ".join(str(a.get("domain")) for a in rolled))
+    if kept:
+        parts.append("оставил в VPN: " + ", ".join(str(a.get("domain")) for a in kept))
+    if pending:
+        parts.append("не применено (VPN не перезапустился): " + ", ".join(pending))
     if bad:
         parts.append("не отвечают: " + ", ".join(bad))
     if slow:
@@ -1352,10 +1402,7 @@ def read_route_state(app: str) -> dict:
     path = route_state_path(app)
     if not path:
         return {}
-    try:
-        data = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    data = _read_json(path)
     if not isinstance(data, dict):
         return {}
     clean: dict = {}
@@ -1503,16 +1550,33 @@ def run_route_audit() -> dict:
         # Без CLI исправлять нечего: семь проб по 10 с с двумя попытками
         # уходили в пустоту (~23 с), и всё это время виджет ждал ответа.
         audit_unlock(fd)
-        return {"ok": False, "checked": time.time(), "verdict": "error",
-                "summary": "VPN CLI не найден — аудит не запускался",
-                "count": 0, "fixed": 0, "probes": [], "actions": [],
-                "reason": "no_cli", "error": "no_cli",
-                "secs": round(time.time() - started, 1)}
+        result = {"ok": False, "checked": time.time(), "verdict": "error",
+                  "summary": "VPN CLI не найден — аудит не запускался",
+                  "count": 0, "fixed": 0, "probes": [], "actions": [],
+                  "reason": "no_cli", "error": "no_cli",
+                  "secs": round(time.time() - started, 1)}
+        # Кэш пишем и здесь: иначе виджет показывал старый снимок, будто
+        # проверку не запускали, и «аудит не выполнился» не появлялось.
+        write_json_cache(app or _cache_app(), "route-audit.json", result)
+        return result
     state: dict = {}
     result: dict = {"ok": False, "checked": time.time(), "probes": [], "actions": []}
     try:
         ctx = route_context(app, cli)
         rules = ctx["rules"]
+        # Предохранитель: без правил аудит слеп. `always_direct`/`always_proxy`
+        # приходят только из `route list --json`; если CLI старый, завис или
+        # напечатал мусор, списки пусты — а тогда `in_list(dom,
+        # ctx["always_direct"])` всегда ложь, и домен из ALWAYS_DIRECT
+        # (api.deepseek.com) уезжает в туннель, где рвётся. Ничего не меняем.
+        if not rules:
+            result = {"ok": False, "checked": time.time(), "verdict": "error",
+                      "summary": "не удалось получить правила маршрутов — не переключаю",
+                      "count": 0, "fixed": 0, "probes": [], "actions": [],
+                      "error": "no_rules",
+                      "secs": round(time.time() - started, 1)}
+            write_json_cache(app, "route-audit.json", result)
+            return result
         socks = _vpn_socks(app)
         overrides = read_route_overrides(app)
         state = read_route_state(app)
@@ -1621,6 +1685,16 @@ def run_route_audit() -> dict:
                         item["detail"] = detail + "; проверяю напрямую"
                         reverse.append(job)
 
+        # Предохранитель «лежит всё»: если не ответила ни одна проба (нет сети,
+        # Wi-Fi без интернета), «direct не отвечает» не значит ничего, и любое
+        # переключение — обрыв трафика вслепую. В таком прогоне маршруты не
+        # трогаем; вердикт остаётся bad: домены действительно не отвечают.
+        if probes and not any(p["before"] for p in probes):
+            for item in probes:
+                item["detail"] += ("; сеть недоступна — ни одна проба не ответила, "
+                                   "маршруты не переключаю")
+            forward, reverse = [], []
+
         # --- фаза 2: direct → proxy, один перезапуск на всю пачку ----------
         if forward:
             applied = []
@@ -1639,31 +1713,33 @@ def run_route_audit() -> dict:
                 job["item"]["path"] = "proxy"
                 applied.append(job)
             restarted, why_restart = _restart_vpn(cli) if applied else (False, "")
-            if not restarted:
+            if applied and not restarted:
+                # Правило легло только в файл: в действующем конфиге путь ещё
+                # прежний. Проба через SOCKS показала бы «работает» на старом
+                # маршруте и дала зелёный вердикт — поэтому after тут только
+                # False, без пробы, и отметка not_applied для сводки. Кулдаун
+                # не трогаем: сломавшийся рестарт — не неудача домена.
                 for job in applied:
-                    job["item"]["detail"] += ("; VPN не перезапустился: " + why_restart
-                                              + " — правило применится позже")
-            else:
+                    job["item"].update({
+                        "after": False, "action": "proxy", "not_applied": True,
+                        "detail": job["item"]["detail"] + "; VPN не перезапустился: "
+                                  + why_restart + " — правило не применено",
+                    })
+            elif applied:
                 time.sleep(ROUTE_SETTLE)
-            for job in applied:
-                dom = job["probe"]["domain"]
-                after_ok, after_res, after_detail = _probe_once(
-                    job["probe"], socks=_path_socks(job["item"]["path"], socks))
-                job["item"].update({
-                    "after": after_ok, "action": "proxy",
-                    "code": after_res["code"], "secs": after_res["secs"],
-                    "detail": job["item"]["detail"] + "; после переключения: " + after_detail,
-                })
-                if not restarted:
-                    # вердикта нет: правило не применилось. Это не повод считать
-                    # попытку неудачной — иначе один сломавшийся рестарт отложил
-                    # бы лечение домена на 6 ч × 2^fails (т.е. на 12 ч после
-                    # первой неудачи, затем 24 и 48).
-                    continue
-                route_state_mark(state, dom, "proxy", after_ok)
-                if after_ok:
-                    actions.append({"domain": dom, "from": job["from"], "to": "proxy",
-                                    "reason": ROUTE_AUDIT_REASON, "ok": True})
+                for job in applied:
+                    dom = job["probe"]["domain"]
+                    after_ok, after_res, after_detail = _probe_once(
+                        job["probe"], socks=_path_socks(job["item"]["path"], socks))
+                    job["item"].update({
+                        "after": after_ok, "action": "proxy",
+                        "code": after_res["code"], "secs": after_res["secs"],
+                        "detail": job["item"]["detail"] + "; после переключения: " + after_detail,
+                    })
+                    route_state_mark(state, dom, "proxy", after_ok)
+                    if after_ok:
+                        actions.append({"domain": dom, "from": job["from"], "to": "proxy",
+                                        "reason": ROUTE_AUDIT_REASON, "ok": True})
 
         # --- фаза 3: proxy → direct (обратное направление) ------------------
         if reverse:
@@ -1727,7 +1803,14 @@ def run_route_audit() -> dict:
                                         "to": job["from"],
                                         "reason": "аудит: proxy и direct не отвечают",
                                         "ok": False, "rollback": True})
-                    _restart_vpn(cli)  # откат тоже надо применить
+                    # откат тоже надо применить. Если не вышло — так и пишем:
+                    # «вернул прежний путь» было бы неправдой, домен остался бы
+                    # на мёртвом direct до следующего перезапуска.
+                    back_ok, back_why = _restart_vpn(cli)
+                    if not back_ok:
+                        for job in bad:
+                            job["item"]["detail"] += ("; но VPN не перезапустился: "
+                                                      + back_why + " — откат не применён")
 
         ok = all(p["after"] for p in probes if not p.get("advisory"))
         # действия фазы 0 (снятые залипшие видео-оверрайды) не теряем:
@@ -1787,10 +1870,7 @@ def run_route_recheck(force: bool = False) -> dict:
         state_path = os.path.join(HOME, ".cache", app, "route-audit-recheck.json") if app else ""
         prev: dict = {}
         if state_path:
-            try:
-                prev = json.load(open(state_path, encoding="utf-8"))
-            except (OSError, ValueError):
-                prev = {}
+            prev = _read_json(state_path) or {}
         last = _num(prev.get("checked")) if isinstance(prev, dict) else 0.0
         if not force and last and (time.time() - last) < ROUTE_RECHECK_GAP:
             result = {"ok": True, "checked": time.time(), "skipped": "недавно проверяли",
@@ -1829,6 +1909,16 @@ def run_route_recheck(force: bool = False) -> dict:
             actions: list[dict] = []
             stripped: list[dict] = []
             for dom in candidates:
+                # Гистерезис: если в direct уже пробовали недавно и не вышло,
+                # снимать оверрайд нельзя — это ещё два перезапуска и обрыв
+                # трафика впустую. Оверрайд остаётся, домен ждёт кулдаун.
+                wait = route_cooldown(state, dom, "direct")
+                if wait > 0:
+                    probes.append({"domain": dom, "path": "proxy", "before": True,
+                                   "after": True, "action": "",
+                                   "detail": "не проверяю: в direct пробовали недавно, "
+                                             "следующая попытка через " + _fmt_cooldown(wait)})
+                    continue
                 item = {"domain": dom, "path": "proxy", "before": True, "after": True,
                         "action": "", "detail": "был override proxy"}
                 probes.append(item)
@@ -1904,18 +1994,31 @@ def run_route_recheck(force: bool = False) -> dict:
                                         "reason": "видео ходит только напрямую", "ok": False})
                         continue
                     restore = _route_switch(cli, dom, "proxy", "аудит: direct всё ещё не отвечает")
-                    if restore.get("ok"):
+                    back_ok = bool(restore.get("ok"))
+                    if back_ok:
                         restored.append(dom)
                     item.update({"path": "proxy", "after": proxy_ok, "action": "restore",
+                                 "kept": True,
                                  "detail": ("direct: " + direct_detail + "; vpn: " + proxy_detail
-                                            + ("; оверрайд возвращён" if restore.get("ok")
+                                            + ("; оверрайд возвращён" if back_ok
                                                else "; оверрайд вернуть не удалось: "
                                                   + str(restore.get("error") or "нет ответа CLI")))})
+                    # ok=False и kept=True: домен остался в proxy. Раньше тут
+                    # стояло ok = restore.ok and proxy_ok, и перепроверка
+                    # отчитывалась «исправлено 1» / verdict=fixed, хотя ничего
+                    # не исправлено — оверрайд просто вернули на место.
                     actions.append({"domain": dom, "from": "direct", "to": "proxy",
                                     "reason": "direct всё ещё не отвечает",
-                                    "ok": bool(restore.get("ok")) and proxy_ok})
+                                    "ok": False, "kept": back_ok})
                 if restored and socks:
-                    _restart_vpn(cli)  # вернуть правила в силу
+                    # вернуть правила в силу. Неудачный рестарт не прячем:
+                    # оверрайд записан, но действует пока старый конфиг.
+                    back_ok, back_why = _restart_vpn(cli)
+                    if not back_ok:
+                        for job in stripped:
+                            if job["domain"] in restored:
+                                job["item"]["detail"] += ("; но VPN не перезапустился: "
+                                                          + back_why + " — оверрайд пока не действует")
             # Действий «до» в перепроверке не бывает: фазы 0 (снятие залипших
             # видео-оверрайдов) здесь нет, а оверрайды снимаются в этом же
             # прогоне и попадают в `actions`. Раньше тут лежал склеенный список
@@ -1949,11 +2052,11 @@ def run_route_recheck(force: bool = False) -> dict:
 
 
 def cached_route_audit(app: str) -> dict:
+    # CLI может исчезнуть (омархи обновился, бинарь переехал), а кэш остался:
+    # без запасного имени приложения виджет показывал пустой раздел.
+    app = app or _cache_app()
     path = os.path.join(HOME, ".cache", app, "route-audit.json") if app else ""
-    try:
-        data = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    data = _read_json(path)
     if not isinstance(data, dict):
         return {}
     checked = _num(data.get("checked"))
@@ -1964,10 +2067,7 @@ def cached_route_audit(app: str) -> dict:
 
 def read_sub(app: str) -> list:
     path = os.path.join(HOME, ".cache", app, "sub.json") if app else ""
-    try:
-        data = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
+    data = _read_json(path)
     if isinstance(data, dict):
         data = data.get("configs")
     return data if isinstance(data, list) else []
@@ -1979,13 +2079,14 @@ def extract_nodes(configs: list, profile_index: int) -> list:
     cfg = configs[profile_index]
     if not isinstance(cfg, dict):
         return []
+    outbounds = cfg.get("outbounds")
+    if not isinstance(outbounds, list):
+        return []
     out = []
-    for o in cfg.get("outbounds", []) or []:
+    for o in outbounds:
         if not isinstance(o, dict) or o.get("protocol") not in PROXY_PROTOCOLS:
             continue
-        st = o.get("settings", {}) or {}
-        if not isinstance(st, dict):
-            st = {}
+        st = _d(o.get("settings"))
         address, port = "", 0
         for key in ("vnext", "servers"):
             seq = st.get(key)
@@ -1993,12 +2094,13 @@ def extract_nodes(configs: list, profile_index: int) -> list:
                 address = str(seq[0].get("address") or seq[0].get("server") or "")
                 port = int(_num(seq[0].get("port")))
                 break
-        stream = o.get("streamSettings", {}) or {}
-        if not isinstance(stream, dict):
-            stream = {}
-        detail = ((stream.get("realitySettings", {}) or {}).get("serverName")
-                  or (stream.get("tlsSettings", {}) or {}).get("serverName")
-                  or (stream.get("xhttpSettings", {}) or {}).get("host")
+        # Каждое вложенное поле — через _d: провайдер может отдать
+        # realitySettings/tlsSettings/xhttpSettings списком или строкой, и
+        # `.get` на таком значении давал AttributeError (rc=1, пустой stdout).
+        stream = _d(o.get("streamSettings"))
+        detail = (_d(stream.get("realitySettings")).get("serverName")
+                  or _d(stream.get("tlsSettings")).get("serverName")
+                  or _d(stream.get("xhttpSettings")).get("host")
                   or address)
         out.append({"index": len(out), "tag": o.get("tag", "proxy"),
                     "address": address, "port": port, "detail": str(detail)})
@@ -2070,10 +2172,7 @@ def installed_zapret_version() -> str:
 
 
 def installed_tgws_version() -> str:
-    try:
-        return open(TGWS_VERSION_FILE, encoding="utf-8").read().strip()
-    except OSError:
-        return ""
+    return _read_text(TGWS_VERSION_FILE).strip()
 
 
 def _aur_version(pkg: str) -> str:
@@ -2118,10 +2217,7 @@ def write_updates(app: str, data: dict) -> None:
 
 def cached_updates(app: str) -> dict:
     path = os.path.join(HOME, ".cache", app, "updates.json") if app else ""
-    try:
-        data = json.load(open(path, encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    data = _read_json(path)
     if not isinstance(data, dict):
         return {}
     if time.time() - _num(data.get("checked")) > UPDATES_MAX_AGE:
@@ -2289,12 +2385,17 @@ def collect(check: bool) -> dict:
             return default
 
     iface = safe("iface", wan_iface, "")
+    vpn = safe("vpn", lambda: vpn_status(cli),
+               {"installed": bool(cli), "running": False})
+    # CLI есть, а статус не прочитался (завис на 10 с, напечатал мусор): без
+    # отметки degraded виджет показывал «VPN не установлен» как факт.
+    if cli and not vpn.get("installed") and "vpn" not in degraded:
+        degraded.append("vpn")
     data = {
         "ok": True,
         "app": app,
         "cli": cli,
-        "vpn": safe("vpn", lambda: vpn_status(cli),
-                    {"installed": bool(cli), "running": False}),
+        "vpn": vpn,
         "zapret": safe("zapret", lambda: zapret_status(iface), {}),
         "tgwsproxy": safe("tgwsproxy", tgwsproxy_status, {}),
         "direct": safe("direct", lambda: direct_status(app), {"file": "", "count": 0}),

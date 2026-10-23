@@ -16,6 +16,7 @@ import base64
 import contextlib
 import copy
 import fcntl
+import fnmatch
 import json
 import os
 import re
@@ -63,6 +64,7 @@ TUN_ADDR = "172.19.0.1/30"
 # VPN (xray + sing-box/TUN) при этом не трогается. Прогресс пишется в
 # CACHE/probe.json — его читает виджет панели (bypass-status).
 PROBE_FILE = CACHE / "probe.json"
+PROBE_LOCK = CACHE / "probe.lock"
 PROBE_DIR = CACHE / "probe"
 PROBE_URL = "https://discord.com/api/v9/gateway"
 PROBE_PORT_BASE = 10990
@@ -444,6 +446,12 @@ def _direct_file_domains() -> tuple[list, bool]:
     Если подставлять в этом случае DEFAULT, Discord/YouTube уходят напрямую —
     то есть в блокировку, ровно там, где обход не работает. DEFAULT берём
     только когда файла нет вовсе.
+
+    Файл, где есть одни комментарии, тоже считается заданным (второй элемент —
+    True), и domains будет пустым: это осознанное решение. Автотюн комментариев
+    не пишет, а человек, оставивший в файле заметку и ни одного домена, скорее
+    всего не хотел молча вернуть встроенный список — молчание файла честнее
+    показывает `omavpn route list` (источник `file`, доменов нет).
     """
     try:
         raw = DIRECT_DOMAINS_FILE.read_text(encoding="utf-8")
@@ -1007,12 +1015,21 @@ def get_configs() -> list:
 
 
 def update_sub() -> list:
+    """Обновляет кэш подписки; файл переписывается только при изменении.
+
+    `update` зовут по таймеру, а каждая перезапись меняла mtime `sub.json` и
+    будила наблюдателей (виджет, сторож, аудит) без причины. Поэтому сравниваем
+    с тем, что уже лежит в кэше, и при совпадении содержимого файл не трогаем —
+    `updated` в нём остаётся временем последнего ФАКТИЧЕСКОГО изменения подписки
+    (статус показывает именно его, а не время последней проверки).
+    """
     configs = fetch_sub()
-    save_json(SUBFILE, {"updated": time.time(), "configs": configs})
-    # Настройки пересохраняем только при фактическом изменении: `update` зовут
-    # по таймеру, а каждая перезапись меняла mtime и будила наблюдателей
-    # (виджет, сторож) без причины. Новый файл или недостающие ключи умолчаний —
-    # уже изменение, тогда пишем.
+    cached = load_json(SUBFILE, None)
+    previous = cached.get("configs") if isinstance(cached, dict) else None
+    if previous != configs:
+        save_json(SUBFILE, {"updated": time.time(), "configs": configs})
+    # Настройки пересохраняем только при фактическом изменении: новый файл или
+    # недостающие ключи умолчаний — уже изменение, тогда пишем.
     s = settings()
     current = load_json(SETTINGS, None)
     if not isinstance(current, dict) or current != s:
@@ -1118,6 +1135,54 @@ def _strip_balancers(cfg: dict) -> None:
         routing.pop("observatoryTag", None)
 
 
+def _as_selectors(value) -> list[str]:
+    """selector/subjectSelector как список строк: в подписках бывает и строка."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(v) for v in value if isinstance(v, (str, int)) and str(v).strip()]
+
+
+def _selector_matches(tag: str, selector: str) -> bool:
+    """Попадает ли тег outbound под selector балансировщика/observatory.
+
+    Xray сопоставляет selector с тегами по префиксу (документация,
+    BalancerObject.selector: «Each string is used for prefix matching»): selector
+    `proxy` цепляет `proxy`, `proxy-2`, … Точное совпадение — частный случай
+    префикса. `*` xray не понимает, но генераторы подписок иногда его пишут —
+    на этот случай проверяем fnmatch, чтобы не объявить исправный конфиг сломанным.
+    """
+    if not selector:
+        return False
+    if tag.startswith(selector):
+        return True
+    return any(ch in selector for ch in "*?[") and fnmatch.fnmatchcase(tag, selector)
+
+
+def _balancer_covers_nodes(cfg: dict, node_tags: list[str]) -> bool:
+    """Попадает ли хотя бы одна нода под selector балансировщика/observatory.
+
+    Если ни одна не попадает, xray считает набор пустым и уводит ВЕСЬ трафик в
+    `fallbackTag` (в подписках это `direct`): VPN «включён», а трафик идёт
+    напрямую. Селектора нет вовсе — судить не берёмся, пусть решает xray.
+    """
+    if not node_tags:
+        return True
+    routing = cfg.get("routing") if isinstance(cfg.get("routing"), dict) else {}
+    selectors: list[str] = []
+    for bal in routing.get("balancers") or []:
+        if isinstance(bal, dict):
+            selectors += _as_selectors(bal.get("selector"))
+    for key in ("observatory", "burstObservatory"):
+        obs = cfg.get(key)
+        if isinstance(obs, dict):
+            selectors += _as_selectors(obs.get("subjectSelector"))
+    if not selectors:
+        return True
+    return any(_selector_matches(tag, sel) for sel in selectors for tag in node_tags)
+
+
 def build_xray(profile_index: int, node_index: int) -> dict:
     configs = get_configs()
     if not (0 <= profile_index < len(configs)):
@@ -1133,22 +1198,46 @@ def build_xray(profile_index: int, node_index: int) -> dict:
         elif inb.get("protocol") == "http":
             inb["port"] = HTTP_PORT
 
-    # ручной выбор ноды: заменяем правило с балансировщиком на outboundTag.
-    # Индекс зажимаем: он приходит из settings.json, а после `update` нод может
-    # стать меньше — IndexError здесь ломал бы каждый следующий запуск.
+    # Выбор ноды. Индекс зажимаем: он приходит из settings.json, а после `update`
+    # нод может стать меньше — IndexError здесь ломал бы каждый следующий запуск.
     nd = nodes(profile_index)
     node_index = _num(node_index, -1)
     if not (0 <= node_index < len(nd)):
         node_index = -1
-    # Без явного выбора ноды берём первую: после вырезания balancers правило с
-    # balancerTag осталось бы без цели, и xray отказался бы грузить конфиг.
-    target = nd[node_index]["tag"] if node_index >= 0 else (nd[0]["tag"] if nd else "")
+    routing = cfg.get("routing")
+    routing = routing if isinstance(routing, dict) else {}
+    balancer_rules = [rule for rule in (routing.get("rules") or [])
+                      if isinstance(rule, dict) and "balancerTag" in rule]
+    has_balancers = bool(routing.get("balancers"))
+    target = nd[node_index]["tag"] if node_index >= 0 else ""
+    if not target and balancer_rules and not has_balancers:
+        # Правило ссылается на балансировщик, которого в подписке нет: xray такой
+        # конфиг не примет, поэтому остаётся только первая нода.
+        target = nd[0]["tag"] if nd else ""
+    if not target and has_balancers and balancer_rules and \
+            not _balancer_covers_nodes(cfg, [n["tag"] for n in nd]):
+        # «Авто», но selector балансировщика не совпал ни с одной нодой: xray
+        # посчитает набор пустым и уведёт ВЕСЬ трафик в fallbackTag (`direct`),
+        # а статус при этом показывал бы running=true — VPN «включён», трафик
+        # идёт напрямую. Падаем на первую ноду тем же путём, что и
+        # «balancerTag без balancers».
+        warn("селектор балансировщика не совпал ни с одной нодой — "
+             "режим «Авто» переключаю на первую ноду")
+        target = nd[0]["tag"] if nd else ""
     if target:
-        for rule in cfg.get("routing", {}).get("rules", []):
-            if "balancerTag" in rule:
-                rule.pop("balancerTag", None)
-                rule["outboundTag"] = target
+        # Явный выбор ноды (или сломанный балансировщик): правило с balancerTag
+        # переписываем на outboundTag, а сам балансировщик с observatory убираем —
+        # без этого xray ругается на balancerTag без balancers.
+        for rule in balancer_rules:
+            rule.pop("balancerTag", None)
+            rule["outboundTag"] = target
         _strip_balancers(cfg)
+    # `node_index == -1` — «Авто»: конфиг подписки остаётся как есть, с
+    # `balancers` + `observatory` и выбором лучшей ноды по задержке. Раньше
+    # балансировщик вырезался всегда и «Авто» молча превращалось в первую ноду,
+    # хотя README и панель обещают выбор по задержке. Исключение — селектор,
+    # не совпавший ни с одной нодой (см. проверку выше): тогда «Авто» честно
+    # падает на первую ноду, а не отдаёт весь трафик в fallbackTag.
 
     cfg["log"] = {"loglevel": "warning", "error": str(XRAY_LOG), "access": "none"}
     return cfg
@@ -1168,13 +1257,18 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
     # zapret-autotune, доверять ему как источнику истины нельзя.
     forced = proxy_domains()
     forced_rule = [{"domain_suffix": forced, "outbound": "proxy"}] if forced else []
-    # Домены из ALWAYS_DIRECT_DOMAINS резолвим российским DNS и при внутреннем
-    # резолве самого sing-box (socks5h, домен в запросе): иначе
-    # `default_domain_resolver` увёл бы их через туннель мимо dns.rules и вернул
-    # зарубежный адрес. Действие `resolve` не финальное — следующее за ним
-    # правило direct по домену всё равно срабатывает (проверено запуском).
-    ru_resolve = [{"domain_suffix": list(ALWAYS_DIRECT_DOMAINS), "action": "resolve",
-                   "server": "ru"}]
+    # Домены для российского резолвера — только те, что действительно идут
+    # напрямую. Домен с оверрайдом `route set <домен> proxy` выпадает отсюда так
+    # же, как из direct-правила: иначе DNS слал бы его в `ru`, а трафик шёл бы
+    # через туннель — то есть ровно то, чего человек оверрайдом избегал.
+    ru_domains = [dom for dom in ALWAYS_DIRECT_DOMAINS if dom not in set(forced)]
+    # Эти домены резолвим российским DNS и при внутреннем резолве самого sing-box
+    # (socks5h, домен в запросе): иначе `default_domain_resolver` увёл бы их
+    # через туннель мимо dns.rules и вернул зарубежный адрес. Действие `resolve`
+    # не финальное — следующее за ним правило direct по домену всё равно
+    # срабатывает (проверено запуском).
+    ru_resolve = [{"domain_suffix": ru_domains, "action": "resolve",
+                   "server": "ru"}] if ru_domains else []
     return {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
@@ -1186,20 +1280,16 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
             #
             # У `ru` НЕТ `detour`: `detour: direct` sing-box на старте отвергает
             # («detour to an empty direct outbound makes no sense» — у обычного
-            # direct нет своих настроек, и обход бессмыслен). Поэтому запросы к
-            # самому 77.88.8.8 уводятся напрямую маршрутным правилом ниже
-            # (`route.rules` → ip_cidr RU_DNS), а `sing-box check` такое не
-            # ловит — проверять надо запуском.
+            # direct нет своих настроек, и обход бессмыслен).
             "servers": [
                 {"type": "udp", "tag": "remote", "server": "1.1.1.1", "detour": "proxy"},
                 {"type": "udp", "tag": "ru", "server": RU_DNS},
             ],
             # `action: route` — актуальная форма (с 1.11 поле адресата в правиле
             # DNS задаётся действием: dns.rules[].action + server).
-            "rules": [
-                {"domain_suffix": list(ALWAYS_DIRECT_DOMAINS), "action": "route",
-                 "server": "ru"},
-            ],
+            # `ru_domains` — ALWAYS_DIRECT_DOMAINS минус оверрайды `proxy`.
+            "rules": ([{"domain_suffix": ru_domains, "action": "route", "server": "ru"}]
+                      if ru_domains else []),
             "final": "remote",
             "strategy": "ipv4_only",
         },
@@ -1211,7 +1301,10 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
             "mtu": 1500,
             "stack": "gvisor",
             "auto_route": True,
-            "strict_route": bool(strict),
+            # `_truthy` на входе: значение приходит из settings.json, где после
+            # ручной правки может стоять строка — bool("false") == True поднял бы
+            # TUN в strict_route против воли человека
+            "strict_route": _truthy(strict),
             # Адреса серверов подписки и tailnet Tailscale не заводим в туннель:
             # иначе соединение самого Xray к серверу уходит в TUN и зацикливается,
             # а пакеты к узлам Tailscale перехватываются VPN.
@@ -1230,8 +1323,12 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
             "rules": [
                 {"action": "sniff"},
                 {"protocol": "dns", "action": "hijack-dns"},
-                # сам резолвер `ru` — напрямую, иначе запрос к 77.88.8.8 ушёл бы
-                # в туннель (final = proxy) и российский адрес не вернулся бы
+                # Страховка, а не необходимость: адрес самого DNS-сервера `ru`
+                # sing-box резолвит/доставляет напрямую и без этого правила
+                # (проверено запуском). Правило оставлено на случай, если в
+                # будущей версии запрос к резолверу пойдёт по общим правилам —
+                # тогда он ушёл бы в туннель (final = proxy) и российский адрес
+                # не вернулся бы.
                 {"ip_cidr": [f"{RU_DNS}/32"], "outbound": "direct"},
                 {"ip_is_private": True, "outbound": "direct"},
                 *forced_rule,
@@ -1545,7 +1642,9 @@ def _cmd_off(quiet: bool = False) -> dict:
     """Останавливает процессы. Печатает только main (через emit)."""
     stop_proc(SB_PID, "sing-box")
     stop_proc(XRAY_PID, "xray")
-    st = load_json(RUNTIME, {})
+    # И только теперь state.json: мусор в файле (`[]`, строка) раньше давал
+    # TypeError, `off` возвращал rc=1 и VPN оставался включённым.
+    st = _runtime_dict()
     st["running"] = False
     # выключение пользователем — намеренное действие: ошибки прошлого запуска
     # к нему отношения не имеют (иначе сторож решит, что VPN упал сам)
@@ -1638,8 +1737,6 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
             warn(f"сохранённый сервер #{node_index} пропал из профиля — беру авто")
             node_index = -1
 
-    set_settings(profile_index=profile_index, node_index=node_index, mode=mode)
-
     xray_cfg = build_xray(profile_index, node_index)
     save_json(XRAY_CFG, xray_cfg)
     err = validate([str(XRAY_BIN), "run", "-c", str(XRAY_CFG), "-test"], XRAY_CFG)
@@ -1648,11 +1745,17 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
 
     sb_cfg = None
     if mode == "tun":
-        sb_cfg = build_singbox(profile_index, s.get("strict_route", False))
+        sb_cfg = build_singbox(profile_index, _truthy(s.get("strict_route", False)))
         save_json(SB_CFG, sb_cfg)
         err = validate([str(SB_BIN), "check", "-c", str(SB_CFG)], SB_CFG)
         if err:
             raise RuntimeError(f"конфиг sing-box отклонён: {err}")
+
+    # Настройки пишем только ПОСЛЕ проверки конфигов. Раньше выбор сохранялся
+    # раньше `xray -test`/`sing-box check`, и кривой профиль/нода/режим оставался
+    # в файле навсегда: каждый следующий запуск (guard, heal, автозапуск) падал
+    # на нём же. Теперь при отказе файл не меняется вовсе — откатывать нечего.
+    set_settings(profile_index=profile_index, node_index=node_index, mode=mode)
 
     _cmd_off(quiet=True)
 
@@ -1677,12 +1780,12 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
         stop_proc(XRAY_PID, "xray")
         # merge, а не замена: иначе теряются last_heal (троттл heal), started_at
         # и mode, которые пишут другие команды.
-        st = load_json(RUNTIME, {})
+        st = _runtime_dict()
         st.update({"running": False, "last_error": last_error})
         save_json(RUNTIME, st)
         raise
 
-    st = load_json(RUNTIME, {})
+    st = _runtime_dict()
     st.update({
         "running": True,
         "mode": mode,
@@ -1695,6 +1798,109 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
     return {"ok": True, "running": True, "mode": mode,
             "profile_index": profile_index, "node_index": node_index,
             "profile_name": profiles()[profile_index]["name"]}
+
+
+def _validate_choice(profile_index: int, node_index: int, mode: str, strict: bool) -> None:
+    """Проверяет конфиги для выбранной пары, ничего не запуская.
+
+    Пишем во временные файлы: живой `xray.json`/`singbox.json` не трогаем — его
+    читает работающий процесс, а следующий `on` всё равно перегенерирует.
+    Нет бинарей или нет подписки — проверять нечем, молча пропускаем (раньше в
+    этом случае настройки просто сохранялись, и ломать такой сценарий нельзя).
+    """
+    try:
+        pro = profiles()
+    except (RuntimeError, OSError, ValueError):
+        pro = []
+    if not pro or not (XRAY_BIN.exists() or SB_BIN.exists()):
+        return
+    if not (0 <= profile_index < len(pro)):
+        # как в `on`: сохранённый профиль мог исчезнуть после `update`
+        profile_index = 0
+    if XRAY_BIN.exists():
+        path = STATE / "check-xray.json"
+        err = ""
+        try:
+            save_json(path, build_xray(profile_index, node_index))
+            err = validate([str(XRAY_BIN), "run", "-c", str(path), "-test"], path)
+        finally:
+            path.unlink(missing_ok=True)
+        if err:
+            raise RuntimeError(f"конфиг Xray отклонён: {err}")
+    if mode == "tun" and SB_BIN.exists():
+        path = STATE / "check-singbox.json"
+        err = ""
+        try:
+            save_json(path, build_singbox(profile_index, strict))
+            err = validate([str(SB_BIN), "check", "-c", str(path)], path)
+        finally:
+            path.unlink(missing_ok=True)
+        if err:
+            raise RuntimeError(f"конфиг sing-box отклонён: {err}")
+
+
+def choose(profile_index: int | None = None, node_index: int | None = None,
+           mode: str | None = None, strict_route: bool | None = None) -> dict:
+    """Применяет выбор профиля/ноды/режима/strict_route после проверки конфигов.
+
+    Раньше `omavpn node 3`, `profile 2`, `mode proxy` писали настройки сразу, а
+    `xray -test`/`sing-box check` гонялись только в `on`: выбор, на котором
+    конфиг не собирается, оставался в файле навсегда, и каждый следующий запуск
+    (guard, heal, автозапуск) падал на нём же.
+
+    Теперь: настройки пишутся, затем при включённом VPN — обычный `on` с новыми
+    значениями (он проверяет конфиги сам), при выключенном — проверка на
+    временной копии. Любая ошибка возвращает прежние настройки, а если VPN был
+    включён — best-effort поднимает его обратно на прежнем выборе (неудача
+    видна в stderr и в атрибуте `restore_failed` у исключения; исходная ошибка
+    остаётся прежней).
+    """
+    previous = settings()
+    changes: dict = {}
+    for key, value in (("profile_index", profile_index), ("node_index", node_index),
+                       ("mode", mode), ("strict_route", strict_route)):
+        if value is not None:
+            changes[key] = value
+    plan = {**previous, **changes}
+    mode_plan = str(plan.get("mode") or "tun")
+    if mode_plan not in ("tun", "proxy"):
+        mode_plan = "tun"
+    written = set_settings(**changes)
+    # Состояние VPN до попытки: если выбор не удался, туннель к этому моменту уже
+    # погашен (cmd_on при ошибке останавливает процессы), и без восстановления
+    # человек остаётся с откаченными настройками и выключенным VPN.
+    vpn_was_on = is_on()
+    try:
+        if vpn_was_on:
+            cmd_on(None, None, None, quiet=True)
+            return {"ok": True, "restarted": True}
+        _validate_choice(_num(plan.get("profile_index"), 0), _num(plan.get("node_index"), -1),
+                         mode_plan, _truthy(plan.get("strict_route", False)))
+    except BaseException as exc:
+        # Кривой выбор не должен «прилипнуть»: возвращаем настройки как было. Но
+        # только если файл всё ещё наш: параллельный процесс (guard, аудит) мог
+        # записать своё, и его решение затирать нельзя.
+        if settings() == written:
+            save_json(SETTINGS, previous)
+        # Best-effort возврат туннеля на прежнем выборе. Исходную ошибку не
+        # маскируем: она уходит наверх как была, а неудача восстановления — в
+        # stderr и в атрибут исключения `restore_failed` (вызывающий может
+        # показать «VPN остался выключен»).
+        restore_failed = False
+        if vpn_was_on and not is_on():
+            try:
+                cmd_on(None, None, None, quiet=True)
+            except Exception:  # noqa: BLE001
+                restore_failed = True
+        if restore_failed:
+            warn("настройки возвращены, но VPN вернуть не удалось — "
+                 "включите вручную: `omavpn on`")
+            try:
+                setattr(exc, "restore_failed", True)
+            except (AttributeError, TypeError):
+                pass
+        raise
+    return {"ok": True, "restarted": False}
 
 
 # --------------------------------------------------------------------------- #
@@ -1740,9 +1946,7 @@ def status() -> dict:
     """
     ensure_dirs()
     s = settings()
-    st = load_json(RUNTIME, {})
-    if not isinstance(st, dict):
-        st = {}
+    st = _runtime_dict()
     xray_alive, sbox_alive = _procs_alive()
     mode = str(s.get("mode") or "tun")
     if mode not in ("tun", "proxy"):
@@ -1753,7 +1957,7 @@ def status() -> dict:
     except (RuntimeError, OSError, ValueError):
         pro = []
     pi = _num(s.get("profile_index"), 0)
-    settings_error = ""
+    errors: list[str] = []
     if not pro:
         pi = 0                      # подписки нет — сравнивать не с чем
     else:
@@ -1764,16 +1968,28 @@ def status() -> dict:
         # причина видна в JSON (`settings_error`) и в тексте статуса.
         raw_pi = s.get("profile_index")
         if not _index_valid(raw_pi):
-            settings_error = (f"в настройках профиль {raw_pi!r} — не число, "
-                              f"использую #{pi}")
+            errors.append(f"в настройках профиль {raw_pi!r} — не число, использую #{pi}")
         elif _num(raw_pi, -1) != pi:
-            settings_error = (f"в настройках профиль #{_num(raw_pi, -1)}, "
-                              f"доступно {len(pro)} — использую #{pi}")
+            errors.append(f"в настройках профиль #{_num(raw_pi, -1)}, "
+                          f"доступно {len(pro)} — использую #{pi}")
     ni = _num(s.get("node_index"), -1)
     try:
         nd = nodes(pi) if pro else []
     except (RuntimeError, OSError, ValueError):
         nd = []
+    # Та же проверка для ноды: при `node_index: 999` статус показывал «авто» с
+    # пустым settings_error, хотя в конфиг попала бы нода #0 (build_xray зажимает
+    # индекс). Без подписки сравнивать не с чем — ноды не проверяем.
+    if nd:
+        raw_ni = s.get("node_index")
+        if not _index_valid(raw_ni):
+            errors.append(f"в настройках сервер {raw_ni!r} — не число, использую авто")
+            ni = -1
+        elif ni < -1 or ni >= len(nd):
+            errors.append(f"в настройках сервер #{ni}, в профиле доступно "
+                          f"{len(nd)} — использую авто")
+            ni = -1
+    settings_error = "; ".join(errors)
     rx, tx = iface_stats() if running else (0, 0)
     started_at = _num(st.get("started_at"), 0)
     uptime = max(0, int(time.time() - started_at)) if running and started_at > 0 else 0
@@ -1794,7 +2010,9 @@ def status() -> dict:
         "sbox_alive": sbox_alive,
         "caps_ok": caps_ok(),
         "mode": mode,
-        "strict_route": bool(s.get("strict_route", False)),
+        # через `_truthy`, а не bool(): после ручной правки "false" в settings.json
+        # bool("false") == True и strict_route включался сам
+        "strict_route": _truthy(s.get("strict_route", False)),
         "profile_index": pi,
         "profile_name": pro[pi]["name"] if pro else "",
         "settings_error": settings_error,
@@ -1922,9 +2140,52 @@ def probe_running() -> bool:
     return (time.time() - _num(data.get("updated"), 0)) < 20
 
 
-def _save_probe(state: dict) -> None:
+@contextlib.contextmanager
+def _probe_lock():
+    """Короткий эксклюзивный flock вокруг файла прогресса теста.
+
+    `probe.json` пишут несколько процессов (CLI, виджет, heal), и запись через
+    общий tmp-файл `save_json` не защищала от гонки: два прогона успевали
+    прочитать «теста нет» и оба начинали писать в один файл — результат одного
+    затирал прогресс другого. Лок отдельный (`probe.lock`), а не на самом
+    `probe.json`: файл прогресса пересоздаётся через `os.replace`, и flock на
+    старом inode перестал бы защищать новый файл.
+    """
+    CACHE.mkdir(parents=True, exist_ok=True)
+    fd = os.open(PROBE_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _write_probe(state: dict) -> None:
+    """Запись файла прогресса БЕЗ лока — только из-под `_probe_lock`/`_save_probe`."""
     state["updated"] = time.time()
     save_json(PROBE_FILE, state)
+
+
+def _save_probe(state: dict) -> None:
+    with _probe_lock():
+        _write_probe(state)
+
+
+def _probe_claim(state: dict) -> bool:
+    """Занять файл прогресса: проверка «тест уже идёт» и запись — под одним локом.
+
+    Без этого между `probe_running()` и первой `_save_probe` оставалось окно, в
+    которое второй процесс запускал свой тест.
+    """
+    with _probe_lock():
+        if probe_running():
+            return False
+        _write_probe(state)
+        return True
 
 
 def _port_up(port: int, timeout: float, proc=None) -> bool:
@@ -2099,8 +2360,6 @@ def probe_all(profile_index: int | None = None, probes: int = PROBE_DEFAULT_PROB
               url: str = PROBE_URL, timeout: float = PROBE_DEFAULT_TIMEOUT,
               node_index: int | None = None) -> dict:
     """Тестирует все серверы профиля. Прогресс — в CACHE/probe.json."""
-    if probe_running():
-        return {"ok": False, "error": "тест серверов уже идёт"}
     s = settings()
     if profile_index is None:
         profile_index = _num(s.get("profile_index"), 0)
@@ -2124,7 +2383,8 @@ def probe_all(profile_index: int | None = None, probes: int = PROBE_DEFAULT_PROB
         "probes": probes, "url": url, "started": time.time(), "finished": 0.0,
         "results": [], "best": None, "error": "",
     }
-    _save_probe(state)
+    if not _probe_claim(state):
+        return {"ok": False, "error": "тест серверов уже идёт"}
     try:
         for n in nd:
             state["current"], state["current_index"] = n["tag"], n["index"]
@@ -2171,8 +2431,6 @@ def probe_best(probes_quick: int = 2, timeout_quick: float = 3.5,
     С apply=True лучшая пара применяется в настройках и, если VPN включён,
     немедленно переподключается на неё.
     """
-    if probe_running():
-        return {"ok": False, "error": "тест серверов уже идёт"}
     pro = profiles()
     if not pro:
         raise RuntimeError("в подписке нет профилей")
@@ -2187,7 +2445,8 @@ def probe_best(probes_quick: int = 2, timeout_quick: float = 3.5,
         "probes": probes_quick, "url": url, "started": time.time(), "finished": 0.0,
         "results": [], "best": None, "error": "",
     }
-    _save_probe(state)
+    if not _probe_claim(state):
+        return {"ok": False, "error": "тест серверов уже идёт"}
     try:
         quick: list[dict] = []
         for p in pro:
@@ -2281,26 +2540,31 @@ def heal(min_gap: float = 600.0, probes: int = 3, timeout: float = 4.0,
         return deadline - (time.time() - started)
 
     with ctrl_lock():
-        st = load_json(RUNTIME, {})
-        if not isinstance(st, dict):
-            st = {}
+        st = _runtime_dict()
         last = _num(st.get("last_heal"), 0)
         if time.time() - last < min_gap:
             return {"ok": False, "reason": "throttled", "actions": [],
                     "retry_in": int(min_gap - (time.time() - last))}
         actions: list[str] = []
-        if _proxy_ok():
+        if is_on() and _proxy_ok():
             return {"ok": True, "actions": ["туннель в порядке"], "checked": True}
+        if not is_on():
+            # Полумёртвая пара: SOCKS ещё отвечает (xray жив), но sing-box/TUN уже
+            # нет. Раньше здесь стояла одна проверка `_proxy_ok()`, и такой VPN
+            # объявлялся здоровым: ремонта не было, а `bypass-status` ставил
+            # кулдаун на 45 минут — поломка жила до следующего окна.
+            actions.append("часть процессов не жива — перезапуск")
+        else:
+            actions.append("перезапуск VPN")
         # Отметку ставим ДО дорогой части: прогон могут убить по таймауту, и без
         # неё следующий тик немедленно начнёт всё заново.
         _mark_heal(actions)
-        actions.append("перезапуск VPN")
         _cmd_off(quiet=True)
         try:
             _cmd_on(None, None, None, quiet=True)
         except Exception as exc:  # noqa: BLE001
             actions.append(f"перезапуск не удался: {exc}")
-        if _proxy_ok():
+        if is_on() and _proxy_ok():
             _mark_heal(actions)
             return {"ok": True, "actions": actions}
         # перезапуск не помог — пробуем ноды текущего профиля и переключаемся
@@ -2330,7 +2594,7 @@ def heal(min_gap: float = 600.0, probes: int = 3, timeout: float = 4.0,
                     _cmd_on(None, alive[0]["index"], None, quiet=True)
         except Exception as exc:  # noqa: BLE001
             actions.append(f"перебор нод не удался: {exc}")
-        ok = _proxy_ok() if left() > 0 else False
+        ok = (is_on() and _proxy_ok()) if left() > 0 else False
         actions.append("туннель восстановлен" if ok else "туннель не восстановлен")
         _mark_heal(actions)
         if not ok and deadline_hit:
@@ -2342,7 +2606,7 @@ def heal(min_gap: float = 600.0, probes: int = 3, timeout: float = 4.0,
 
 
 def _mark_heal(actions: list) -> None:
-    st = load_json(RUNTIME, {})
+    st = _runtime_dict()
     st["last_heal"] = time.time()
     st["last_heal_actions"] = actions
     save_json(RUNTIME, st)
@@ -2353,6 +2617,9 @@ def _mark_heal(actions: list) -> None:
 # --------------------------------------------------------------------------- #
 
 JSON_OUT = False
+# Был ли `--json` в argv: нужно ещё до `parse_args`, чтобы ошибки разбора тоже
+# уходили JSON'ом в stdout (см. `_JsonParser`).
+_JSON_ARGV = False
 
 
 def emit(data, human: str = "") -> None:
@@ -2362,10 +2629,28 @@ def emit(data, human: str = "") -> None:
         print(human)
 
 
+class _JsonParser(argparse.ArgumentParser):
+    """argparse, который под `--json` отвечает JSON-ошибкой в stdout.
+
+    `parse_args` вызывается до установки `JSON_OUT`, и ошибки разбора (например
+    `omavpn --json node abc`) давали rc=2, usage в stderr и ПУСТОЙ stdout:
+    потребитель (виджет, аудит) не видел ни JSON, ни причины. Флаг ищем в argv
+    заранее — иначе под --json он узнаётся слишком поздно.
+    """
+
+    def error(self, message: str):
+        if _JSON_ARGV:
+            print(json.dumps({"ok": False, "error": f"{self.prog}: {message}"},
+                             ensure_ascii=False))
+            sys.exit(2)
+        super().error(message)
+
+
 def main(argv: list) -> int:
-    global JSON_OUT
+    global JSON_OUT, _JSON_ARGV
     os.umask(0o077)  # приватные каталоги/файлы состояния и кэша по умолчанию
-    p = argparse.ArgumentParser(prog="omavpn", description="Xray + TUN клиент для Omarchy")
+    _JSON_ARGV = "--json" in argv
+    p = _JsonParser(prog="omavpn", description="Xray + TUN клиент для Omarchy")
     p.add_argument("--json", action="store_true", help="вывод в JSON")
     sub = p.add_subparsers(dest="cmd")
 
@@ -2465,26 +2750,18 @@ def main(argv: list) -> int:
         elif args.cmd == "profile":
             # проверка ДО записи: иначе индекс вне диапазона ломал все запуски
             idx = check_profile(args.index)
-            set_settings(profile_index=idx, node_index=-1)
-            if is_on():
-                cmd_on(idx, -1, None, quiet=True)
+            choose(profile_index=idx, node_index=-1)
             emit({"ok": True, "profile_index": idx}, f"Профиль: {idx}")
         elif args.cmd == "node":
             idx = check_node(settings_profile(), args.index)
-            set_settings(node_index=idx)
-            if is_on():
-                cmd_on(None, idx, None, quiet=True)
+            choose(node_index=idx)
             emit({"ok": True, "node_index": idx}, f"Нода: {idx}")
         elif args.cmd == "mode":
-            set_settings(mode=args.value)
-            if is_on():
-                cmd_on(None, None, args.value, quiet=True)
+            choose(mode=args.value)
             emit({"ok": True, "mode": args.value}, f"Режим: {args.value}")
         elif args.cmd == "strict":
             strict_on = args.value == "on"
-            set_settings(strict_route=strict_on)
-            if is_on():
-                cmd_on(None, None, None, quiet=True)
+            choose(strict_route=strict_on)
             emit({"ok": True, "strict_route": strict_on},
                  f"strict_route: {'включён' if strict_on else 'выключен'}")
         elif args.cmd == "check":

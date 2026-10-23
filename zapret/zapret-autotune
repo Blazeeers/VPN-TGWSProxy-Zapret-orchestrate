@@ -32,9 +32,6 @@ UID_N=""
 OMAVPN="$USER_HOME/.local/bin/omavpn"
 DIRECT_FILE="$USER_HOME/.config/omavpn/direct_domains.txt"
 DIRECT_CHANGED=0
-# 1 — встроенный direct-список omavpn прочитан успешно (только тогда, если
-# список пуст, можно удалять файл пользователя).
-FULL_DIRECT_OK=0
 
 # Изолированный пробник: отдельный системный пользователь, чей трафик уходит
 # напрямую (ip rule uidrange -> main). Боевой трафик при этом не трогается:
@@ -329,16 +326,39 @@ build_opt() { # $1 кандидат, $2 сервисы ("youtube discord" | "you
 EOF
 }
 
-# set_opt <полный NFQWS_OPT>; return 0 если изменено, 1 если уже так
+# set_opt <полный NFQWS_OPT>
+#   0 — записано (стратегия изменилась)
+#   1 — уже так, менять нечего
+#   2 — записать НЕ удалось (нет прав, диск, исключение)
+# Раньше запись шла прямо в конфиг, а сбоем считался только код 3: любое
+# исключение (нет прав на /opt/zapret/config, полный диск) выглядело как
+# «изменено». Дальше activate поднимал zapret со СТАРОЙ стратегией, проверка
+# проходила — и в кэш сети писался индекс стратегии, которая на самом деле не
+# применялась. Плюс обрыв записи оставлял обрезанный конфиг без бэкапа.
+# Теперь: одна копия $CFG.bak.autotune перед первой правкой и атомарная замена
+# через временный файл рядом с целью (os.replace — в пределах одной ФС).
 set_opt() {
   local optf rc
-  optf="$(mktemp /tmp/zapret-autotune.opt.XXXXXX)"
-  printf '%s\n' "$1" > "$optf"
+  optf="$(mktemp "${TMPDIR:-/tmp}/zapret-autotune.opt.XXXXXX")" || {
+    log "не удалось создать временный файл для NFQWS_OPT"
+    return 2
+  }
+  if ! printf '%s\n' "$1" > "$optf"; then
+    rm -f "$optf"
+    log "не удалось записать временный файл NFQWS_OPT"
+    return 2
+  fi
   python3 - "$CFG" "$optf" <<'PY'
-import re, sys
+import os, re, shutil, stat, sys, tempfile
 cfg, optf = sys.argv[1], sys.argv[2]
-opt = open(optf).read().strip()
-t = open(cfg).read()
+with open(optf, encoding="utf-8") as fh:
+    opt = fh.read().strip()
+try:
+    with open(cfg, encoding="utf-8") as fh:
+        t = fh.read()
+except OSError as exc:
+    print(f"не читается {cfg}: {exc}", file=sys.stderr)
+    sys.exit(4)
 m = re.search(r'NFQWS_OPT="(.*?)"', t, re.S)
 cur = m.group(1).strip() if m else ""
 if cur == opt:
@@ -347,11 +367,49 @@ if m:
     t = t[:m.start()] + 'NFQWS_OPT="' + opt + '"' + t[m.end():]
 else:
     t = t.rstrip() + '\nNFQWS_OPT="' + opt + '"\n'
-open(cfg, 'w').write(t)
+
+dst_dir = os.path.dirname(cfg) or "."
+tmp = None
+try:
+    bak = cfg + ".bak.autotune"
+    if not os.path.exists(bak):
+        shutil.copy2(cfg, bak)
+    mode = stat.S_IMODE(os.stat(cfg).st_mode)
+    fd, tmp = tempfile.mkstemp(prefix=".config.", suffix=".tmp", dir=dst_dir)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(t)
+    os.chmod(tmp, mode)
+    os.replace(tmp, cfg)
+except OSError as exc:
+    if tmp:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    print(f"запись {cfg} не удалась: {exc}", file=sys.stderr)
+    sys.exit(4)
 PY
-  rc=$?; rm -f "$optf"
-  [ "$rc" = 3 ] && return 1
-  return 0
+  rc=$?
+  rm -f "$optf"
+  case "$rc" in
+    0) return 0 ;;
+    3) return 1 ;;
+    *) log "запись NFQWS_OPT не удалась (код $rc)"; return 2 ;;
+  esac
+}
+
+# apply_opt <полный NFQWS_OPT> — записать и применить.
+#   0 — применено изменённое, 1 — конфиг уже был таким (просто включаем zapret),
+#   2 — запись не удалась: вызывающий обязан НЕ писать индекс в кэш сети,
+#       иначе кэш начнёт врать про стратегию, которой в конфиге нет.
+apply_opt() {
+  local rc
+  set_opt "$1"; rc=$?
+  case "$rc" in
+    0) activate; return 0 ;;
+    1) ensure_zapret_on; return 1 ;;
+    *) return 2 ;;
+  esac
 }
 
 activate() {
@@ -416,12 +474,12 @@ ensure_direct() {
   DIRECT_CHANGED=0
   return 1
 }
-# Полный встроенный список. Файл пользователя удаляем ТОЛЬКО при явно удачном
-# импорте (FULL_DIRECT_OK=1): раньше упавший импорт давал пустой вывод, и
-# рабочий direct-список молча стирался — YouTube уезжал в VPN, где видео не идёт.
+# Полный встроенный список: им перезаписывается direct_domains.txt пользователя.
+# Делаем это ТОЛЬКО при явно удачном импорте: раньше упавший импорт давал пустой
+# вывод, и рабочий direct-список молча затирался пустотой — YouTube уезжал в VPN,
+# где видео не идёт.
 ensure_direct_all() {
   local content rc
-  FULL_DIRECT_OK=0
   if [ -z "$USER_NAME" ]; then
     log "USER_NAME не задан — direct_domains.txt не трогаю"
     DIRECT_CHANGED=0
@@ -433,7 +491,6 @@ ensure_direct_all() {
     DIRECT_CHANGED=0
     return 1
   fi
-  FULL_DIRECT_OK=1
   ensure_direct "$content"
 }
 ensure_direct_min() { ensure_direct "max.ru"; }
@@ -529,8 +586,22 @@ STRATEGIES=(
   "--dpi-desync=multidisorder --dpi-desync-split-pos=1 --dpi-desync-fooling=badseq"
 )
 
+# Все кандидаты не записались (apply_opt вернул 2): перебор продолжать незачем —
+# ни один вариант не попадёт в $CFG. Раньше winner оставался пустым, и дальше
+# шёл обычный «обход не найден»: zapret_off + set_direct "" + VPN + cache_set vpn,
+# хотя настоящая причина — права на конфиг, а не блокировки. Теперь возвращаем 0
+# (значит «сообщил и обработал»), вызывающий обязан выйти с кодом 1, не трогая
+# zapret, VPN и кэш сети.
+all_writes_failed() { # $1 = сколько кандидатов не записалось, $2 = всего
+  [ "${1:-0}" -ge "${2:-1}" ] || return 1
+  log "не удалось записать конфиг $CFG (все $2 кандидатов) — перебор отменён, состояние не меняю"
+  probe_teardown
+  probe_state_clear
+  return 0
+}
+
 run_scan() {
-  local key="$1" cf="$2" i use_probe=0 total="${#STRATEGIES[@]}" yt_ok=0 dc_ok=0 winner="" direct=""
+  local key="$1" cf="$2" i rc use_probe=0 total="${#STRATEGIES[@]}" yt_ok=0 dc_ok=0 winner="" direct="" write_fail=0
   probe_state_clear
 
   if probe_setup; then
@@ -566,12 +637,19 @@ run_scan() {
     if [ "$yt_ok" = 1 ]; then
       log "youtube работает напрямую; zapret нужен только для discord"
       set_direct "youtube"; apply_direct_change
+      write_fail=0
       for i in "${!STRATEGIES[@]}"; do
         log "пробую[$i] (только discord): ${STRATEGIES[$i]}"
         probe_state_write "$i" "$total" "${STRATEGIES[$i]}" 1 ""
-        if set_opt "$(build_opt "${STRATEGIES[$i]}" discord)"; then activate; else ensure_zapret_on; fi
+        apply_opt "$(build_opt "${STRATEGIES[$i]}" discord)"; rc=$?
+        if [ "$rc" = 2 ]; then
+          log "вариант[$i] не записан (NFQWS_OPT) — пропускаю"
+          write_fail=$((write_fail + 1))
+          continue
+        fi
         if probe_discord_direct; then winner="$i"; break; fi
       done
+      if all_writes_failed "$write_fail" "$total"; then return 1; fi
       if [ -n "$winner" ]; then
         log "стратегия для discord найдена: индекс $winner"
         cache_set "$key" "$winner" discord "youtube discord"
@@ -586,12 +664,19 @@ run_scan() {
       return 0
     fi
 
+    write_fail=0
     for i in "${!STRATEGIES[@]}"; do
       log "пробую[$i]: ${STRATEGIES[$i]}"
       probe_state_write "$i" "$total" "${STRATEGIES[$i]}" 1 ""
-      if set_opt "$(build_opt "${STRATEGIES[$i]}" "youtube discord")"; then activate; else ensure_zapret_on; fi
+      apply_opt "$(build_opt "${STRATEGIES[$i]}" "youtube discord")"; rc=$?
+      if [ "$rc" = 2 ]; then
+        log "стратегия[$i] не записана (NFQWS_OPT) — пропускаю"
+        write_fail=$((write_fail + 1))
+        continue
+      fi
       if probe_youtube_direct && probe_discord_direct; then winner="$i"; break; fi
     done
+    if all_writes_failed "$write_fail" "$total"; then return 1; fi
     if [ -n "$winner" ]; then
       log "рабочая стратегия найдена: индекс $winner (${STRATEGIES[$winner]})"
       cache_set "$key" "$winner" "youtube discord" "youtube discord"
@@ -619,10 +704,16 @@ run_scan() {
     probe_state_clear
     return 0
   fi
+  write_fail=0
   for i in "${!STRATEGIES[@]}"; do
     log "пробую[$i]: ${STRATEGIES[$i]}"
     probe_state_write "$i" "$total" "${STRATEGIES[$i]}" 0 ""
-    if set_opt "$(build_opt "${STRATEGIES[$i]}" "youtube discord")"; then activate; else ensure_zapret_on; fi
+    apply_opt "$(build_opt "${STRATEGIES[$i]}" "youtube discord")"; rc=$?
+    if [ "$rc" = 2 ]; then
+      log "стратегия[$i] не записана (NFQWS_OPT) — пропускаю"
+      write_fail=$((write_fail + 1))
+      continue
+    fi
     if test_targets; then
       log "рабочая стратегия найдена: индекс $i (${STRATEGIES[$i]})"
       cache_set "$key" "$i" "youtube discord" "youtube discord"
@@ -630,6 +721,7 @@ run_scan() {
       return 0
     fi
   done
+  if all_writes_failed "$write_fail" "$total"; then return 1; fi
   log "ни одна стратегия не сработала -> Discord/YouTube через VPN"
   zapret_off
   set_direct ""
@@ -644,7 +736,8 @@ run_scan() {
   return 0
 }
 
-apply_cached() { # $1 = стратегия из кэша, $2 = ключ сети; return 0 если ок
+apply_cached() { # $1 = стратегия из кэша, $2 = ключ сети
+  # 0 — применено и работает, 1 — не работает (нужен перебор), 2 — конфиг не пишется
   local strat="$1" key="$2" optf svc direct
   svc="$(cache_services "$key")"
   direct="$(cache_direct "$key")"
@@ -659,7 +752,9 @@ apply_cached() { # $1 = стратегия из кэша, $2 = ключ сети
       optf="$CACHE/$key.opt"
       [ -s "$optf" ] || return 1
       set_direct "$direct"; apply_direct_change
-      if set_opt "$(cat "$optf")"; then activate; else ensure_zapret_on; fi
+      # 2 — конфиг не пишется: возвращаем 2 наверх, чтобы не устраивать
+      # много­минутный перебор, который всё равно ничего не запишет.
+      apply_opt "$(cat "$optf")"; [ "$?" = 2 ] && return 2
       test_targets ;;
     ''|*[!0-9]*)
       return 1 ;;
@@ -671,13 +766,13 @@ apply_cached() { # $1 = стратегия из кэша, $2 = ключ сети
       strat=$(( 10#$strat ))
       [ "$strat" -lt "${#STRATEGIES[@]}" ] || return 1
       set_direct "$direct"; apply_direct_change
-      if set_opt "$(build_opt "${STRATEGIES[$strat]}" "$svc")"; then activate; else ensure_zapret_on; fi
+      apply_opt "$(build_opt "${STRATEGIES[$strat]}" "$svc")"; [ "$?" = 2 ] && return 2
       test_targets ;;
   esac
 }
 
 run() {
-  local force="${1:-}" tries=0
+  local force="${1:-}" tries=0 rc
   while ! set_wan; do
     tries=$((tries + 1))
     if [ "$tries" -ge 3 ]; then
@@ -700,14 +795,21 @@ run() {
     log "кэш: strategy=$strat, проверяю"
     if [ "$strat" = "vpn" ] && scan_due "$key"; then
       log "vpn-режим: пора перепроверить обход (${RETRY_SECONDS}s) -> переподбор"
-    elif apply_cached "$strat" "$key"; then
-      log "кэш работает"
-      return 0
     else
-      log "кэш перестал работать -> переподбор"
+      apply_cached "$strat" "$key"; rc=$?
+      case "$rc" in
+        0) log "кэш работает"; return 0 ;;
+        # 2 — /opt/zapret/config не пишется. Перебор ничего не изменит (каждый
+        # кандидат упадёт так же), а кэш после него соврал бы про стратегию.
+        2) log "конфиг $CFG не пишется — перебор пропущен (проверь права на файл)"
+           return 1 ;;
+        *) log "кэш перестал работать -> переподбор" ;;
+      esac
     fi
   fi
-  run_scan "$key" "$cf"
+  # run_scan возвращает 1, если конфиг zapret не пишется вовсе: тогда прогон не
+  # считается выполненным (mark_scan не ставим) и код возврата — 1.
+  run_scan "$key" "$cf" || return 1
   mark_scan "$key"
 }
 

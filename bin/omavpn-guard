@@ -47,14 +47,26 @@ TG_UNIT='app-tg\x2dws\x2dproxy@autostart.service'
 COOLDOWN=900        # ручное вмешательство в путь не чаще раза в 15 минут
 MAX_BACKOFF=3600    # потолок паузы после серии неудач
 TUN_WAIT=25         # сколько ждать интерфейс после запуска
-# Живой перебор стратегий длится 5:46–7:21 (29 кандидатов × 2 сервиса), поэтому
+# Живой перебор стратегий длится 5:46–7:21 (28 кандидатов × 2 сервиса), поэтому
 # 600 с не хватало: guard решал, что «перебор не завершился», и лез в путь руками.
 RESCAN_WAIT=1200    # сколько ждать, пока autotune переберёт стратегии
+# Сколько ждать чужой flock в --autostart. Прогон guard может занять до
+# RESCAN_WAIT (20 мин перебора), поэтому 120 с не хватало: автозапуск молча
+# выходил, и VPN после входа не поднимался вовсе. Ждём с повторами, суммарно
+# чуть больше RESCAN_WAIT; таймаут юнита (install.sh) выставлен под это же.
+AUTOSTART_LOCK_WAIT=1260
 # `omavpn heal` перебирает все ноды профиля (14 шт., до ~400 с); при 240 с его
 # убивали на середине, троттл не записывался и следующий тик начинал заново.
 HEAL_TIMEOUT=420
 MAX_NODES=5         # сколько нод перебрать за один прогон
 CURL_T=8            # таймаут одной HTTP-проверки, с (в --status урезается)
+ROUTE_T=20          # таймаут `omavpn --json route list`, с (в --status урезается)
+
+# 1 — VPN трогать нельзя (нет cap_net_admin / нет sing-box в tun-режиме).
+# Ставится в cmd_check. При этом guard НЕ выходит: Telegram чинится локальным
+# прокси, перебор стратегий zapret идёт как обычно — раньше `return 1` до всей
+# логики означал, что в такой машине не лечилось вообще ничего.
+VPN_BLOCKED=0
 
 YT_DOMAINS="youtube.com
 youtu.be
@@ -260,7 +272,7 @@ json_actions() { # $1 JSON -> действия одной строкой
 # правкой файла, которая ни на что не влияла.
 route_path_of() { # $1 домен -> direct|proxy|"" (спросить не удалось)
     local out
-    out=$(timeout 20 "$OMAVPN" --json route list 2>/dev/null) || return 0
+    out=$(timeout "$ROUTE_T" "$OMAVPN" --json route list 2>/dev/null) || return 0
     printf '%s' "$out" | jq -r --arg d "$1" \
         'first(.routes[]? | select(.domain == $d) | .path) // empty' 2>/dev/null || true
 }
@@ -667,7 +679,10 @@ heal() {
     path_vpn=$(vpn_mode)
     log "лечение: путь $(path_now), режим VPN $path_vpn, autotune=$mode, zapret=$(zapret_active && echo on || echo off)"
 
-    if ! vpn_alive; then
+    if [ "$VPN_BLOCKED" = 1 ]; then
+        # VPN не поднять (нет caps/sing-box): не выходим, лечим остальное.
+        log "VPN-шаги пропущены: (нет cap_net_admin/sing-box)"
+    elif ! vpn_alive; then
         if vpn_up; then log "VPN поднят"; else log "VPN не поднимается"; return 1; fi
     fi
 
@@ -682,30 +697,45 @@ heal() {
             [ -z "$broken" ] && return 0
         else
             log "tg-ws-proxy не ожил — проверю через VPN"
-            vpn_up
+            [ "$VPN_BLOCKED" = 1 ] || vpn_up
         fi
     fi
 
-    # Общие меры для YouTube/Discord
+    # Общие меры для YouTube/Discord. VPN-шаги (heal_vpn, ноды, подъём VPN,
+    # оверрайд с перезапуском) при VPN_BLOCKED пропускаются: их нечем выполнить,
+    # а перебор стратегий zapret и запрос rescan — можно и нужно.
     if [[ " $broken " == *" youtube "* || " $broken " == *" discord "* ]]; then
-        heal_vpn
-        wait_vpn
-        if health_ok_quiet; then log "помогло: omavpn heal"; return 0; fi
+        if [ "$VPN_BLOCKED" = 1 ]; then
+            log "VPN-шаги пропущены — лечу обходом (zapret)"
+        else
+            heal_vpn
+            wait_vpn
+            if health_ok_quiet; then log "помогло: omavpn heal"; return 0; fi
+        fi
 
         if [ "$mode" = "vpn" ]; then
-            log "autotune считает, что нужен VPN — перебираю ноды"
-            try_nodes && return 0
+            if [ "$VPN_BLOCKED" = 1 ]; then
+                log "autotune считает, что нужен VPN, а VPN поднять нечем — только перебор"
+                request_rescan && wait_rescan_result && { log "помог перебор стратегий"; return 0; }
+            else
+                log "autotune считает, что нужен VPN — перебираю ноды"
+                try_nodes && return 0
+            fi
         else
             log "autotune в режиме стратегии $mode — прошу перебор"
             if request_rescan; then
                 wait_rescan_result && { log "помог перебор стратегий"; return 0; }
             fi
-            log "перебор не помог — пробую VPN"
-            if vpn_up && try_nodes; then return 0; fi
+            if [ "$VPN_BLOCKED" = 0 ]; then
+                log "перебор не помог — пробую VPN"
+                if vpn_up && try_nodes; then return 0; fi
+            fi
         fi
 
         # Крайняя мера: увести сломанный сервис в VPN оверрайдом маршрута.
-        if [ "$(switches_last_hour)" -ge 3 ]; then
+        if [ "$VPN_BLOCKED" = 1 ]; then
+            log "крайняя мера (оверрайд в VPN) недоступна: VPN не поднять"
+        elif [ "$(switches_last_hour)" -ge 3 ]; then
             log "путь переключался 3+ раза за час — не воюю с autotune"
         elif ! can_switch; then
             log "ручная смена пути на кулдауне"
@@ -828,6 +858,9 @@ cmd_status() {
     # таймаут 4 с (было 8 с и без повторов — ответ шёл около минуты).
     CURL_T=4
     HTTP_TRIES=1
+    # `route list` в статусе — 5 с, а не 20: иначе «быстрый» вывод подвисал до
+    # ~25 с и «без блокировки» (без общего flock) читалось как «мгновенно».
+    ROUTE_T=5
     printf '{"vpn_alive":%s,"tun_up":%s,"mode":"%s","intent":"%s","path":"%s","autotune":"%s","zapret":%s,"caps_ok":%s,"caps":"%s","streak":%s,"broken":"%s"}\n' \
         "$(vpn_alive && echo true || echo false)" \
         "$(tun_up && echo true || echo false)" \
@@ -849,27 +882,35 @@ cmd_check() {
     want=$(intent_update)
 
     # caps нужны только для TUN. В режиме proxy их отсутствие — не поломка:
-    # Telegram (локальный прокси) и VPN через socks работают и без них, а раньше
-    # guard из-за отсутствия caps не лечил вообще ничего.
+    # Telegram (локальный прокси) и VPN через socks работают и без них.
+    # Выходить из прогона нельзя: раньше `return 1` здесь отменял вообще всё
+    # лечение, хотя перезапуск tg-ws-proxy и перебор стратегий zapret caps не
+    # требуют. Теперь помечаем VPN-шаги запрещёнными и идём дальше.
     caps=$(caps_state)
+    VPN_BLOCKED=0
     if [ "$caps" != "ok" ] && tun_needed; then
+        VPN_BLOCKED=1
         case "$caps" in
             nobin)
-                log "нет $SB_BIN — TUN поднять нечем (переустанови omavpn)"
+                log "нет $SB_BIN — TUN поднять нечем (переустанови omavpn); VPN-шаги пропускаю"
                 notify "VPN не поднимется: не найден sing-box" ;;
             *)
-                log "нет cap_net_admin у sing-box — нужен sudo setcap, лечить нечем"
+                log "нет cap_net_admin у sing-box — нужен sudo setcap; VPN-шаги пропускаю"
                 notify "VPN не может подняться: у sing-box нет cap_net_admin" ;;
         esac
-        return 1
     fi
 
-    if in_backoff && ! { [ "$want" = "on" ] && ! vpn_alive; }; then
+    # Бэкофф действует и при want=on с мёртвым VPN. Раньше из этого правила
+    # делали исключение, и полное лечение (heal + ноды + перезапуск) шло каждые
+    # 10 минут без роста паузы: одна и та же поломка молотила бесконечно, а
+    # журнал пух. Счётчик при этом сбрасывается при смене сети, так что первый
+    # прогон после входа паузы не ждёт.
+    if in_backoff; then
         log "пауза после неудач — пропускаю до $(date -d "@$(cat "$NEXT_TRY_FILE")" '+%F %T' 2>/dev/null)"
         return 0
     fi
 
-    if [ "$want" = "on" ]; then
+    if [ "$want" = "on" ] && [ "$VPN_BLOCKED" = 0 ]; then
         if ensure_profile; then vpn_restart; fi
         if ! vpn_consistent; then
             log "VPN числится живым, но xray мёртв — перезапускаю"
@@ -912,6 +953,11 @@ cmd_check() {
             return 0
         fi
         log "обход не тянет (не работают:$broken) — поднимаю VPN"
+        if [ "$VPN_BLOCKED" = 1 ]; then
+            log "VPN-шаги запрещены (нет cap_net_admin/sing-box) — поднять нечем"
+            mark_fail
+            return 1
+        fi
         if vpn_up && health_ok_quiet; then
             mark_ok
             notify "Обход в этой сети не справляется, включил VPN"
@@ -939,7 +985,18 @@ fi
 
 exec 9>"$LOCK"
 if [ "${1:-}" = "--autostart" ]; then
-    flock -w 120 9 || { log "автозапуск: не дождался блокировки"; exit 0; }
+    # Ждём лок с повторами до AUTOSTART_LOCK_WAIT: прогон guard может идти до
+    # RESCAN_WAIT (20 мин), и раньше автозапуск отваливался через 120 с молча —
+    # VPN после входа так и не поднимался.
+    deadline=$(( $(now) + AUTOSTART_LOCK_WAIT ))
+    until flock -w 30 9; do
+        if [ "$(now)" -ge "$deadline" ]; then
+            log "автозапуск: лок занят дольше $((AUTOSTART_LOCK_WAIT / 60)) мин — пропуск"
+            notify "VPN не поднят при входе: другой прогон держит блокировку"
+            exit 0
+        fi
+        log "автозапуск: лок занят, жду (до $(( (deadline - $(now)) / 60 )) мин)"
+    done
 else
     if ! flock -n 9; then
         log "пропуск: идёт другой прогон"

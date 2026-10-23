@@ -123,6 +123,14 @@ Wi-Fi), запуск **пропускается** — иначе был бы п�
 Изменения применяются только если реально изменились (сравнение `NFQWS_OPT` и
 содержимого `direct_domains.txt`) — сервис не перезапускает VPN/zapret зря.
 
+Запись `NFQWS_OPT` в `/opt/zapret/config` атомарная: временный файл рядом с
+целью и `os.replace`, а первая правка оставляет копию `config.bak.autotune`.
+Раньше файл писали прямо на месте, и сбой (нет прав, полный диск) не считался
+ошибкой — автотюн «применял» стратегию, проверка проходила на старом конфиге, и
+в кэш сети попадал индекс стратегии, которой в конфиге нет. Теперь при сбое в
+лог уходит `запись NFQWS_OPT не удалась (код N)`, кандидат пропускается, индекс
+не сохраняется.
+
 ### Изолированный перебор (без разрыва связи)
 
 Подбор новых стратегий не трогает боевой трафик:
@@ -181,6 +189,31 @@ RETRY_SECONDS=1800       # как часто в режиме vpn перепро�
 - таймер `zapret-autotune.timer`: `OnBootSec=3min`, `OnUnitActiveSec=15min`;
 - ручной `rescan`.
 
+### Юниты и `KillMode=process`
+
+Установщик создаёт два root-юнита: `zapret-autotune.service` (плановый/ручной
+прогон) и `zapret-autotune-rescan.service` (перебор по кнопке из виджета). Оба
+— `Type=oneshot`, и оба обязаны иметь в `[Service]`:
+
+```ini
+KillMode=process
+```
+
+Автотюн изнутри поднимает и перезапускает VPN (`ensure_vpn`, `omavpn_restart`),
+а `xray`/`sing-box` при этом остаются в контрольной группе юнита (omavpn
+запускает их через `setsid`, но из cgroup не выводит). С дефолтным
+`KillMode=control-group` systemd по завершении oneshot-запуска гасит всю группу
+— и VPN ложится **после каждого перебора**, то есть ровно тогда, когда он
+только что понадобился. Проверка на живой машине:
+
+```bash
+systemctl show -p KillMode zapret-autotune.service zapret-autotune-rescan.service
+# ожидается: KillMode=process
+```
+
+Если в выводе `control-group` — переустанови автотюн
+(`sudo bash zapret/zapret-autotune-install.sh`) и сделай `systemctl daemon-reload`.
+
 ## Глубокий подбор (`blockcheck`)
 
 `zapret/zapret-blockcheck.sh` запускает штатный `/opt/zapret/blockcheck.sh`
@@ -196,6 +229,13 @@ sudo bash zapret/zapret-blockcheck.sh standard   # или quick
 
 Лог: `/var/log/zapret-blockcheck.log`. Если стратегия не найдена — значит в этой
 сети obход zapret невозможен и правильный режим — `vpn`.
+
+Восстановление после прерывания: скрипт гасит zapret и VPN ради честного теста,
+поэтому на `INT`/`TERM`/`EXIT` срабатывает `restore_state` — возвращает прежний
+`NFQWS_OPT` (если рабочий вариант так и не был найден), включает zapret, если он
+был включён, и поднимает VPN, если он был поднят. Ctrl-C больше не оставляет
+машину без обхода и без VPN; функция идемпотентна, повторный вызов ничего не
+делает.
 
 ## Связка VPN + zapret (маршрутизация пакетов nfqws)
 
