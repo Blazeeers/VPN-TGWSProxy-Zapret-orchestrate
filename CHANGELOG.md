@@ -4,6 +4,21 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
+## [2.3.4] — 2026-10-24
+
+Обновление tg-ws-proxy больше не оставляет в системе второй экземпляр.
+Спасибо [@ferlhd](https://github.com/ferlhd) за исправление и разбор с
+воспроизведением — [#1](https://github.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/pull/1).
+
+### Fixed
+- **Обновление tg-ws-proxy идёт через systemd-юнит**, если прокси запущен
+  юнитом автозапуска `app-tg\x2dws\x2dproxy@autostart.service`. Вместо
+  `pkill` и запуска нового процесса выполняется `systemctl --user restart`.
+  Раньше `pkill` убивал MainPID юнита, `omavpn-guard` поднимал юнит заново, а
+  новый процесс оставался вне systemd: в системе оказывались два tg-ws-proxy,
+  второй висел с треем и не мог занять порт 1443. Если юнита нет, поведение
+  прежнее (`pkill` + запуск) как fallback.
+
 ## [2.3.3] — 2026-10-23
 
 Накопленные правки после аудита: надёжность VPN, честный аудит маршрутов,
