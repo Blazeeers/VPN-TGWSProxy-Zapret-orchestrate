@@ -432,21 +432,18 @@ def _parse_direct_lines(lines: list) -> list:
 def _direct_file_domains() -> tuple[list, bool]:
     """(домены из файла, файл задан пользователем).
 
-    Пустой файл (или файл из одних комментариев) — «пользователь ничего не
-    добавлял», то есть fallback на DEFAULT_DIRECT_DOMAINS. Раньше пустой файл
-    означал «direct-доменов нет вообще»: DEFAULT подставлялся только при OSError,
-    и вместе с файлом из конфига пропадал весь список по умолчанию.
+    Существующий файл — источник истины, даже если он пустой: именно так
+    `zapret-autotune` в режиме `vpn` пишет «всё в туннель» (`set_direct ""`).
+    Если подставлять в этом случае DEFAULT, Discord/YouTube уходят напрямую —
+    то есть в блокировку, ровно там, где обход не работает. DEFAULT берём
+    только когда файла нет вовсе.
     """
     try:
         raw = DIRECT_DOMAINS_FILE.read_text(encoding="utf-8")
     except OSError:
         return list(DEFAULT_DIRECT_DOMAINS), False
-    if not raw.strip():
-        return list(DEFAULT_DIRECT_DOMAINS), False
     parsed = _parse_direct_lines(raw.splitlines())
-    if not parsed:
-        return list(DEFAULT_DIRECT_DOMAINS), False
-    return parsed, True
+    return parsed, bool(raw.strip())
 
 
 def _rule_hit(dom: str, rule: list):
@@ -995,8 +992,10 @@ def fetch_sub() -> list:
 
 def get_configs() -> list:
     cache = load_json(SUBFILE, None)
-    if cache and cache.get("configs"):
-        return cache["configs"]
+    if isinstance(cache, dict):
+        configs = cache.get("configs")
+        if isinstance(configs, list) and configs:
+            return configs
     raise RuntimeError("нет данных подписки — выполните `omavpn update`")
 
 
@@ -1292,7 +1291,16 @@ def stop_proc(pidfile: Path, marker: str, timeout: float = 6.0) -> None:
             pass
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if not Path(f"/proc/{pid}").exists():
+            stat = Path(f"/proc/{pid}/stat")
+            if not stat.exists():
+                break
+            # Зомби (/proc есть, процесс уже мёртв) не даёт выйти из цикла:
+            # ожидание съедало полный таймаут на каждом неудачном запуске.
+            try:
+                raw = stat.read_text()
+                if raw.rsplit(")", 1)[-1].split()[0] == "Z":
+                    break
+            except (OSError, IndexError):
                 break
             time.sleep(0.15)
         # Перепроверяем marker, а не только /proc/<pid>: за время ожидания pid
@@ -1308,8 +1316,14 @@ def stop_proc(pidfile: Path, marker: str, timeout: float = 6.0) -> None:
 PORT_SETTLE = 0.4   # пауза, за которую успевший упасть процесс себя выдаст
 
 
-def _listen_inode(port: int) -> str | None:
-    """inode сокета, слушающего порт (по /proc/net/tcp), либо None."""
+def _listen_inodes(port: int) -> set:
+    """Все inode сокетов, слушающих порт (IPv4 и IPv6, любые адреса).
+
+    Раньше возвращался только первый найденный: если тот же порт слушал кто-то
+    ещё на другом адресе (127.0.0.2, ::1), настоящий владелец считался чужим и
+    `on` падал с «Xray не открыл порт» при живом xray.
+    """
+    found: set = set()
     for table in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
             lines = Path(table).read_text().splitlines()[1:]
@@ -1324,8 +1338,14 @@ def _listen_inode(port: int) -> str | None:
             except (IndexError, ValueError):
                 continue
             if local_port == port:
-                return parts[9]
-    return None
+                found.add(parts[9])
+    return found
+
+
+def _listen_inode(port: int) -> str | None:
+    """Первый inode, слушающий порт (совместимость)."""
+    inodes = _listen_inodes(port)
+    return next(iter(inodes), None)
 
 
 def _owns_listen_port(pid: int, port: int) -> bool | None:
@@ -1334,16 +1354,17 @@ def _owns_listen_port(pid: int, port: int) -> bool | None:
     None — определить не удалось (нет /proc/net/tcp или прав): такой случай не
     должен мешать запуску, поэтому вызывающий считает его «не False».
     """
-    inode = _listen_inode(port)
-    if inode is None:
+    inodes = _listen_inodes(port)
+    if not inodes:
         return None
+    targets = {f"socket:[{i}]" for i in inodes}
     try:
         fds = list(Path(f"/proc/{pid}/fd").iterdir())
     except OSError:
         return None
     for fd in fds:
         try:
-            if fd.readlink().as_posix() == f"socket:[{inode}]":
+            if fd.readlink().as_posix() in targets:
                 return True
         except OSError:
             continue
@@ -1417,9 +1438,15 @@ def _procs_alive() -> tuple[bool, bool]:
     return process_alive(XRAY_PID, "xray"), process_alive(SB_PID, "sing-box")
 
 
+def _runtime_dict() -> dict:
+    """state.json как объект. Мусор (строка, список) не должен ронять status."""
+    st = load_json(RUNTIME, {})
+    return st if isinstance(st, dict) else {}
+
+
 def _active_mode() -> str:
     """Режим запущенного VPN: из state.json, иначе из настроек."""
-    mode = str(load_json(RUNTIME, {}).get("mode") or settings().get("mode") or "tun")
+    mode = str(_runtime_dict().get("mode") or settings().get("mode") or "tun")
     return mode if mode in ("tun", "proxy") else "tun"
 
 

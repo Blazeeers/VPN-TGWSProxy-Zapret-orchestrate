@@ -265,6 +265,11 @@ def vpn_status(cli: str) -> dict:
     return {
         "installed": bool(d.get("installed")),
         "running": bool(d.get("running")),
+        # Частичная живость: в режиме tun `running` false, если умер ОДИН процесс,
+        # но трафик всё равно уходит в туннель. Без этих полей такой VPN выглядел
+        # как «выключен намеренно», и лечение не запускалось.
+        "xray_alive": d.get("xray_alive"),
+        "sbox_alive": d.get("sbox_alive"),
         "caps_ok": d.get("caps_ok"),
         "mode": d.get("mode", ""),
         "profile": d.get("profile_name", ""),
@@ -704,7 +709,15 @@ def health_items(app: str, cli: str) -> tuple[list, dict]:
     data["vpn"] = v
 
     # --- VPN: туннель реально работает? -------------------------------------
-    if not v.get("running"):
+    if not v.get("running") and (v.get("xray_alive") or v.get("sbox_alive")):
+        # Полумёртвый VPN: часть процессов жива, TUN поднят, трафик уходит в
+        # мёртвый socks — это поломка, а не намеренное выключение.
+        items.append({"id": "vpn", "name": "VPN", "state": "bad",
+                      "detail": "сломан: часть процессов жива (xray="
+                                + ("да" if v.get("xray_alive") else "нет")
+                                + ", sing-box=" + ("да" if v.get("sbox_alive") else "нет") + ")"})
+        data["exit_ip"] = ""
+    elif not v.get("running"):
         items.append({"id": "vpn", "name": "VPN", "state": "idle",
                       "detail": "выключен — трафик идёт напрямую"})
         data["exit_ip"] = ""
