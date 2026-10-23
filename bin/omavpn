@@ -202,6 +202,27 @@ def warn(msg: str) -> None:
     print(f"omavpn: {msg}", file=sys.stderr)
 
 
+def _num(value, default: int = 0, low: int | None = None, high: int | None = None) -> int:
+    """Безопасное целое из JSON/настроек — мусор не роняет `status()`.
+
+    Настройки, state.json и probe.json пишут разные процессы (CLI, виджет,
+    аудит), и один испорченный файл не должен превращать `--json status` в
+    трейсбек: виджет тогда считает, что VPN не установлен. `bool` отбрасываем —
+    True это не индекс, а случайное значение. `low`/`high` зажимают диапазон.
+    """
+    try:
+        if isinstance(value, bool):
+            raise TypeError
+        num = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if low is not None and num < low:
+        return low
+    if high is not None and num > high:
+        return high
+    return num
+
+
 def norm_domain(value: str) -> str:
     return value.strip().strip(".").lower()
 
@@ -364,12 +385,9 @@ def direct_domains() -> list:
         add(dom)
     for dom in BUILTIN_DIRECT_DOMAINS:
         add(dom)
-    try:
-        lines = DIRECT_DOMAINS_FILE.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        lines = DEFAULT_DIRECT_DOMAINS
-    for line in lines:
-        add(line.strip())
+    # Файл читается общим разборщиком: комментарии, пустые строки и мусор.
+    for dom in _direct_file_domains()[0]:
+        add(dom)
     for dom, ent in over.items():
         if ent["path"] == "direct":
             add(dom)
@@ -389,18 +407,43 @@ def fmt_age(seconds) -> str:
     return f"{seconds // 86400} д"
 
 
+def _parse_direct_lines(lines: list) -> list:
+    """Домены из direct_domains.txt: `#` — комментарий, в том числе в конце строки.
+
+    Докстринг файла обещал комментарии, а строки читались дословно: `example.com
+    # мой домен` и случайный мусор попадали в `domain_suffix` sing-box как есть.
+    Теперь строка режется по `#`, пустые пропускаются, а невалидная строка даёт
+    предупреждение в stderr (stdout занят JSON для виджета) и не попадает в конфиг.
+    """
+    out: list[str] = []
+    for raw in lines:
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        dom = norm_domain(line)
+        if not valid_domain(dom):
+            warn(f"{DIRECT_DOMAINS_FILE}: строка {raw.strip()!r} — не домен, пропускаю")
+            continue
+        if dom not in out:
+            out.append(dom)
+    return out
+
+
 def _direct_file_domains() -> tuple[list, bool]:
-    """(домены direct-правила, файл существует). '#' — комментарий."""
+    """(домены из файла, файл задан пользователем).
+
+    Существующий файл — источник истины, даже если он пустой: именно так
+    `zapret-autotune` в режиме `vpn` пишет «всё в туннель» (`set_direct ""`).
+    Если подставлять в этом случае DEFAULT, Discord/YouTube уходят напрямую —
+    то есть в блокировку, ровно там, где обход не работает. DEFAULT берём
+    только когда файла нет вовсе.
+    """
     try:
-        lines = DIRECT_DOMAINS_FILE.read_text(encoding="utf-8").splitlines()
+        raw = DIRECT_DOMAINS_FILE.read_text(encoding="utf-8")
     except OSError:
         return list(DEFAULT_DIRECT_DOMAINS), False
-    out = []
-    for line in lines:
-        dom = norm_domain(line)
-        if dom and not dom.startswith("#"):
-            out.append(dom)
-    return out, True
+    parsed = _parse_direct_lines(raw.splitlines())
+    return parsed, bool(raw.strip())
 
 
 def _rule_hit(dom: str, rule: list):
@@ -501,6 +544,32 @@ def _restart_after_route_change() -> tuple[bool, str]:
     return True, ""
 
 
+MAX_ROUTE_REASON = 200
+
+
+def _route_domain(domain: str) -> str:
+    """Проверенный домен для `route set`/`route unset` — одно поведение у обеих.
+
+    Раньше `route set` домен отвергал, а `route unset` молча нормализовал
+    (`..Example.COM ` снимал оверрайд `example.com`), то есть на невалидный ввод
+    две команды отвечали по-разному.
+    """
+    if not valid_domain(domain):
+        raise RuntimeError(
+            f"некорректный домен: {domain!r} — нужно обычное DNS-имя (например example.com): "
+            "без «*», IP, «#», пробелов, пустых меток (`a..b`), ведущей точки и кириллицы")
+    return norm_domain(domain)
+
+
+def _route_reason(reason: str) -> str:
+    """Причина оверрайда: обрезаем хвост, чтобы не раздувать файл и вывод."""
+    text = str(reason or "").strip()
+    if len(text) > MAX_ROUTE_REASON:
+        warn(f"причина длиннее {MAX_ROUTE_REASON} символов — обрезаю")
+        text = text[:MAX_ROUTE_REASON]
+    return text
+
+
 def route_set(domain: str, path: str, reason: str = "", restart: bool = True) -> dict:
     """Ставит оверрайд маршрута домена и (по умолчанию) перезапускает VPN.
 
@@ -511,15 +580,11 @@ def route_set(domain: str, path: str, reason: str = "", restart: bool = True) ->
     `example.com`. При `--no-restart` лок берётся с короткими повторами: аудит
     ставит правила пачкой, и секундный чужой лок не должен рушить всю пачку.
     """
-    if not valid_domain(domain):
-        raise RuntimeError(
-            f"некорректный домен: {domain!r} — нужно обычное DNS-имя (например example.com): "
-            "без «*», IP, «#», пробелов, пустых меток (`a..b`), ведущей точки и кириллицы")
-    dom = norm_domain(domain)
+    dom = _route_domain(domain)
     path = str(path).strip().lower()
     if path not in ROUTE_PATHS:
         raise RuntimeError(f"неизвестный путь: {path!r} (нужно proxy или direct)")
-    reason = reason.strip()
+    reason = _route_reason(reason)
     with ctrl_lock(0 if restart else 4):
         over = route_overrides()
         current = over.get(dom) or {}
@@ -538,10 +603,12 @@ def route_set(domain: str, path: str, reason: str = "", restart: bool = True) ->
 
 
 def route_unset(domain: str, restart: bool = True) -> dict:
-    """Снимает оверрайд домена (домен возвращается к обычному приоритету правил)."""
-    dom = norm_domain(domain)
-    if not dom:
-        raise RuntimeError("пустой домен")
+    """Снимает оверрайд домена (домен возвращается к обычному приоритету правил).
+
+    Домен проверяется так же, как в `route set`: обе команды должны одинаково
+    реагировать на `..Example.COM` и прочий мусор.
+    """
+    dom = _route_domain(domain)
     with ctrl_lock(0 if restart else 4):
         over = route_overrides()
         previous = over.pop(dom, None)
@@ -594,8 +661,13 @@ def save_json(path: Path, data) -> None:
 
 
 def settings() -> dict:
+    """Настройки; битый/чужой JSON не повод падать (иначе падает весь status)."""
+    data = load_json(SETTINGS, {})
     s = dict(DEFAULT_SETTINGS)
-    s.update(load_json(SETTINGS, {}))
+    if isinstance(data, dict):
+        s.update(data)
+    else:
+        warn(f"{SETTINGS}: ожидался объект настроек — беру умолчания")
     return s
 
 
@@ -607,8 +679,15 @@ def set_settings(**kw) -> dict:
 
 
 def fail(msg: str, code: int = 1):
-    print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False) if JSON_OUT else msg,
-          file=sys.stderr)
+    """Ошибка: JSON (при --json) — в stdout, текст — в stderr; rc≠0.
+
+    Потребители (`bypass-status`, виджет, аудит) читают stdout: JSON ошибки в
+    stderr они не видели и считали, что команда просто молча ничего не сделала.
+    """
+    if JSON_OUT:
+        print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False))
+    else:
+        print(msg, file=sys.stderr)
     sys.exit(code)
 
 
@@ -913,8 +992,10 @@ def fetch_sub() -> list:
 
 def get_configs() -> list:
     cache = load_json(SUBFILE, None)
-    if cache and cache.get("configs"):
-        return cache["configs"]
+    if isinstance(cache, dict):
+        configs = cache.get("configs")
+        if isinstance(configs, list) and configs:
+            return configs
     raise RuntimeError("нет данных подписки — выполните `omavpn update`")
 
 
@@ -986,6 +1067,10 @@ def nodes(profile_index: int) -> list:
 def server_endpoints(profile_index: int) -> tuple[list, list]:
     """(ip_cidr, domains) — куда Xray может дозваниваться напрямую."""
     configs = get_configs()
+    if not (0 <= profile_index < len(configs)):
+        raise RuntimeError(
+            f"профиль #{profile_index} не найден: в подписке профилей {len(configs)} — "
+            "список: `omavpn profiles`")
     ips, domains = [], []
     for o in node_outbounds(configs[profile_index]):
         _, address, _ = node_meta(o)
@@ -1007,7 +1092,9 @@ def server_endpoints(profile_index: int) -> tuple[list, list]:
 def build_xray(profile_index: int, node_index: int) -> dict:
     configs = get_configs()
     if not (0 <= profile_index < len(configs)):
-        raise RuntimeError("профиль не найден")
+        raise RuntimeError(
+            f"профиль #{profile_index} не найден: в подписке профилей {len(configs)} — "
+            "список: `omavpn profiles`")
     cfg = copy.deepcopy(configs[profile_index])
 
     for inb in cfg.get("inbounds", []):
@@ -1017,8 +1104,13 @@ def build_xray(profile_index: int, node_index: int) -> dict:
         elif inb.get("protocol") == "http":
             inb["port"] = HTTP_PORT
 
-    # ручной выбор ноды: заменяем правило с балансировщиком на outboundTag
-    if node_index is not None and node_index >= 0:
+    # ручной выбор ноды: заменяем правило с балансировщиком на outboundTag.
+    # Индекс зажимаем: он приходит из settings.json, а после `update` нод может
+    # стать меньше — IndexError здесь ломал бы каждый следующий запуск.
+    node_index = _num(node_index, -1)
+    if not (0 <= node_index < len(nodes(profile_index))):
+        node_index = -1
+    if node_index >= 0:
         tag = nodes(profile_index)[node_index]["tag"]
         for rule in cfg.get("routing", {}).get("rules", []):
             if "balancerTag" in rule:
@@ -1125,8 +1217,45 @@ def process_alive(pidfile: Path, marker: str) -> bool:
     return marker in cmdline
 
 
-def spawn(cmd: list, logfile: Path, pidfile: Path) -> int:
+LOG_MAX_BYTES = 2 * 1024 * 1024   # порог обрезки: 2 МБ
+LOG_KEEP_LINES = 5000             # столько последних строк оставляем
+
+
+def trim_log(path: Path, max_bytes: int = LOG_MAX_BYTES,
+             keep_lines: int = LOG_KEEP_LINES) -> None:
+    """Обрезает разросшийся лог, оставляя последние `keep_lines` строк.
+
+    Логи xray/sing-box никто не ротирует (процессы запускаются через spawn, а не
+    systemd), и за недели работы они уходят в десятки мегабайт, а `omavpn logs`
+    читал файл целиком. Правка идёт **на месте**, без переименования: процесс
+    держит лог открытым в режиме append, и после `os.replace` его записи уходили
+    бы в удалённый inode, а новый файл перестал бы расти.
+    """
+    try:
+        if path.stat().st_size <= max_bytes:
+            return
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-keep_lines:]
+        payload = ("\n".join(lines) + "\n").encode()
+        with path.open("r+b") as handle:
+            handle.seek(0)
+            handle.write(payload)
+            handle.truncate()
+    except FileNotFoundError:
+        return          # лога ещё нет — это норма (первый запуск, log_tail)
+    except OSError as exc:
+        warn(f"не удалось обрезать {path}: {exc}")
+
+
+def spawn(cmd: list, logfile: Path, pidfile: Path) -> subprocess.Popen:
+    """Запускает процесс и возвращает `Popen` — по нему видно, жив ли он.
+
+    Раньше возвращался только pid, и `on` считал VPN поднятым по открытому порту.
+    Порт мог держать старый xray или чужой процесс: новый падал на bind, а
+    `on` отвечал `{"ok": true, "running": true}` при мёртвом туннеле. Теперь
+    вызывающий проверяет `proc.poll()` в wait_port/wait_iface.
+    """
     logfile.parent.mkdir(parents=True, exist_ok=True)
+    trim_log(logfile)
     fd = os.open(logfile, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     os.chmod(logfile, 0o600)
     log = os.fdopen(fd, "ab", buffering=0)
@@ -1139,9 +1268,15 @@ def spawn(cmd: list, logfile: Path, pidfile: Path) -> int:
         cwd=str(STATE),
         start_new_session=True,
     )
-    pidfile.write_text(str(proc.pid))
-    os.chmod(pidfile, 0o600)
-    return proc.pid
+    # У ребёнка свой дубликат fd: в родителе файл больше не нужен, закрываем.
+    log.close()
+    # pid пишем атомарно (tmp + replace): половина числа в pid-файле означала бы
+    # «процесс чужой» и `off` не смог бы его погасить.
+    tmp = pidfile.with_suffix(pidfile.suffix + ".tmp")
+    tmp.write_text(str(proc.pid))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, pidfile)
+    return proc
 
 
 def stop_proc(pidfile: Path, marker: str, timeout: float = 6.0) -> None:
@@ -1156,10 +1291,21 @@ def stop_proc(pidfile: Path, marker: str, timeout: float = 6.0) -> None:
             pass
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if not Path(f"/proc/{pid}").exists():
+            stat = Path(f"/proc/{pid}/stat")
+            if not stat.exists():
+                break
+            # Зомби (/proc есть, процесс уже мёртв) не даёт выйти из цикла:
+            # ожидание съедало полный таймаут на каждом неудачном запуске.
+            try:
+                raw = stat.read_text()
+                if raw.rsplit(")", 1)[-1].split()[0] == "Z":
+                    break
+            except (OSError, IndexError):
                 break
             time.sleep(0.15)
-        if Path(f"/proc/{pid}").exists():
+        # Перепроверяем marker, а не только /proc/<pid>: за время ожидания pid
+        # мог быть переиспользован чужим процессом, и SIGKILL убил бы его.
+        if process_alive(pidfile, marker):
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
@@ -1167,40 +1313,159 @@ def stop_proc(pidfile: Path, marker: str, timeout: float = 6.0) -> None:
     pidfile.unlink(missing_ok=True)
 
 
-def wait_port(port: int, timeout: float) -> bool:
+PORT_SETTLE = 0.4   # пауза, за которую успевший упасть процесс себя выдаст
+
+
+def _listen_inodes(port: int) -> set:
+    """Все inode сокетов, слушающих порт (IPv4 и IPv6, любые адреса).
+
+    Раньше возвращался только первый найденный: если тот же порт слушал кто-то
+    ещё на другом адресе (127.0.0.2, ::1), настоящий владелец считался чужим и
+    `on` падал с «Xray не открыл порт» при живом xray.
+    """
+    found: set = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(table).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 10 or parts[3] != "0A":   # 0A — состояние LISTEN
+                continue
+            try:
+                local_port = int(parts[1].rsplit(":", 1)[1], 16)
+            except (IndexError, ValueError):
+                continue
+            if local_port == port:
+                found.add(parts[9])
+    return found
+
+
+def _listen_inode(port: int) -> str | None:
+    """Первый inode, слушающий порт (совместимость)."""
+    inodes = _listen_inodes(port)
+    return next(iter(inodes), None)
+
+
+def _owns_listen_port(pid: int, port: int) -> bool | None:
+    """Слушает ли порт именно наш процесс.
+
+    None — определить не удалось (нет /proc/net/tcp или прав): такой случай не
+    должен мешать запуску, поэтому вызывающий считает его «не False».
+    """
+    inodes = _listen_inodes(port)
+    if not inodes:
+        return None
+    targets = {f"socket:[{i}]" for i in inodes}
+    try:
+        fds = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            if fd.readlink().as_posix() in targets:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def wait_port(port: int, timeout: float, proc: subprocess.Popen | None = None) -> bool:
+    """Ждёт открытия порта; если процесс умер — сразу False.
+
+    Открытый порт сам по себе ничего не доказывает: его мог занять старый xray
+    или чужой процесс, а наш падает на bind. Поэтому при переданном `proc`
+    дополнительно проверяем, что листенер принадлежит именно ему (по inode
+    сокета), и держим settle-паузу: первый успешный коннект случается раньше,
+    чем падающий процесс успевает выйти.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.3)
             if s.connect_ex(("127.0.0.1", port)) == 0:
-                return True
+                if proc is None:
+                    return True
+                time.sleep(PORT_SETTLE)
+                if proc.poll() is not None:
+                    return False
+                if _owns_listen_port(proc.pid, port) is not False:
+                    return True
+                # порт держит кто-то другой — ждём, пока наш процесс займёт его сам
         time.sleep(0.2)
     return False
 
 
-def wait_iface(iface: str, timeout: float) -> bool:
+def wait_iface(iface: str, timeout: float, proc: subprocess.Popen | None = None) -> bool:
+    """Ждёт появления интерфейса; если процесс умер — сразу False (см. wait_port)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False
         if Path(f"/sys/class/net/{iface}").exists():
-            return True
+            if proc is None:
+                return True
+            # интерфейс мог остаться от прошлого запуска — даём процессу время упасть
+            time.sleep(PORT_SETTLE)
+            return proc.poll() is None
         time.sleep(0.2)
     return False
 
 
 def log_tail(path: Path, lines: int = 6) -> str:
+    """Последние строки лога: читаем хвост файла, а не весь лог целиком."""
+    trim_log(path)
     try:
-        data = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 256 * 1024))
+            data = handle.read().decode("utf-8", errors="replace")
     except OSError:
         return ""
-    return " | ".join(l.strip() for l in data[-lines:] if l.strip())
+    return " | ".join(l.strip() for l in data.splitlines()[-lines:] if l.strip())
 
 
 # --------------------------------------------------------------------------- #
 # жизненный цикл
 # --------------------------------------------------------------------------- #
 
+def _procs_alive() -> tuple[bool, bool]:
+    """(xray жив, sing-box жив) — по pid-файлам и маркеру командной строки."""
+    return process_alive(XRAY_PID, "xray"), process_alive(SB_PID, "sing-box")
+
+
+def _runtime_dict() -> dict:
+    """state.json как объект. Мусор (строка, список) не должен ронять status."""
+    st = load_json(RUNTIME, {})
+    return st if isinstance(st, dict) else {}
+
+
+def _active_mode() -> str:
+    """Режим запущенного VPN: из state.json, иначе из настроек."""
+    mode = str(_runtime_dict().get("mode") or settings().get("mode") or "tun")
+    return mode if mode in ("tun", "proxy") else "tun"
+
+
 def is_on() -> bool:
-    return process_alive(XRAY_PID, "xray") or process_alive(SB_PID, "sing-box")
+    """Работает ли VPN целиком.
+
+    В режиме tun нужны ОБА процесса: раньше хватало любого, и связка «умер xray,
+    жив sing-box» считалась включённой — TUN есть, трафик уходит в мёртвый socks,
+    а статус зелёный.
+    """
+    xray_alive, sbox_alive = _procs_alive()
+    if _active_mode() == "tun":
+        return xray_alive and sbox_alive
+    return xray_alive
+
+
+def is_running_any() -> bool:
+    """Жив ли хоть один процесс VPN (пара может быть неполной и требовать heal)."""
+    return any(_procs_alive())
 
 
 def cmd_off(quiet: bool = False) -> dict:
@@ -1209,6 +1474,7 @@ def cmd_off(quiet: bool = False) -> dict:
 
 
 def _cmd_off(quiet: bool = False) -> dict:
+    """Останавливает процессы. Печатает только main (через emit)."""
     stop_proc(SB_PID, "sing-box")
     stop_proc(XRAY_PID, "xray")
     st = load_json(RUNTIME, {})
@@ -1217,8 +1483,6 @@ def _cmd_off(quiet: bool = False) -> dict:
     # к нему отношения не имеют (иначе сторож решит, что VPN упал сам)
     st["last_error"] = ""
     save_json(RUNTIME, st)
-    if not quiet and not JSON_OUT:
-        print("Отключено")
     return {"ok": True, "running": False}
 
 
@@ -1228,16 +1492,56 @@ def cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
         return _cmd_on(profile_index, node_index, mode, quiet)
 
 
+def check_profile(profile_index) -> int:
+    """Индекс профиля с понятной ошибкой и подсказкой (`omavpn profiles`)."""
+    pro = profiles()
+    idx = _num(profile_index, 0)
+    if not (0 <= idx < len(pro)):
+        raise RuntimeError(
+            f"профиль #{idx} не найден: в подписке профилей {len(pro)} — список: `omavpn profiles`")
+    return idx
+
+
+def settings_profile() -> int:
+    """Текущий профиль из настроек, зажатый в диапазон подписки."""
+    try:
+        pro = profiles()
+    except RuntimeError:
+        return 0
+    idx = _num(settings().get("profile_index"), 0)
+    return idx if 0 <= idx < len(pro) else 0
+
+
+def check_node(profile_index: int, node_index) -> int:
+    """Нода: -1 (авто) или существующий индекс; иначе ошибка (`omavpn nodes`)."""
+    idx = _num(node_index, -1)
+    if idx < 0:
+        return -1
+    nd = nodes(profile_index)
+    if idx >= len(nd):
+        raise RuntimeError(
+            f"сервер #{idx} не найден: в профиле серверов {len(nd)} — список: `omavpn nodes`")
+    return idx
+
+
 def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
             quiet: bool = False) -> dict:
+    """Поднимает VPN. Печатает только main (через emit).
+
+    Профиль и нода проверяются ДО записи настроек: `omavpn node 99` раньше
+    сохранял индекс вне диапазона, и после этого падали все запуски (IndexError
+    в build_xray), включая guard, автозапуск и heal. Тот же эффект был после
+    `update`, когда нод в профиле становилось меньше.
+    """
     ensure_dirs()
     s = settings()
-    if profile_index is None:
-        profile_index = s["profile_index"]
-    if node_index is None:
-        node_index = s["node_index"]
+
     if mode is None:
-        mode = s["mode"]
+        mode = str(s.get("mode") or "tun")
+    mode = str(mode).strip().lower()
+    if mode not in ("tun", "proxy"):
+        warn(f"неизвестный режим {mode!r} — беру tun")
+        mode = "tun"
 
     if not XRAY_BIN.exists():
         raise RuntimeError("Xray не установлен — запустите install.sh")
@@ -1245,8 +1549,26 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
         raise RuntimeError("sing-box не установлен — запустите install.sh")
 
     configs = get_configs()
-    if not (0 <= profile_index < len(configs)) or not node_outbounds(configs[profile_index]):
-        raise RuntimeError("профиль не найден или в нём нет серверов")
+
+    if profile_index is not None:
+        profile_index = check_profile(profile_index)
+    else:
+        # сохранённый профиль мог исчезнуть после `update` — берём первый
+        profile_index = _num(s.get("profile_index"), 0)
+        if not (0 <= profile_index < len(configs)):
+            warn(f"сохранённый профиль #{profile_index} пропал из подписки — беру первый")
+            profile_index = 0
+    if not node_outbounds(configs[profile_index]):
+        raise RuntimeError(
+            f"в профиле #{profile_index} нет серверов — выберите другой: `omavpn profiles`")
+
+    if node_index is not None:
+        node_index = check_node(profile_index, node_index)
+    else:
+        node_index = _num(s.get("node_index"), -1)
+        if node_index >= len(nodes(profile_index)):
+            warn(f"сохранённый сервер #{node_index} пропал из профиля — беру авто")
+            node_index = -1
 
     set_settings(profile_index=profile_index, node_index=node_index, mode=mode)
 
@@ -1264,25 +1586,30 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
         if err:
             raise RuntimeError(f"конфиг sing-box отклонён: {err}")
 
-    cmd_off(quiet=True)
+    _cmd_off(quiet=True)
 
     last_error = ""
     try:
-        spawn([str(XRAY_BIN), "run", "-c", str(XRAY_CFG)], XRAY_LOG, XRAY_PID)
-        if not wait_port(SOCKS_PORT, 6):
+        xray_proc = spawn([str(XRAY_BIN), "run", "-c", str(XRAY_CFG)], XRAY_LOG, XRAY_PID)
+        if not wait_port(SOCKS_PORT, 6, xray_proc):
             raise RuntimeError("Xray не открыл SOCKS-порт: " + log_tail(XRAY_LOG))
         if mode == "tun":
-            spawn([str(SB_BIN), "run", "-c", str(SB_CFG)], SB_LOG, SB_PID)
-            if not wait_iface(TUN_IFACE, 8):
+            sb_proc = spawn([str(SB_BIN), "run", "-c", str(SB_CFG)], SB_LOG, SB_PID)
+            if not wait_iface(TUN_IFACE, 8, sb_proc):
                 raise RuntimeError("TUN не поднялся: " + log_tail(SB_LOG))
     except Exception as exc:  # noqa: BLE001
         last_error = str(exc)
         stop_proc(SB_PID, "sing-box")
         stop_proc(XRAY_PID, "xray")
-        save_json(RUNTIME, {"running": False, "last_error": last_error})
+        # merge, а не замена: иначе теряются last_heal (троттл heal), started_at
+        # и mode, которые пишут другие команды.
+        st = load_json(RUNTIME, {})
+        st.update({"running": False, "last_error": last_error})
+        save_json(RUNTIME, st)
         raise
 
-    save_json(RUNTIME, {
+    st = load_json(RUNTIME, {})
+    st.update({
         "running": True,
         "mode": mode,
         "profile_index": profile_index,
@@ -1290,10 +1617,10 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
         "started_at": time.time(),
         "last_error": "",
     })
-    if not quiet and not JSON_OUT:
-        name = profiles()[profile_index]["name"]
-        print(f"Подключено · {name}" + (" · TUN" if mode == "tun" else " · SOCKS/HTTP"))
-    return {"ok": True, "running": True}
+    save_json(RUNTIME, st)
+    return {"ok": True, "running": True, "mode": mode,
+            "profile_index": profile_index, "node_index": node_index,
+            "profile_name": profiles()[profile_index]["name"]}
 
 
 # --------------------------------------------------------------------------- #
@@ -1315,31 +1642,50 @@ def caps_ok() -> bool:
 
 
 def status() -> dict:
+    """Состояние для виджета. Не падает никогда: любой мусор → валидный JSON.
+
+    На входе бывают: отрицательный или нечисловой `profile_index`, `node_index`
+    строкой, `pid: "abc"` в probe.json, `sub.json` со списком вместо объекта.
+    Раньше каждый такой случай давал трейсбек, и виджет решал, что VPN вообще
+    не установлен. Теперь всё читается безопасными геттерами.
+    """
     ensure_dirs()
     s = settings()
     st = load_json(RUNTIME, {})
+    if not isinstance(st, dict):
+        st = {}
+    xray_alive, sbox_alive = _procs_alive()
+    mode = str(s.get("mode") or "tun")
+    if mode not in ("tun", "proxy"):
+        mode = "tun"
     running = is_on()
     try:
         pro = profiles()
-    except RuntimeError:
+    except (RuntimeError, OSError, ValueError):
         pro = []
-    pi = s["profile_index"]
-    if pi >= len(pro):
+    pi = _num(s.get("profile_index"), 0)
+    if not (0 <= pi < len(pro)):
         pi = 0
-    ni = s["node_index"]
+    ni = _num(s.get("node_index"), -1)
     try:
         nd = nodes(pi) if pro else []
-    except RuntimeError:
+    except (RuntimeError, OSError, ValueError):
         nd = []
     rx, tx = iface_stats() if running else (0, 0)
-    uptime = int(time.time() - st["started_at"]) if running and st.get("started_at") else 0
+    started_at = _num(st.get("started_at"), 0)
+    uptime = max(0, int(time.time() - started_at)) if running and started_at > 0 else 0
     installed = XRAY_BIN.exists() and SB_BIN.exists()
+    sub = load_json(SUBFILE, {})
+    updated = _num(sub.get("updated"), 0) if isinstance(sub, dict) else 0
     return {
         "ok": True,
         "installed": installed,
         "running": running,
+        # раздельно: в режиме tun нужны оба, и виджет должен видеть, кто умер
+        "xray_alive": xray_alive,
+        "sbox_alive": sbox_alive,
         "caps_ok": caps_ok(),
-        "mode": s["mode"],
+        "mode": mode,
         "strict_route": bool(s.get("strict_route", False)),
         "profile_index": pi,
         "profile_name": pro[pi]["name"] if pro else "",
@@ -1351,31 +1697,72 @@ def status() -> dict:
         "socks_port": SOCKS_PORT,
         "http_port": HTTP_PORT,
         "tun_iface": TUN_IFACE,
-        "last_error": st.get("last_error", ""),
-        "updated": load_json(SUBFILE, {}).get("updated", 0),
+        "last_error": str(st.get("last_error") or ""),
+        "updated": updated,
         "profiles": pro,
-        "nodes": nodes(pi),
+        "nodes": nd,
         "probe": probe_state(),
     }
 
 
+def status_text(st: dict) -> str:
+    """Короткая человеческая строка `omavpn status` (печатает только main)."""
+    if not st.get("installed"):
+        return "не установлен: нет бинарей xray/sing-box — запустите install.sh"
+    if not st.get("running"):
+        reason = str(st.get("last_error") or "")
+        return "выключен" + (f" · последняя ошибка: {reason}" if reason else "")
+    parts = [
+        "подключён",
+        f"профиль {st.get('profile_name') or '—'}",
+        f"нода {st.get('node_name') or 'auto'}",
+        str(st.get("mode") or ""),
+        f"аптайм {fmt_age(st.get('uptime'))}",
+    ]
+    if not st.get("xray_alive", True):
+        parts.append("xray не работает")
+    if str(st.get("mode")) == "tun" and not st.get("sbox_alive", True):
+        parts.append("sing-box не работает — туннеля нет")
+    return " · ".join(part for part in parts if part)
+
+
 def check() -> dict:
     url = "https://api.ipify.org"
-    direct = subprocess.run(
-        ["curl", "-s", "--max-time", "12", url],
-        capture_output=True, text=True).stdout.strip()
+    if shutil.which("curl") is None:
+        return {"ok": False, "error": "curl не найден — внешний IP не проверить"}
+    direct = _run_out(["curl", "-s", "--max-time", "12", url], 15).strip()
     if not is_on():
         return {"ok": False, "error": "не подключено", "direct_ip": direct}
-    proxied = subprocess.run(
-        ["curl", "-s", "--max-time", "20", "--socks5-hostname",
-         f"127.0.0.1:{SOCKS_PORT}", url],
-        capture_output=True, text=True).stdout.strip()
+    proxied = _run_out(["curl", "-s", "--max-time", "20", "--socks5-hostname",
+                        f"127.0.0.1:{SOCKS_PORT}", url], 23).strip()
     return {
         "ok": bool(proxied),
         "direct_ip": direct,
         "proxy_ip": proxied,
         "changed": bool(proxied) and proxied != direct,
     }
+
+
+def check_text(res: dict) -> str:
+    """Короткая человеческая строка `omavpn check` (печатает только main)."""
+    if res.get("error"):
+        return str(res["error"])
+    if not res.get("ok"):
+        return f"через VPN ответа нет · прямой IP: {res.get('direct_ip') or '—'}"
+    return (f"прямой IP: {res.get('direct_ip') or '—'} · через VPN: {res.get('proxy_ip')}"
+            + (" · IP изменился" if res.get("changed") else " · IP не изменился"))
+
+
+def on_text(res: dict) -> str:
+    """Человеческая строка `omavpn on`/`toggle` (печатает только main)."""
+    name = str(res.get("profile_name") or "")
+    mode = str(res.get("mode") or "")
+    text = "Подключено" + (f" · {name}" if name else "")
+    if mode == "tun":
+        text += " · TUN"
+    elif mode:
+        text += " · SOCKS/HTTP"
+    return text
 
 
 # --------------------------------------------------------------------------- #
@@ -1396,13 +1783,13 @@ def _free_port(start: int, tries: int = 200) -> int:
 def probe_running() -> bool:
     """Идёт ли тест серверов прямо сейчас (по файлу прогресса)."""
     data = load_json(PROBE_FILE, {})
-    if not data.get("running"):
+    if not isinstance(data, dict) or not data.get("running"):
         return False
-    pid = int(data.get("pid") or 0)
+    pid = _num(data.get("pid"), 0)
     if pid > 0 and Path(f"/proc/{pid}").exists():
         return True
     # файл только что обновлён, а pid ещё не виден — считаем, что тест идёт
-    return (time.time() - float(data.get("updated") or 0)) < 20
+    return (time.time() - _num(data.get("updated"), 0)) < 20
 
 
 def _save_probe(state: dict) -> None:
@@ -1455,17 +1842,34 @@ def _probe_once(port: int, url: str, timeout: float):
 
 def probe_node(profile_index: int, node_index: int, probes: int, url: str,
                timeout: float) -> dict:
-    """Поднимает временный Xray с одной нодой и меряет её реальные пробы."""
+    """Поднимает временный Xray с одной нодой и меряет её реальные пробы.
+
+    Каждая проба идёт в собственном каталоге: раньше все писали в общие
+    `probe/node.json` и `probe/node.log`, и два одновременных теста (виджет и
+    CLI) затирали друг другу конфиг и лог — результат был случайным.
+    """
+    PROBE_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = int(time.time() * 1000) % 10 ** 6
+    workdir = PROBE_DIR / f"node-{os.getpid()}-{_num(node_index, 0)}-{stamp}"
+    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        return _probe_node_in(profile_index, node_index, probes, url, timeout, workdir)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _probe_node_in(profile_index: int, node_index: int, probes: int, url: str,
+                   timeout: float, workdir: Path) -> dict:
+    """Тело probe_node: работает в своём временном каталоге `workdir`."""
     nd = nodes(profile_index)[node_index]
     result = {"index": node_index, "tag": nd["tag"], "detail": nd["detail"],
               "address": nd["address"], "dead": True, "note": "", "probes": probes,
               "ok_count": 0, "loss": probes, "med": None, "p90": None, "max": None,
               "tls_med": None, "score": None, "secs": 0.0}
     started = time.time()
-    PROBE_DIR.mkdir(parents=True, exist_ok=True)
     port = _free_port(PROBE_PORT_BASE)
-    cfg_path = PROBE_DIR / "node.json"
-    log_path = PROBE_DIR / "node.log"
+    cfg_path = workdir / "node.json"
+    log_path = workdir / "node.log"
 
     cfg = build_xray(profile_index, node_index)
     cfg.pop("observatory", None)
@@ -1544,10 +1948,10 @@ def probe_all(profile_index: int | None = None, probes: int = PROBE_DEFAULT_PROB
         return {"ok": False, "error": "тест серверов уже идёт"}
     s = settings()
     if profile_index is None:
-        profile_index = int(s.get("profile_index") or 0)
+        profile_index = _num(s.get("profile_index"), 0)
     pro = profiles()
     if not (0 <= profile_index < len(pro)):
-        raise RuntimeError("профиль не найден")
+        raise RuntimeError(f"профиль #{profile_index} не найден — список: `omavpn profiles`")
     nd = nodes(profile_index)
     if node_index is not None:
         if not (0 <= node_index < len(nd)):
@@ -1594,9 +1998,9 @@ def probe_state() -> dict:
     if not isinstance(data, dict):
         return {}
     if data.get("running"):
-        pid = int(data.get("pid") or 0)
+        pid = _num(data.get("pid"), 0)
         if not (pid > 0 and Path(f"/proc/{pid}").exists()) \
-                and (time.time() - float(data.get("updated") or 0)) > 30:
+                and (time.time() - _num(data.get("updated"), 0)) > 30:
             data["running"] = False
             data["stale"] = True
     return data
@@ -1698,49 +2102,87 @@ def _proxy_ok(timeout: float = 8.0) -> bool:
         return False
 
 
-def heal(min_gap: float = 600.0, probes: int = 3, timeout: float = 4.0) -> dict:
-    """Самовосстановление VPN: перезапуск, при неудаче — лучшая нода текущего профиля.
+HEAL_DEADLINE = 150.0   # бюджет одного прогона heal, с
+
+
+def heal(min_gap: float = 600.0, probes: int = 3, timeout: float = 4.0,
+         deadline: float = HEAL_DEADLINE) -> dict:
+    """Самовосстановление VPN: перезапуск, при неудаче — лучшая нода профиля.
 
     Вызывается из монитора работоспособности (bypass-status --health), поэтому
     ограничен по частоте: не чаще одного раза в min_gap секунд.
+
+    Бюджет и лок: прогон укладывается в `deadline` (по умолчанию 150 с — меньше
+    внешних таймаутов 180–240 с), весь цикл идёт под ОДНИМ ctrl_lock, а
+    `_mark_heal` пишется в начале ремонта. Раньше лок брался дважды (off и on),
+    отметка ставилась только в конце, и по таймауту прогон убивали: троттл не
+    записан, следующий тик снова рвал туннель.
     """
-    if not is_on():
+    if not is_on() and not is_running_any():
         return {"ok": False, "reason": "vpn_off", "actions": []}
-    st = load_json(RUNTIME, {})
-    last = float(st.get("last_heal") or 0)
-    if time.time() - last < min_gap:
-        return {"ok": False, "reason": "throttled", "actions": [],
-                "retry_in": int(min_gap - (time.time() - last))}
-    actions: list[str] = []
-    if _proxy_ok():
-        return {"ok": True, "actions": ["туннель в порядке"], "checked": True}
-    actions.append("перезапуск VPN")
-    cmd_off(quiet=True)
-    try:
-        cmd_on(None, None, None, quiet=True)
-    except Exception as exc:  # noqa: BLE001
-        actions.append(f"перезапуск не удался: {exc}")
-    if _proxy_ok():
+    started = time.time()
+
+    def left() -> float:
+        return deadline - (time.time() - started)
+
+    with ctrl_lock():
+        st = load_json(RUNTIME, {})
+        if not isinstance(st, dict):
+            st = {}
+        last = _num(st.get("last_heal"), 0)
+        if time.time() - last < min_gap:
+            return {"ok": False, "reason": "throttled", "actions": [],
+                    "retry_in": int(min_gap - (time.time() - last))}
+        actions: list[str] = []
+        if _proxy_ok():
+            return {"ok": True, "actions": ["туннель в порядке"], "checked": True}
+        # Отметку ставим ДО дорогой части: прогон могут убить по таймауту, и без
+        # неё следующий тик немедленно начнёт всё заново.
         _mark_heal(actions)
-        return {"ok": True, "actions": actions}
-    # перезапуск не помог — пробуем ноды текущего профиля и переключаемся
-    try:
-        s = settings()
-        nd = nodes(s["profile_index"])
-        results = []
-        for n in nd:
-            results.append(probe_node(s["profile_index"], n["index"], probes, PROBE_URL, timeout))
-        alive = sorted((r for r in results if not r["dead"]), key=lambda r: r["score"])
-        if alive:
-            set_settings(node_index=alive[0]["index"])
-            actions.append("переключение на " + alive[0]["tag"])
-            cmd_on(None, alive[0]["index"], None, quiet=True)
-    except Exception as exc:  # noqa: BLE001
-        actions.append(f"перебор нод не удался: {exc}")
-    ok = _proxy_ok()
-    actions.append("туннель восстановлен" if ok else "туннель не восстановлен")
-    _mark_heal(actions)
-    return {"ok": ok, "actions": actions}
+        actions.append("перезапуск VPN")
+        _cmd_off(quiet=True)
+        try:
+            _cmd_on(None, None, None, quiet=True)
+        except Exception as exc:  # noqa: BLE001
+            actions.append(f"перезапуск не удался: {exc}")
+        if _proxy_ok():
+            _mark_heal(actions)
+            return {"ok": True, "actions": actions}
+        # перезапуск не помог — пробуем ноды текущего профиля и переключаемся
+        deadline_hit = False
+        try:
+            s = settings()
+            pi = _num(s.get("profile_index"), 0)
+            nd = nodes(pi)
+            results = []
+            for n in nd:
+                budget = left()
+                if budget <= 0:
+                    deadline_hit = True
+                    break
+                # таймаут одной пробы урезаем под остаток бюджета: иначе пробы
+                # 14 нод при внешнем таймауте 180–240 с прогон не заканчивали
+                per_probe = max(0.5, min(timeout, (budget - 1.0) / max(1, probes)))
+                results.append(probe_node(pi, n["index"], probes, PROBE_URL, per_probe))
+            if left() <= 0:
+                deadline_hit = True
+            alive = sorted((r for r in results if not r["dead"]), key=lambda r: r["score"])
+            if alive:
+                set_settings(node_index=alive[0]["index"])
+                actions.append("переключение на " + alive[0]["tag"])
+                if left() > 0:
+                    _cmd_on(None, alive[0]["index"], None, quiet=True)
+        except Exception as exc:  # noqa: BLE001
+            actions.append(f"перебор нод не удался: {exc}")
+        ok = _proxy_ok() if left() > 0 else False
+        actions.append("туннель восстановлен" if ok else "туннель не восстановлен")
+        _mark_heal(actions)
+        if not ok and deadline_hit:
+            # бюджет кончился: честно говорим об этом, а не «не восстановлен»
+            actions.append(f"дедлайн {int(deadline)} с — перебор нод прерван")
+            return {"ok": False, "reason": "deadline", "actions": actions,
+                    "deadline": int(deadline)}
+        return {"ok": ok, "actions": actions}
 
 
 def _mark_heal(actions: list) -> None:
@@ -1842,13 +2284,15 @@ def main(argv: list) -> int:
             emit({"ok": True, "profiles": pro},
                  "\n".join(f"{x['index']}: {x['name']} ({x['node_count']})" for x in pro))
         elif args.cmd == "nodes":
-            nd = nodes(settings()["profile_index"])
+            nd = nodes(settings_profile())
             emit({"ok": True, "nodes": nd},
                  "\n".join(f"{x['index']}: {x['tag']} · {x['detail']}" for x in nd))
         elif args.cmd == "status":
-            emit(status())
+            st = status()
+            emit(st, status_text(st))
         elif args.cmd == "on":
-            emit(cmd_on(None, None, None), "Подключено")
+            res = cmd_on(None, None, None)
+            emit(res, on_text(res))
         elif args.cmd == "off":
             emit(cmd_off(), "Отключено")
         elif args.cmd == "restart":
@@ -1860,29 +2304,36 @@ def main(argv: list) -> int:
             if is_on():
                 emit(cmd_off(), "Отключено")
             else:
-                emit(cmd_on(None, None, None), "Подключено")
+                res = cmd_on(None, None, None)
+                emit(res, on_text(res))
         elif args.cmd == "profile":
-            set_settings(profile_index=args.index, node_index=-1)
+            # проверка ДО записи: иначе индекс вне диапазона ломал все запуски
+            idx = check_profile(args.index)
+            set_settings(profile_index=idx, node_index=-1)
             if is_on():
-                cmd_on(args.index, -1, None, quiet=True)
-            emit({"ok": True, "profile_index": args.index}, f"Профиль: {args.index}")
+                cmd_on(idx, -1, None, quiet=True)
+            emit({"ok": True, "profile_index": idx}, f"Профиль: {idx}")
         elif args.cmd == "node":
-            set_settings(node_index=args.index)
+            idx = check_node(settings_profile(), args.index)
+            set_settings(node_index=idx)
             if is_on():
-                cmd_on(None, args.index, None, quiet=True)
-            emit({"ok": True, "node_index": args.index}, f"Нода: {args.index}")
+                cmd_on(None, idx, None, quiet=True)
+            emit({"ok": True, "node_index": idx}, f"Нода: {idx}")
         elif args.cmd == "mode":
             set_settings(mode=args.value)
             if is_on():
                 cmd_on(None, None, args.value, quiet=True)
             emit({"ok": True, "mode": args.value}, f"Режим: {args.value}")
         elif args.cmd == "strict":
-            set_settings(strict_route=(args.value == "on"))
+            strict_on = args.value == "on"
+            set_settings(strict_route=strict_on)
             if is_on():
                 cmd_on(None, None, None, quiet=True)
-            emit({"ok": True, "strict_route": args.value == "on"})
+            emit({"ok": True, "strict_route": strict_on},
+                 f"strict_route: {'включён' if strict_on else 'выключен'}")
         elif args.cmd == "check":
-            emit(check())
+            res = check()
+            emit(res, check_text(res))
         elif args.cmd == "logs":
             tail = {"xray": log_tail(XRAY_LOG, 40), "sing-box": log_tail(SB_LOG, 40)}
             emit({"ok": True, **tail}, f"xray: {tail['xray']}\n\nsing-box: {tail['sing-box']}")
@@ -1911,6 +2362,9 @@ def main(argv: list) -> int:
                                else " · " + (res["note"] or "без перезапуска")))
                 emit(res, text)
             else:
+                # под --json справка в stdout ломала бы разбор JSON у потребителей
+                if JSON_OUT:
+                    fail("route: не указана подкоманда (list | set | unset)", 2)
                 srt.print_help()
                 return 0
         elif args.cmd == "best":
@@ -1942,12 +2396,19 @@ def main(argv: list) -> int:
                              f"({res['best']['med']}s)")
             emit(res, "\n".join(lines) or str(res.get("error") or "тест не выполнен"))
         else:
+            # --json без команды: справка в stdout ломала разбор JSON → ошибка + rc=2
+            if JSON_OUT:
+                fail("не указана команда (см. omavpn --help)", 2)
             p.print_help()
             return 0
     except RuntimeError as exc:
         fail(str(exc))
     except urllib.error.URLError as exc:  # noqa: F821
         fail(f"сеть недоступна: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        # последняя страховка: под --json потребитель должен получить JSON, а не
+        # трейсбек — иначе виджет решает, что VPN не установлен
+        fail(f"{type(exc).__name__}: {exc}")
     return 0
 
 

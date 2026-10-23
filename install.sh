@@ -85,9 +85,29 @@ else
 fi
 
 # --- capabilities для TUN ----------------------------------------------------
-say "Выдаю CAP_NET_ADMIN бинарю sing-box (нужен sudo)…"
-sudo setcap cap_net_admin,cap_net_raw+ep "$BIN_DIR/sing-box"
-getcap "$BIN_DIR/sing-box" || true
+# Недоступный root больше не рвёт установку на середине (CLI, таймеры и виджет
+# ещё не поставлены): без caps не работает только TUN, поэтому предупреждаем и
+# идём дальше. Порядок — от самого дешёвого к самому навязчивому: sudo без
+# пароля, sudo с вводом пароля (только в терминале), pkexec (только с потолком
+# по времени — без polkit-агента он висит, ожидая подтверждения).
+say "Выдаю CAP_NET_ADMIN бинарю sing-box (нужен root)…"
+CAPS_OK=0
+CAPS_CMD=(setcap cap_net_admin,cap_net_raw+ep "$BIN_DIR/sing-box")
+if sudo -n "${CAPS_CMD[@]}" 2>/dev/null; then
+  CAPS_OK=1
+elif [ -t 0 ] && [ -t 1 ] && sudo "${CAPS_CMD[@]}"; then
+  CAPS_OK=1
+elif command -v pkexec >/dev/null 2>&1 &&
+     timeout 90 pkexec "${CAPS_CMD[@]}"; then
+  CAPS_OK=1
+fi
+if [ "$CAPS_OK" = 1 ]; then
+  getcap "$BIN_DIR/sing-box" || true
+else
+  warn "Не удалось выдать CAP_NET_ADMIN (sudo/pkexec недоступны)."
+  warn "Выдай вручную, иначе TUN не поднимется:"
+  warn "  sudo setcap cap_net_admin,cap_net_raw+ep $BIN_DIR/sing-box"
+fi
 
 # --- CLI --------------------------------------------------------------------
 say "Ставлю CLI в $LOCAL_BIN/omavpn"
@@ -179,6 +199,10 @@ Type=oneshot
 ExecStart=%h/.local/bin/omavpn-guard --autostart
 RemainAfterExit=yes
 TimeoutStartSec=180
+# KillMode=process, как у guard/аудита: omavpn поднимает xray и sing-box из
+# cgroup этого юнита, и без process они умерли бы вместе с oneshot-запуском,
+# то есть VPN ложился бы сразу после автозапуска.
+KillMode=process
 
 [Install]
 WantedBy=graphical-session.target

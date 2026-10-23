@@ -32,6 +32,9 @@ UID_N=""
 OMAVPN="$USER_HOME/.local/bin/omavpn"
 DIRECT_FILE="$USER_HOME/.config/omavpn/direct_domains.txt"
 DIRECT_CHANGED=0
+# 1 — встроенный direct-список omavpn прочитан успешно (только тогда, если
+# список пуст, можно удалять файл пользователя).
+FULL_DIRECT_OK=0
 
 # Изолированный пробник: отдельный системный пользователь, чей трафик уходит
 # напрямую (ip rule uidrange -> main). Боевой трафик при этом не трогается:
@@ -351,8 +354,11 @@ ensure_zapret_on() {
 zapret_off() { systemctl stop zapret.service >/dev/null 2>&1 || true; }
 
 # --- omavpn -----------------------------------------------------------------
+# Возвращает встроенный direct-список omavpn. rc ≠ 0 — импорт не удался
+# (нет пользователя, упал python, сломан CLI): пустой вывод при этом НЕ значит
+# «список пуст», и стирать по нему файл пользователя нельзя.
 full_direct() {
-  [ -n "$USER_NAME" ] || return 0
+  [ -n "$USER_NAME" ] || return 1
   runuser -u "$USER_NAME" -- env HOME="$USER_HOME" python3 - "$OMAVPN" <<'PY' 2>/dev/null
 import importlib.machinery, importlib.util, sys
 p = sys.argv[1]
@@ -365,13 +371,22 @@ PY
 
 # Запись в файл пользователя выполняется от его UID (runuser): root не должен
 # следовать по пользовательской симлинк-ссылке и менять владельца её цели.
+# Пишем атомарно (mktemp рядом с целью + mv), как это делает guard: запись
+# через `tee` в сам файл оставляла его обрезанным, если процесс убивали посередине.
 user_write() { # stdin -> файл $1, от имени $USER_NAME
   [ -n "$USER_NAME" ] || return 1
-  runuser -u "$USER_NAME" -- tee "$1" >/dev/null
-}
-user_remove() {
-  [ -n "$USER_NAME" ] || return 0
-  runuser -u "$USER_NAME" -- rm -f -- "$1" 2>/dev/null || true
+  local target="$1" dir tmp
+  dir="$(dirname "$target")"
+  runuser -u "$USER_NAME" -- mkdir -p "$dir" 2>/dev/null || return 1
+  tmp="$(runuser -u "$USER_NAME" -- mktemp "$dir/.$(basename "$target").XXXXXX" 2>/dev/null)" || return 1
+  [ -n "$tmp" ] || return 1
+  if runuser -u "$USER_NAME" -- tee "$tmp" >/dev/null 2>&1; then
+    if runuser -u "$USER_NAME" -- mv -f "$tmp" "$target" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  runuser -u "$USER_NAME" -- rm -f "$tmp" 2>/dev/null || true
+  return 1
 }
 
 # ensure_direct <содержимое>; ставит DIRECT_CHANGED
@@ -380,18 +395,33 @@ ensure_direct() {
   [ -n "$USER_NAME" ] || return 0
   cur="$(runuser -u "$USER_NAME" -- cat "$DIRECT_FILE" 2>/dev/null)"
   if [ "$cur" = "$content" ]; then DIRECT_CHANGED=0; return 0; fi
-  printf '%s\n' "$content" | user_write "$DIRECT_FILE"
-  DIRECT_CHANGED=1
-}
-ensure_direct_all() {
-  local content; content="$(full_direct)"
-  if [ -n "$content" ]; then
-    ensure_direct "$content"
-  elif [ -f "$DIRECT_FILE" ]; then
-    user_remove "$DIRECT_FILE"; DIRECT_CHANGED=1
-  else
-    DIRECT_CHANGED=0
+  if printf '%s\n' "$content" | user_write "$DIRECT_FILE"; then
+    DIRECT_CHANGED=1
+    return 0
   fi
+  log "не удалось записать $DIRECT_FILE — оставил как есть"
+  DIRECT_CHANGED=0
+  return 1
+}
+# Полный встроенный список. Файл пользователя удаляем ТОЛЬКО при явно удачном
+# импорте (FULL_DIRECT_OK=1): раньше упавший импорт давал пустой вывод, и
+# рабочий direct-список молча стирался — YouTube уезжал в VPN, где видео не идёт.
+ensure_direct_all() {
+  local content rc
+  FULL_DIRECT_OK=0
+  if [ -z "$USER_NAME" ]; then
+    log "USER_NAME не задан — direct_domains.txt не трогаю"
+    DIRECT_CHANGED=0
+    return 1
+  fi
+  content="$(full_direct)"; rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$content" ]; then
+    log "импорт встроенного direct-списка не удался (код $rc) — файл пользователя не трогаю"
+    DIRECT_CHANGED=0
+    return 1
+  fi
+  FULL_DIRECT_OK=1
+  ensure_direct "$content"
 }
 ensure_direct_min() { ensure_direct "max.ru"; }
 
@@ -621,6 +651,12 @@ apply_cached() { # $1 = стратегия из кэша, $2 = ключ сети
     ''|*[!0-9]*)
       return 1 ;;
     *)
+      # Индекс приходит из файла кэша: его могли править руками, а STRATEGIES
+      # между версиями короче. "${STRATEGIES[$strat]}" под set -u — фатальная
+      # ошибка, и autotune (а с ним и весь перебор) умирал молча навсегда.
+      case "$strat" in *[!0-9]*|'') return 1 ;; esac
+      strat=$(( 10#$strat ))
+      [ "$strat" -lt "${#STRATEGIES[@]}" ] || return 1
       set_direct "$direct"; apply_direct_change
       if set_opt "$(build_opt "${STRATEGIES[$strat]}" "$svc")"; then activate; else ensure_zapret_on; fi
       test_targets ;;

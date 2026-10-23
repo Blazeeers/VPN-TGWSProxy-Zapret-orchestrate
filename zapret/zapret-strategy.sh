@@ -90,11 +90,16 @@ EOF
 }
 
 apply_preset() {
-  local name="$1" opt
-  opt="$(preset_text "$name")"
+  local name="$1" opt optf rc
+  opt="$(preset_text "$name")" || return 1
   cp -a "$CFG" "$CFG.bak.strategy.$(date +%Y%m%d-%H%M%S)"
-  printf '%s\n' "$opt" > /tmp/zapret-nfqws-opt.txt
-  python3 - "$CFG" /tmp/zapret-nfqws-opt.txt <<'PY'
+  # Файл с опцией — только через mktemp: раньше писали в фиксированный
+  # /tmp/zapret-nfqws-opt.txt от root, и подсунутая заранее симлинк-ссылка
+  # уводила запись в любой файл системы.
+  optf="$(mktemp "${TMPDIR:-/tmp}/zapret-nfqws-opt.XXXXXX")" || return 1
+  trap 'rm -f "$optf"' EXIT
+  printf '%s\n' "$opt" > "$optf"
+  if python3 - "$CFG" "$optf" <<'PY'
 import re, sys
 cfg, optf = sys.argv[1], sys.argv[2]
 opt = open(optf).read().strip()
@@ -105,6 +110,14 @@ else:
     text = text.rstrip() + '\nNFQWS_OPT="' + opt + '"\n'
 open(cfg, 'w').write(text)
 PY
+  then
+    rc=0
+  else
+    rc=$?
+  fi
+  rm -f "$optf"
+  trap - EXIT
+  [ "$rc" -eq 0 ] || { echo "Не удалось записать NFQWS_OPT в $CFG (код $rc)" >&2; return 1; }
   systemctl restart zapret.service
   sleep 3
 }

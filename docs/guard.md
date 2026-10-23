@@ -145,3 +145,11 @@ omavpn --json status | python3 -m json.tool | head -20
 tail -40 /var/log/zapret-autotune.log
 systemctl --user list-timers omavpn-guard.timer
 ```
+
+### Живость VPN в разных режимах
+
+`vpn_alive()` учитывает режим: в `tun` нужен интерфейс `omavpn0`, в `proxy` — живой
+xray и `running: true` в состоянии. Раньше проверялся только интерфейс, из-за чего в
+режиме `proxy` сторож каждые 10 минут «поднимал» уже работающий VPN (фактически
+перезапускал его) и слал ложные уведомления. Поле `mode` и `vpn_alive` есть в
+`omavpn-guard --status`.

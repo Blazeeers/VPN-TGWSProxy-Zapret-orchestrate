@@ -8,8 +8,12 @@ import qs.Ui
 
 Panel {
   id: root
+  // Канонический id плагина — тот же, что в манифесте и в каталоге установки
+  // (~/.config/omarchy/plugins/io.github.blazeeers.omavpn).
   moduleName: "io.github.blazeeers.omavpn"
-  ipcTarget: "io.github.blazeeers.omavpn"
+  // IPC-цель обязана совпадать с moduleName. Раньше здесь был захардкожен id
+  // «соседнего» плагина — отсюда двойные «Обходы» в баре и путаница команд.
+  ipcTarget: root.moduleName
   manageIpc: false
 
   readonly property string scriptPath: Quickshell.env("HOME") + "/.local/bin/bypass-status"
@@ -34,10 +38,27 @@ Panel {
   property var health: ({})
   property bool vpnLoaded: false
   property bool vpnExpanded: false
+
+  // Два независимых флага. busy — действие пользователя (только он гасит
+  // кнопки), healthRunning — фоновая проверка: панель при ней остаётся живой,
+  // иначе открытая панель «умирала» ровно тогда, когда её открыли починить.
   property string busy: ""
+  property string healthRunning: ""
+
   property string notice: ""
-  property string refreshedAt: ""
   property string lastError: ""
+  // Время последнего УДАЧНОГО снимка --json. Нужен, чтобы честно писать
+  // «данные от HH:MM» и помечать залипшие значения, а не делать вид, что они свежие.
+  property real statusAt: 0
+  property real healthStartedAt: 0
+  // Кто именно не ответил (для понятного сообщения вместо «ошибка»).
+  property string timeoutHit: ""
+  // Тик раз в секунду только для надписей («проверяю… N с», возраст данных).
+  property real nowSec: Date.now() / 1000
+
+  // Подтверждение разрушительных действий.
+  property string confirmKind: ""
+  property string confirmMessage: ""
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -60,11 +81,31 @@ Panel {
   readonly property bool capsOk: root.vpn.caps_ok !== false
   readonly property bool zapTesting: !!root.zap.testing || root.zap.autotune === "activating"
 
+  // Разделы, которые бэкенд не смог собрать (битый файл, исключение). Вместо
+  // «всё хорошо» показываем это отдельной строкой.
+  readonly property var degraded: (root.bs && root.bs.degraded instanceof Array) ? root.bs.degraded : []
+  readonly property string degradedText: {
+    var names = []
+    for (var i = 0; i < root.degraded.length; i++)
+      if (root.degraded[i] !== "route_audit") names.push(root.degraded[i])
+    return names.length > 0 ? "часть данных недоступна: " + names.join(", ") : ""
+  }
+  readonly property bool raDegraded: root.degraded.indexOf("route_audit") >= 0
+
+  readonly property bool statusStale: root.statusAt > 0 && (root.nowSec - root.statusAt) > 60
+  readonly property string statusStamp: root.statusAt > 0
+    ? Qt.formatTime(new Date(root.statusAt * 1000), "HH:mm") : ""
+
   // ---- комплексная проверка (health.json из bypass-status --health) ---------
   readonly property var hl: (root.health && root.health.items instanceof Array)
     ? root.health : ((root.bs && root.bs.health && root.bs.health.items instanceof Array) ? root.bs.health : ({}))
   readonly property string verdict: root.hl.verdict || ""
   readonly property bool healthStale: root.hl.stale === true
+  // VPN выключен намеренно: плохой YouTube/Discord — не поломка.
+  readonly property bool vpnIdle: root.hl.vpn_idle === true
+  readonly property bool healthBusy: root.healthRunning !== ""
+  readonly property int healthElapsed: root.healthRunning === ""
+    ? 0 : Math.max(0, Math.floor(root.nowSec - root.healthStartedAt))
 
   // ---- аудит маршрутов (route-audit.json из bypass-status --route-audit) ----
   readonly property var ra: (root.bs && root.bs.route_audit) ? root.bs.route_audit : ({})
@@ -74,7 +115,18 @@ Panel {
   // actions нельзя выдавать за «исправлено» — виджет врал «исправлено: 1»
   // после отката.
   readonly property int raFixed: Number(root.ra.fixed) || 0
-  readonly property bool raHas: Number(root.ra.checked || 0) > 0
+  // Аудит считается невыполненным, если бэкенд так и сказал (verdict=error),
+  // если проб нет вовсе (нечего проверять) или если раздел не собрался.
+  // Раньше пустой список проб давал зелёное «маршруты в порядке» — ложь.
+  readonly property bool raFailed: {
+    if (root.raDegraded) return true
+    if (String(root.ra.verdict || "") === "error") return true
+    if (root.raProbes.length === 0 && root.ra.ok === false) return true
+    if (String(root.ra.verdict || "") === "bad" && root.raProbes.length === 0) return true
+    return false
+  }
+  readonly property bool raHas: !root.raFailed
+    && (Number(root.ra.checked || 0) > 0 || root.raProbes.length > 0)
   readonly property var raBroken: {
     var bad = []
     for (var i = 0; i < root.raProbes.length; i++)
@@ -82,14 +134,27 @@ Panel {
     return bad
   }
   readonly property string raText: {
+    if (root.raFailed) {
+      var why = String(root.ra.summary || root.ra.error || "")
+      if (why === "" && root.raDegraded) why = "раздел route_audit не собрался"
+      return "маршруты: аудит не выполнился" + (why !== "" ? " — " + why : "")
+    }
     if (!root.raHas) return ""
     if (root.raFixed > 0)
       return "маршруты: проверено " + root.raCount + ", исправлено " + root.raFixed
     if (root.raBroken.length > 0) return "маршруты: не отвечают " + root.raBroken.join(", ")
     return "маршруты в порядке"
   }
-  readonly property color raColor: root.raFixed > 0 ? root.warn
-    : (root.raBroken.length > 0 ? root.urgent : root.okColor)
+  readonly property string raLineText: {
+    if (root.raText === "") return ""
+    var t = root.raText
+    if (root.ra.checked) t += " · " + root.fmtAge(root.ra.age || 0)
+    if (root.ra.stale === true) t += " · устарело"
+    return t
+  }
+  readonly property color raColor: root.raFailed ? root.urgent
+    : (root.raFixed > 0 ? root.warn
+      : (root.raBroken.length > 0 ? root.urgent : root.okColor))
 
   function hItem(id) {
     var it = root.hl && root.hl.items ? root.hl.items : []
@@ -149,6 +214,26 @@ Panel {
     if (root.vt.applied) t += " · применён"
     return t
   }
+  // Итог подбора отдельной строкой: раньше он жил внутри блока, видимого лишь
+  // во время запуска, и после завершения (вместе с ошибкой) просто исчезал.
+  readonly property string vtResultText: {
+    if (root.vtRunning) return ""
+    if (root.vt.error) return "подбор не удался: " + root.vt.error
+    if (!root.vtHasData) return ""
+    var t = ""
+    if (root.vtBest) {
+      t = "лучший " + (root.vtBest.profile_name || "?") + " · #" + root.vtBest.index + " " + root.vtBest.tag
+    } else {
+      var alive = 0
+      for (var i = 0; i < root.vtResults.length; i++) if (!root.vtResults[i].dead) alive++
+      t = "живых серверов " + alive
+    }
+    t += root.vt.applied ? " · применён" : " · не применён"
+    if (root.vtWhen !== "") t += " · " + root.vtWhen
+    return "подбор: " + t
+  }
+  readonly property color vtResultColor: root.vt.error ? root.urgent
+    : (root.vt.applied ? root.okColor : root.dim)
   readonly property string vtWhen: {
     var t = Number(root.vt.finished || root.vt.updated || 0)
     return t > 0 ? Qt.formatTime(new Date(t * 1000), "HH:mm") : ""
@@ -195,36 +280,67 @@ Panel {
   readonly property string healthIcon:
     root.verdict === "bad" ? "warning"
     : root.verdict === "warn" ? "warning"
-    : (root.vtRunning || root.zapTesting) ? "refresh"
+    : (root.vtRunning || root.zapTesting || root.healthBusy) ? "refresh"
     : root.verdict === "ok" ? "check"
     : "vpn"
   readonly property color healthColor:
     root.verdict === "bad" ? root.urgent
     : root.verdict === "warn" ? root.warn
-    : (root.vtRunning || root.zapTesting) ? root.warn
+    : (root.vtRunning || root.zapTesting || root.healthBusy) ? root.warn
     : root.verdict === "ok" ? root.okColor
     : (root.vpnOn ? root.okColor : root.dim)
+
+  // Одна строка «что сломано и что нажать» — вместо перечисления имён.
+  readonly property string advice: {
+    if (!root.hl.checked || root.healthBusy) return ""
+    var names = {
+      vpn: "VPN не работает", youtube: "YouTube не грузит видео",
+      discord: "Discord не открывается", deepseek: "DeepSeek API недоступен",
+      tgwsproxy: "tg-ws-proxy молчит", telegram: "Telegram API молчит",
+      zapret: "zapret не обходит DPI"
+    }
+    var actions = {
+      vpn: "«Проверить всё»", youtube: "«Проверить маршруты»",
+      discord: "«Проверить маршруты»", deepseek: "«Проверить всё»",
+      tgwsproxy: "«Проверить всё»", telegram: "«Проверить всё»",
+      zapret: "«Тест стратегий»"
+    }
+    var items = root.hl.items || []
+    var firstBad = "", firstWarn = ""
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].state === "bad" && firstBad === "") firstBad = items[i].id
+      else if (items[i].state === "warn" && firstWarn === "") firstWarn = items[i].id
+    }
+    var id = firstBad !== "" ? firstBad : firstWarn
+    if (id === "") return ""
+    if (root.vpnIdle && (id === "youtube" || id === "discord")) return "VPN выключен → включи VPN"
+    var what = names[id] || id
+    var act = actions[id] || ""
+    return act !== "" ? (what + " → " + act) : what
+  }
+
   // Короткая подпись для шапки панели (PanelHero пишет её капсом).
   readonly property string heroMeta: {
     if (root.vtRunning) return "подбор серверов"
     if (root.zapTesting) return "подбор стратегии zapret"
+    if (root.healthBusy) return "идёт проверка"
     if (!root.hl.checked) return root.vpnOn ? "VPN включён · проверки ещё не было" : "VPN выключен"
-    if (root.verdict === "bad") {
-      var bad = []
-      for (var i = 0; i < root.hl.items.length; i++)
-        if (root.hl.items[i].state === "bad") bad.push(root.hl.items[i].name)
-      return "не работает: " + bad.join(", ")
+    // Считаем по состояниям пунктов, а не по полю verdict: старый кэш
+    // health.json мог не иметь verdict, и шапка врала «всё работает».
+    var items = root.hl.items || []
+    var firstBad = "", firstWarn = ""
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].state === "bad" && firstBad === "") firstBad = items[i].name
+      else if (items[i].state === "warn" && firstWarn === "") firstWarn = items[i].name
     }
-    if (root.verdict === "warn") {
-      var warn = []
-      for (var j = 0; j < root.hl.items.length; j++)
-        if (root.hl.items[j].state === "warn") warn.push(root.hl.items[j].name)
-      return "замечания: " + warn.join(", ")
-    }
+    if (firstBad !== "") return "не работает: " + firstBad
+    if (firstWarn !== "") return "замечания: " + firstWarn
+    if (root.verdict === "bad") return "не работает: проверка сорвалась"
     return (root.vpnOn ? "VPN включён · " : "") + "всё работает"
   }
 
   readonly property string healthText: {
+    if (root.healthBusy) return "идёт проверка · " + root.healthElapsed + " с"
     if (root.vtRunning) return "идёт подбор серверов"
     if (root.zapTesting) return "идёт подбор стратегии zapret"
     if (!root.hl.checked) return root.vpnOn ? "VPN подключён, проверка не запускалась" : "VPN выключен"
@@ -245,7 +361,6 @@ Panel {
     if (sec < 3600) return Math.round(sec / 60) + " мин назад"
     return Math.round(sec / 3600) + " ч назад"
   }
-  function markRefreshed() { root.refreshedAt = Qt.formatTime(new Date(), "HH:mm:ss") }
 
   readonly property string vpnDetail: {
     var v = root.vpn
@@ -260,17 +375,91 @@ Panel {
   }
 
   // ---- действия ------------------------------------------------------------
+  function refreshStatus() {
+    if (!statusProc.running) statusProc.running = true
+  }
+  function refreshVpn() {
+    if (!vpnProc.running) vpnProc.running = true
+  }
+
   function run(args, label) {
-    if (actionProc.running || root.cliPath === "") return
+    if (actionProc.running || root.cliPath === "" || root.busy !== "") return
     root.busy = label || "…"
     actionProc.command = [root.cliPath, "--json"].concat(args)
     actionProc.running = true
   }
 
-  function startHealth() {
+  // heal=false — только чтение (--health-json). Лечение VPN запускается
+  // единственным явным действием — кнопкой «Проверить всё».
+  function startHealth(heal) {
     if (healthProc.running) return
-    root.busy = "health"
+    root.healthRunning = heal ? "heal" : "quick"
+    root.healthStartedAt = Date.now() / 1000
+    healthProc.command = [root.scriptPath, heal ? "--health" : "--health-json"]
     healthProc.running = true
+  }
+
+  // Сторож: Process без таймаута при зависании оставлял флаг занятым навсегда.
+  function killProc(which) {
+    root.timeoutHit = which
+    if (which === "status") statusProc.running = false
+    else if (which === "vpn") vpnProc.running = false
+    else if (which === "health") healthProc.running = false
+    else if (which === "audit") auditProc.running = false
+    else if (which === "optimize") optimizeProc.running = false
+    else if (which === "rescan") rescanProc.running = false
+    else if (which === "upd") updProc.running = false
+    else if (which === "action") actionProc.running = false
+  }
+
+  function notify(title, body) {
+    // Долгие операции идут минутами — человек успевает отойти от экрана.
+    notifyProc.command = ["notify-send", "-a", "Обходы", title, body || ""]
+    notifyProc.running = true
+  }
+
+  function askConfirm(kind, message) {
+    root.confirmKind = kind
+    root.confirmMessage = message
+    confirmDlg.opened = true
+  }
+  function cancelConfirm() {
+    root.confirmKind = ""
+    confirmDlg.opened = false
+  }
+  function confirmRun() {
+    var kind = root.confirmKind
+    root.cancelConfirm()
+    if (kind === "audit") {
+      if (auditProc.running || root.busy !== "") return
+      root.busy = "audit"
+      auditProc.running = true
+    } else if (kind === "update") {
+      root.run(["update"], "update")
+    } else if (kind === "upd") {
+      if (updProc.running || root.busy !== "") return
+      root.busy = "upd"
+      updProc.running = true
+    }
+  }
+
+  // opendata: снимок --json пересобирается каждые 4 с, но чаще всего меняется
+  // лишь пара полей. Неизменившиеся разделы сохраняем тем же объектом, чтобы
+  // привязки (vtResults → nodesOfProfile → Repeater) не инвалидировались и
+  // список серверов не пересоздавался под курсором.
+  function sameValue(a, b) {
+    return JSON.stringify(a) === JSON.stringify(b)
+  }
+  function mergeSections(prev, next) {
+    if (!prev || typeof prev !== "object") return next
+    var out = {}
+    var changed = false
+    for (var k in next) {
+      if (prev[k] !== undefined && root.sameValue(prev[k], next[k])) out[k] = prev[k]
+      else { out[k] = next[k]; changed = true }
+    }
+    for (var p in prev) if (!(p in next)) changed = true
+    return changed ? out : prev
   }
 
   onBsChanged: {
@@ -282,11 +471,14 @@ Panel {
     }
   }
 
-  onOpenedChanged: if (opened) {
-    if (!statusProc.running) statusProc.running = true
+  onOpenedChanged: {
+    if (!opened) return
+    root.refreshStatus()
     if (!vpnProc.running && (!root.vpnLoaded || (Date.now() / 1000 - (root.vpnInfo.updated || 0)) > 120))
       vpnProc.running = true
-    if (!root.hl.checked || root.hl.age > 600) root.startHealth()
+    // Открытие панели — это не повод лечить VPN и не повод занимать busy:
+    // только чтение готового health.json, лечение — по кнопке.
+    if (!root.healthBusy && (!root.hl.checked || root.hl.age > 600)) root.startHealth(false)
   }
 
   implicitWidth: button.implicitWidth
@@ -298,7 +490,15 @@ Panel {
     function close(): void { root.close() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function health(): string { root.startHealth(); return "ok" }
+    function vpn(): string { root.run(["toggle"], "vpn"); return "ok" }
+    function health(): string { root.startHealth(false); return "ok" }
+    function heal(): string { root.startHealth(true); return "ok" }
+    function audit(): string {
+      if (auditProc.running || root.busy !== "") return "busy"
+      root.busy = "audit"
+      auditProc.running = true
+      return "ok"
+    }
   }
 
   // ---- пиктограмма из сгенерированных иконок -------------------------------
@@ -331,17 +531,45 @@ Panel {
     }
   }
 
+  // Кнопка действия: Ui/Button не показывает disabled сам, поэтому гасим руками —
+  // иначе недоступная кнопка выглядит рабочей.
+  component ActionButton: Button {
+    bordered: true
+    foreground: root.foreground
+    fontFamily: root.fontFamily
+    fontSize: Style.font.bodySmall
+    opacity: enabled ? 1 : 0.5
+  }
+
   // ---- процесс опроса статуса ---------------------------------------------
   Process {
     id: statusProc
     command: [root.scriptPath, "--json"]
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
     onExited: function(code) {
-      if (code !== 0) return
-      try {
-        var d = JSON.parse(statusOut.text)
-        if (d && d.ok) { root.bs = d; root.lastError = "" }
-      } catch (e) { /* неполный вывод */ }
+      if (root.timeoutHit === "status") {
+        root.timeoutHit = ""
+        root.lastError = "статус не ответил за 60 с — данные могли устареть"
+        return
+      }
+      if (code !== 0) {
+        root.lastError = "статус не получен (код " + code + ")"
+        return
+      }
+      var d = null
+      try { d = JSON.parse(statusOut.text) } catch (e) { d = null }
+      if (!d || typeof d !== "object") {
+        root.lastError = "статус: битый ответ"
+        return
+      }
+      if (d.ok !== true) {
+        root.lastError = "статус: " + (d.error || "сервис вернул ошибку")
+        return
+      }
+      root.lastError = ""
+      root.statusAt = Date.now() / 1000
+      var merged = root.mergeSections(root.bs, d)
+      if (merged !== root.bs) root.bs = merged
     }
   }
 
@@ -350,35 +578,63 @@ Panel {
     command: [root.scriptPath, "--vpn"]
     stdout: StdioCollector { id: vpnOut; waitForEnd: true }
     onExited: function(code) {
-      if (code !== 0) return
-      try {
-        var d = JSON.parse(vpnOut.text)
-        if (d && d.ok) { root.vpnInfo = d; root.vpnLoaded = true }
-      } catch (e) { /* ignore */ }
+      if (root.timeoutHit === "vpn") {
+        root.timeoutHit = ""
+        root.lastError = "список серверов не получен за 60 с"
+        return
+      }
+      if (code !== 0) {
+        root.lastError = "список серверов не получен (код " + code + ")"
+        return
+      }
+      var d = null
+      try { d = JSON.parse(vpnOut.text) } catch (e) { d = null }
+      if (!d || typeof d !== "object") {
+        root.lastError = "список серверов: битый ответ"
+        return
+      }
+      if (d.ok === false) {
+        root.lastError = "список серверов: " + (d.error || "ошибка")
+        return
+      }
+      root.vpnInfo = d
+      root.vpnLoaded = true
     }
   }
 
   // Комплексный тест конфигурации: страница/видео YouTube, Discord, DeepSeek,
-  // Telegram, tg-ws-proxy, zapret и реальный выход VPN. Раз в 5 минут.
+  // Telegram, tg-ws-proxy, zapret и реальный выход VPN. Раз в 5 минут —
+  // без лечения (--health-json); с лечением — только по кнопке «Проверить всё».
   Process {
     id: healthProc
-    command: [root.scriptPath, "--health"]
+    command: [root.scriptPath, "--health-json"]
     stdout: StdioCollector { id: healthOut; waitForEnd: true }
     onExited: function(code) {
-      root.busy = ""
-      root.markRefreshed()
-      try {
-        var d = JSON.parse(healthOut.text)
-        if (d && d.items) {
+      var was = root.healthRunning
+      root.healthRunning = ""
+      var timedOut = root.timeoutHit === "health"
+      if (timedOut) root.timeoutHit = ""
+      if (timedOut) {
+        root.lastError = "проверка не ответила за 5 минут — прервана"
+      } else if (code !== 0) {
+        root.lastError = "проверка завершилась ошибкой (код " + code + ")"
+      } else {
+        var d = null
+        try { d = JSON.parse(healthOut.text) } catch (e) { d = null }
+        if (!d || !(d.items instanceof Array)) {
+          root.lastError = "проверка: непонятный ответ"
+        } else {
           root.health = d
+          root.lastError = d.error ? ("проверка прервалась: " + d.error) : ""
           var h = d.heal || {}
           if (h && h.actions && h.actions.length > 0) {
             root.notice = "VPN: " + h.actions.join("; ")
             noticeTimer.restart()
           }
+          if (was === "heal") root.notify("Обходы: проверка", d.summary || "готово")
         }
-      } catch (e) { root.lastError = "нет ответа от проверки" }
-      if (!statusProc.running) statusProc.running = true
+      }
+      root.refreshStatus()
     }
   }
 
@@ -387,18 +643,20 @@ Panel {
     command: [root.scriptPath, "--rescan-request"]
     stdout: StdioCollector { id: rescanOut; waitForEnd: true }
     onExited: function(code) {
+      var timedOut = root.timeoutHit === "rescan"
+      if (timedOut) root.timeoutHit = ""
       root.busy = ""
-      var msg = "не удалось запросить перебор"
-      if (code === 0) {
+      var msg = timedOut ? "запрос перебора не ответил — попробуй ещё раз" : "не удалось запросить перебор"
+      if (code === 0 && !timedOut) {
         msg = "перебор запрошен — стратегии тестируются"
         try {
           var d = JSON.parse(rescanOut.text)
           if (d && d.message) msg = d.message
-        } catch (e) { /* ignore */ }
+        } catch (e) { /* пустой вывод */ }
       }
       root.notice = msg
       noticeTimer.restart()
-      if (!statusProc.running) statusProc.running = true
+      root.refreshStatus()
     }
   }
 
@@ -408,37 +666,51 @@ Panel {
     command: [root.scriptPath, "--optimize"]
     stdout: StdioCollector { id: optimizeOut; waitForEnd: true }
     onExited: function(code) {
+      var timedOut = root.timeoutHit === "optimize"
+      if (timedOut) root.timeoutHit = ""
       root.busy = ""
-      var msg = "не удалось запустить подбор"
-      try {
-        var d = JSON.parse(optimizeOut.text)
-        if (d && d.message) msg = d.message
-        else if (d && d.error) msg = d.error
-      } catch (e) { /* ignore */ }
+      var msg = timedOut ? "подбор не ответил за 4 минуты — прерван" : "не удалось запустить подбор"
+      if (code === 0 && !timedOut) {
+        try {
+          var d = JSON.parse(optimizeOut.text)
+          if (d && d.message) msg = d.message
+          else if (d && d.error) msg = d.error
+        } catch (e) { /* пустой вывод */ }
+      }
       root.notice = msg
       noticeTimer.restart()
-      if (!statusProc.running) statusProc.running = true
+      root.notify("Обходы: подбор", msg)
+      root.refreshStatus()
+      root.refreshVpn()
     }
   }
 
   // Аудит маршрутов: домен, который не отвечает по текущему пути, уходит на
-  // рабочий (omavpn route set ... proxy). Настройки VPN не трогает.
+  // рабочий (omavpn route set ... proxy). Настройки VPN не трогает, но туннель
+  // перезапускает — поэтому запускается только после подтверждения.
   Process {
     id: auditProc
     command: [root.scriptPath, "--route-audit"]
     stdout: StdioCollector { id: auditOut; waitForEnd: true }
     onExited: function(code) {
+      var timedOut = root.timeoutHit === "audit"
+      if (timedOut) root.timeoutHit = ""
       root.busy = ""
-      var msg = "не удалось проверить маршруты"
-      try {
-        var d = JSON.parse(auditOut.text)
-        if (d && d.reason === "already_running") msg = "аудит маршрутов уже идёт"
-        else if (d && d.reason === "lock_error") msg = "уже идёт проверка — лок занят"
-        else if (d && d.summary) msg = d.summary
-      } catch (e) { /* ignore */ }
+      var msg = timedOut ? "аудит маршрутов не ответил за 3 минуты" : "не удалось проверить маршруты"
+      var d = null
+      try { d = JSON.parse(auditOut.text) } catch (e) { d = null }
+      if (!timedOut && code === 0 && d) {
+        if (d.reason === "already_running") msg = "аудит маршрутов уже идёт"
+        else if (d.reason === "lock_error") msg = "уже идёт проверка — лок занят"
+        else if (d.verdict === "error") msg = "аудит не выполнился: " + (d.error || d.summary || "неизвестная ошибка")
+        else if (d.summary) msg = d.summary
+      } else if (!timedOut) {
+        root.lastError = "аудит маршрутов завершился ошибкой (код " + code + ")"
+      }
       root.notice = msg
       noticeTimer.restart()
-      if (!statusProc.running) statusProc.running = true
+      root.notify("Обходы: маршруты", msg)
+      root.refreshStatus()
     }
   }
 
@@ -447,15 +719,20 @@ Panel {
     command: [root.scriptPath, "--update-components"]
     stdout: StdioCollector { id: updOut; waitForEnd: true }
     onExited: function(code) {
+      var timedOut = root.timeoutHit === "upd"
+      if (timedOut) root.timeoutHit = ""
       root.busy = ""
-      var msg = "не удалось обновить"
-      try {
-        var d = JSON.parse(updOut.text)
-        if (d && d.messages && d.messages.length) msg = d.messages.join("; ")
-      } catch (e) { /* ignore */ }
+      var msg = timedOut ? "обновление не ответило за 4 минуты" : "не удалось обновить"
+      if (code === 0 && !timedOut) {
+        try {
+          var d = JSON.parse(updOut.text)
+          if (d && d.messages && d.messages.length) msg = d.messages.join("; ")
+        } catch (e) { /* пустой вывод */ }
+      }
       root.notice = msg
       noticeTimer.restart()
-      if (!statusProc.running) statusProc.running = true
+      root.notify("Обходы: обновления", msg)
+      root.refreshStatus()
     }
   }
 
@@ -464,18 +741,37 @@ Panel {
     stdout: StdioCollector { id: actionOut; waitForEnd: true }
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function(code) {
-      var wasVpn = root.busy === "vpn"
+      var label = root.busy
+      var timedOut = root.timeoutHit === "action"
+      if (timedOut) root.timeoutHit = ""
       root.busy = ""
-      root.markRefreshed()
-      if (code !== 0) {
+      if (timedOut) {
+        root.lastError = "действие «" + (label || "?") + "» не ответило за 3 минуты"
+      } else if (code !== 0) {
         var t = (actionErr.text || actionOut.text || "").trim()
         try { var j = JSON.parse(t); if (j.error) t = j.error } catch (e) { /* plain */ }
         root.lastError = t || "ошибка"
-      } else { root.lastError = "" }
-      if (!statusProc.running) statusProc.running = true
-      if (!vpnProc.running) vpnProc.running = true
-      if (wasVpn) root.startHealth()
+      } else {
+        root.lastError = ""
+      }
+      if (label === "vpn" || label === "update") {
+        // vpnOn здесь ещё старый (статус обновится ниже), поэтому без «включён/выключен».
+        root.notify("Обходы: " + (label === "vpn" ? "VPN" : "подписка"),
+          root.lastError !== "" ? root.lastError
+            : (label === "vpn" ? "переключено" : "обновлена"))
+      }
+      root.refreshStatus()
+      root.refreshVpn()
+      // Лечение после переключения не запускаем: остальное покажет обычный опрос.
     }
+  }
+
+  Process {
+    id: notifyProc
+    // notify-send есть на этой машине (libnotify); если его нет — уведомление
+    // просто не появится, на работу виджета это не влияет.
+    command: ["notify-send", "-a", "Обходы", "Обходы", ""]
+    onExited: function(code) { /* код не важен: уведомление — необязательный бонус */ }
   }
 
   Timer {
@@ -484,22 +780,47 @@ Panel {
     onTriggered: root.notice = ""
   }
 
-  // Быстрый опрос статуса — для живого состояния строк.
+  // Тик для надписей «проверяю… N с» и возраста данных — без спавнов.
   Timer {
-    interval: 4000
+    id: tick
+    interval: 1000
+    running: root.opened
+    repeat: true
+    onTriggered: root.nowSec = Date.now() / 1000
+  }
+
+  // Опрос статуса: открытая панель — 4 с (живые строки), закрытая — 25 с.
+  // Раньше --json шёл каждые 4 с круглосуточно (~100 спавнов в минуту, ~10 % ядра).
+  Timer {
+    id: statusTimer
+    interval: root.opened ? 4000 : 25000
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: if (!statusProc.running) statusProc.running = true
+    onTriggered: root.refreshStatus()
   }
 
-  // Монитор работоспособности: комплексная проверка каждые 5 минут.
+  // Монитор работоспособности: комплексная проверка каждые 5 минут — только чтение.
   Timer {
+    id: healthTimer
     interval: 300000
     running: true
     repeat: true
-    onTriggered: root.startHealth()
+    onTriggered: {
+      if (root.busy !== "" || root.healthBusy) return
+      root.startHealth(false)
+    }
   }
+
+  // Сторожа процессов: интервал = предел ожидания, взводится вместе с запуском.
+  Timer { id: statusWatch; interval: 60000; running: statusProc.running; onTriggered: root.killProc("status") }
+  Timer { id: vpnWatch; interval: 60000; running: vpnProc.running; onTriggered: root.killProc("vpn") }
+  Timer { id: healthWatch; interval: 300000; running: healthProc.running; onTriggered: root.killProc("health") }
+  Timer { id: auditWatch; interval: 900000; running: auditProc.running; onTriggered: root.killProc("audit") }
+  Timer { id: optimizeWatch; interval: 240000; running: optimizeProc.running; onTriggered: root.killProc("optimize") }
+  Timer { id: rescanWatch; interval: 120000; running: rescanProc.running; onTriggered: root.killProc("rescan") }
+  Timer { id: updWatch; interval: 1800000; running: updProc.running; onTriggered: root.killProc("upd") }
+  Timer { id: actionWatch; interval: 180000; running: actionProc.running; onTriggered: root.killProc("action") }
 
   // ---- кнопка в панели -----------------------------------------------------
   BarIconButton {
@@ -509,6 +830,7 @@ Panel {
     active: true
     activeColor: root.healthColor
     tooltipText: "Обходы: " + root.healthText + (root.raText !== "" ? " · " + root.raText : "")
+      + " · ПКМ — включить/выключить VPN"
     iconComponent: Component {
       Pictogram {
         name: root.healthIcon
@@ -516,7 +838,14 @@ Panel {
         px: Style.space(15)
       }
     }
-    onPressed: function(buttonCode) { root.toggle() }
+    onPressed: function(buttonCode) {
+      // Правый клик — VPN включить/выключить, без открытия панели.
+      if (buttonCode === Qt.RightButton) {
+        if (root.cliPath !== "" && root.busy === "") root.run(["toggle"], "vpn")
+        return
+      }
+      root.toggle()
+    }
   }
 
   // ---- всплывающая панель --------------------------------------------------
@@ -533,7 +862,11 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onCloseRequested: root.close()
+      onCloseRequested: {
+        if (confirmDlg.opened) root.cancelConfirm()
+        else root.close()
+      }
+      onReturnRequested: if (confirmDlg.opened) root.confirmRun()
     }
 
     Flickable {
@@ -579,6 +912,29 @@ Panel {
           wrapMode: Text.WordWrap
         }
 
+        Text {
+          width: parent.width
+          visible: root.degradedText !== ""
+          textFormat: Text.PlainText
+          text: root.degradedText
+          color: root.warn
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
+        // Одна строка «что сломано и что нажать».
+        Text {
+          width: parent.width
+          visible: root.advice !== ""
+          textFormat: Text.PlainText
+          text: root.advice
+          color: root.verdict === "bad" ? root.urgent : root.warn
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
         // ---------- карточка VPN ----------
         Rectangle {
           width: parent.width
@@ -602,7 +958,7 @@ Panel {
 
               Pictogram {
                 name: "vpn"
-                tint: root.vpnOn ? root.stateColor(root.hState("vpn", "ok")) : root.dim
+                tint: root.vpnOn ? root.stateColor(root.hState("vpn", "")) : root.dim
                 px: Style.space(22)
                 anchors.verticalCenter: parent.verticalCenter
               }
@@ -624,7 +980,7 @@ Panel {
                   Text {
                     textFormat: Text.PlainText
                     text: root.vpnOn ? (root.stateWord(root.hState("vpn", "")) || "") : "выкл"
-                    color: root.vpnOn ? root.stateColor(root.hState("vpn", "ok")) : root.dim
+                    color: root.vpnOn ? root.stateColor(root.hState("vpn", "")) : root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     anchors.verticalCenter: parent.verticalCenter
@@ -641,15 +997,11 @@ Panel {
                 }
               }
 
-              Button {
+              ActionButton {
                 id: toggleBtn
                 anchors.verticalCenter: parent.verticalCenter
                 text: root.busy === "vpn" ? "…" : (root.vpnOn ? "Выключить" : "Включить")
-                bordered: true
-                foreground: root.foreground
                 accent: root.vpnOn ? root.okColor : Color.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
                 enabled: root.cliPath !== "" && root.busy === ""
                 onClicked: root.run(["toggle"], "vpn")
               }
@@ -694,6 +1046,18 @@ Panel {
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
               }
+            }
+
+            // итог подбора — остаётся после завершения (с «применён» или ошибкой)
+            Text {
+              width: parent.width
+              visible: root.vtResultText !== ""
+              textFormat: Text.PlainText
+              text: root.vtResultText
+              color: root.vtResultColor
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
 
             // строка-переключатель регионов/серверов
@@ -861,6 +1225,62 @@ Panel {
                 width: parent.width
                 spacing: Style.space(2)
 
+                // Авто (omavpn node -1): без этой строки из UI нельзя было
+                // вернуться к балансировке — при node_index < 0 ничего не подсвечено.
+                Rectangle {
+                  id: autoNodeRow
+                  readonly property bool isCurrent: Number(root.vpnInfo.node_index) < 0
+                  width: parent.width
+                  implicitHeight: anodeRow.implicitHeight + Style.space(8)
+                  radius: Style.cornerRadius > 0 ? Style.space(8) : 0
+                  color: autoNodeRow.isCurrent ? root.selectedFill
+                         : (anodeMouse.containsMouse ? root.hoverFill : "transparent")
+
+                  Row {
+                    id: anodeRow
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: Style.space(8)
+                    anchors.rightMargin: Style.space(8)
+                    spacing: Style.space(8)
+
+                    Rectangle {
+                      width: Style.space(7)
+                      height: width
+                      radius: width / 2
+                      anchors.verticalCenter: parent.verticalCenter
+                      color: autoNodeRow.isCurrent ? root.okColor : root.dim
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Авто (лучший по задержке)" + (autoNodeRow.isCurrent ? " ●" : "")
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      width: Style.space(180)
+                      elide: Text.ElideRight
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "балансировка между серверами региона"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                      width: parent.width - Style.space(240)
+                    }
+                  }
+
+                  MouseArea {
+                    id: anodeMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: if (root.busy === "") root.run(["node", "-1"], "node")
+                  }
+                }
+
                 Repeater {
                   model: root.nodesOfProfile
 
@@ -943,9 +1363,11 @@ Panel {
         }
 
         // ---------- строки состояния ----------
+        // При устаревшем снимке (> 60 с) значения больше не «живые» — гасим их.
         Column {
           width: parent.width
           spacing: Style.space(2)
+          opacity: root.statusStale ? 0.6 : 1.0
 
           // zapret
           Rectangle {
@@ -965,7 +1387,7 @@ Panel {
 
               Pictogram {
                 name: "zapret"
-                tint: root.zapTesting ? root.warn : root.stateColor(root.hState("zapret", "ok"))
+                tint: root.zapTesting ? root.warn : root.stateColor(root.hState("zapret", ""))
                 px: Style.space(18)
                 anchors.verticalCenter: parent.verticalCenter
               }
@@ -1125,8 +1547,9 @@ Panel {
               cursorShape: Qt.PointingHandCursor
               onClicked: {
                 if (root.busy !== "") return
-                root.busy = "upd"
-                updProc.running = true
+                // Обновление компонентов идёт через pkexec, то есть с паролем.
+                root.askConfirm("upd",
+                  "Обновить zapret и tg-ws-proxy?\nПонадобится пароль (pkexec) и 1–2 минуты. Трафик может прерваться.")
               }
             }
           }
@@ -1188,23 +1611,17 @@ Panel {
           width: parent.width
           spacing: Style.space(8)
 
-          Button {
-            text: root.busy === "health" ? "… проверяю" : "Проверить всё"
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
-            enabled: root.busy === ""
-            onClicked: root.startHealth()
+          ActionButton {
+            text: root.healthBusy ? ("… " + root.healthElapsed + " с") : "Проверить всё"
+            tooltipText: "Полная проверка с попыткой самовосстановления VPN (до 3 минут)"
+            enabled: root.scriptPath !== "" && !root.healthBusy && root.busy === ""
+            onClicked: root.startHealth(true)
           }
 
-          Button {
+          ActionButton {
             text: root.vtRunning ? ("подбор " + root.vtDone + "/" + root.vtTotal) : "Подобрать лучший"
-            bordered: true
-            foreground: root.foreground
             accent: Color.accent
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
+            tooltipText: "Прогнать все регионы и серверы и подключить лучший (туннель перезапустится)"
             enabled: root.cliPath !== "" && root.busy === "" && !root.vtRunning
             onClicked: {
               if (root.vtRunning || optimizeProc.running) return
@@ -1214,13 +1631,10 @@ Panel {
             }
           }
 
-          Button {
+          ActionButton {
             text: root.busy === "rescan" ? "…" : "Тест стратегий"
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
-            enabled: root.busy === ""
+            // Фоновая проверка не должна гасить действия — только своё занятие.
+            enabled: root.scriptPath !== "" && root.busy === ""
             onClicked: {
               if (root.busy !== "" || rescanProc.running) return
               root.busy = "rescan"
@@ -1228,30 +1642,22 @@ Panel {
             }
           }
 
-          Button {
+          ActionButton {
             text: root.busy === "audit" ? "… маршруты" : "Проверить маршруты"
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
+            tooltipText: "Аудит доменов: может перевести домен на другой путь и перезапустить туннель (~1 минута)"
             // Аудит запускает scriptPath (bypass-status), а не cliPath (omavpn):
             // проверять надо именно его, иначе кнопка мертва без CLI.
             enabled: root.scriptPath !== "" && root.busy === ""
-            onClicked: {
-              if (root.busy !== "" || auditProc.running) return
-              root.busy = "audit"
-              auditProc.running = true
-            }
+            onClicked: root.askConfirm("audit",
+              "Проверить маршруты доменов?\nАудит может перевести домены на другой путь и перезапустить туннель — трафик прервётся примерно на минуту.")
           }
 
-          Button {
+          ActionButton {
             text: root.busy === "update" ? "…" : "Обновить подписку"
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
+            tooltipText: "Перечитать подписку (туннель перезапустится)"
             enabled: root.cliPath !== "" && root.busy === ""
-            onClicked: root.run(["update"], "update")
+            onClicked: root.askConfirm("update",
+              "Обновить подписку?\nТуннель перезапустится, трафик прервётся на несколько секунд.")
           }
         }
 
@@ -1293,19 +1699,81 @@ Panel {
           }
         }
 
+        // Возраст снимка --json: если бэкенд молчит, значения помечены как старые.
         Text {
           width: parent.width
-          visible: root.raText !== ""
+          visible: root.statusStamp !== ""
           textFormat: Text.PlainText
-          text: root.raText
-            + (root.raHas ? (" · " + root.fmtAge(root.ra.age || 0)) : "")
-            + (root.ra.stale === true ? " · устарело" : "")
+          text: "данные от " + root.statusStamp
+            + (root.statusStale ? " · устарели, обновление не отвечает" : "")
+          color: root.statusStale ? root.warn : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        // Аудит маршрутов: полный список доменов не обрезаем — перенос + подсказка.
+        Text {
+          id: raLine
+          width: parent.width
+          visible: root.raLineText !== ""
+          textFormat: Text.PlainText
+          text: root.raLineText
           color: root.raColor
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
+          wrapMode: Text.WordWrap
+
+          // MouseArea внутри Text: как ребёнок Column она попала бы под
+          // позиционер и потеряла anchors.
+          MouseArea {
+            id: raHover
+            anchors.fill: parent
+            acceptedButtons: Qt.NoButton
+            hoverEnabled: true
+          }
+
+          ToolTip {
+            id: raTip
+            visible: raHover.containsMouse && raLine.visible
+            delay: 500
+            padding: Style.space(8)
+            text: root.raLineText
+            contentItem: Text {
+              textFormat: Text.PlainText
+              text: raTip.text
+              color: Color.tooltip.text
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              width: Style.space(340)
+              wrapMode: Text.WordWrap
+            }
+            background: Rectangle {
+              color: Color.tooltip.background
+              radius: Style.cornerRadius > 0 ? Style.space(6) : 0
+              border.width: 1
+              border.color: Color.tooltip.border
+            }
+          }
         }
       }
+    }
+
+    // Подтверждение разрушительных действий: обновление подписки, аудит
+    // маршрутов и обновление компонентов (pkexec) рвут трафик.
+    ConfirmDialog {
+      id: confirmDlg
+      anchors.fill: parent
+      z: 10
+      opened: false
+      message: root.confirmMessage
+      cancelText: "Отмена"
+      confirmText: "Продолжить"
+      background: root.bar ? root.bar.background : Color.background
+      foreground: root.foreground
+      selectedText: Color.accent
+      fontFamily: root.fontFamily
+      onCanceled: root.cancelConfirm()
+      onConfirmed: root.confirmRun()
     }
   }
 }

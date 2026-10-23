@@ -18,6 +18,15 @@ rm -f "$HOME_DIR/.config/systemd/user/omavpn-guard.service" \
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 rm -f "$HOME_DIR/.local/bin/omavpn-guard"
 
+# Проверка обновлений и CLI виджета: без этого «полное удаление» оставляло
+# включённый omavpn-updates.timer (он дёргает уже удалённый bypass-status и
+# копит ошибки) и живой ~/.local/bin/bypass-status.
+systemctl --user disable --now omavpn-updates.timer >/dev/null 2>&1 || true
+rm -f "$HOME_DIR/.config/systemd/user/omavpn-updates.service" \
+      "$HOME_DIR/.config/systemd/user/omavpn-updates.timer"
+systemctl --user daemon-reload >/dev/null 2>&1 || true
+rm -f "$HOME_DIR/.local/bin/bypass-status"
+
 # Аудит маршрутов: те же правила — сначала таймеры, потом файлы юнитов.
 systemctl --user disable --now omavpn-route-audit.timer omavpn-route-recheck.timer >/dev/null 2>&1 || true
 rm -f "$HOME_DIR/.config/systemd/user/omavpn-route-audit.service" \

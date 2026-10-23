@@ -36,6 +36,7 @@ LAST_SWITCH="$STATE_DIR/last_switch"
 SWITCH_HISTORY="$STATE_DIR/switch_history"
 LAST_NET_FILE="$STATE_DIR/last_net"
 VPN_STATE="$HOME_DIR/.local/state/omavpn/state.json"
+VPN_SETTINGS="$HOME_DIR/.config/omavpn/settings.json"
 SINGBOX_CFG="$HOME_DIR/.local/state/omavpn/singbox.json"
 DIRECT_FILE="$HOME_DIR/.config/omavpn/direct_domains.txt"
 SB_BIN="$HOME_DIR/.local/share/omavpn/bin/sing-box"
@@ -46,8 +47,14 @@ TG_UNIT='app-tg\x2dws\x2dproxy@autostart.service'
 COOLDOWN=900        # ручное вмешательство в путь не чаще раза в 15 минут
 MAX_BACKOFF=3600    # потолок паузы после серии неудач
 TUN_WAIT=25         # сколько ждать интерфейс после запуска
-RESCAN_WAIT=600     # сколько ждать, пока autotune переберёт стратегии
+# Живой перебор стратегий длится 5:46–7:21 (29 кандидатов × 2 сервиса), поэтому
+# 600 с не хватало: guard решал, что «перебор не завершился», и лез в путь руками.
+RESCAN_WAIT=1200    # сколько ждать, пока autotune переберёт стратегии
+# `omavpn heal` перебирает все ноды профиля (14 шт., до ~400 с); при 240 с его
+# убивали на середине, троттл не записывался и следующий тик начинал заново.
+HEAL_TIMEOUT=420
 MAX_NODES=5         # сколько нод перебрать за один прогон
+CURL_T=8            # таймаут одной HTTP-проверки, с (в --status урезается)
 
 YT_DOMAINS="youtube.com
 youtu.be
@@ -62,22 +69,6 @@ youtubemusic.com
 ytstatic.com
 youtube.googleapis.com
 youtubei.googleapis.com"
-
-DISCORD_DOMAINS="discord.com
-discord.gg
-discordapp.com
-discordapp.net
-discord.co
-discord.dev
-discord.new
-discord.media
-discordmerch.com
-discordstatus.com
-discord-activities.com
-discordactivities.com
-discordpartygames.com
-discordapp.io
-discordcdn.com"
 
 mkdir -p -m 700 "$STATE_DIR" 2>/dev/null || { echo "omavpn-guard: нет каталога состояния" >&2; exit 1; }
 chmod 700 "$STATE_DIR" 2>/dev/null || true
@@ -111,35 +102,73 @@ now() { date +%s; }
 
 tun_up() { ip link show omavpn0 >/dev/null 2>&1; }
 
-wait_tun() {
-    local i
-    for i in $(seq 1 "$TUN_WAIT"); do
-        tun_up && return 0
-        sleep 1
-    done
-    return 1
-}
-
 runtime_field() {
     [ -f "$VPN_STATE" ] || { echo ""; return; }
     jq -r ".$1 // empty" "$VPN_STATE" 2>/dev/null
 }
 
+# Режим VPN: tun (по умолчанию) или proxy. Читаем state.json, а до первого
+# запуска — настройки omavpn: в proxy TUN не поднимается вообще, и всё, что
+# считает «VPN = omavpn0», в этом режиме врёт.
+vpn_mode() {
+    local m
+    m=$(runtime_field mode)
+    [ -n "$m" ] || m=$(jq -r '.mode // empty' "$VPN_SETTINGS" 2>/dev/null)
+    case "$m" in
+        proxy) echo proxy ;;
+        *)     echo tun ;;
+    esac
+}
+
+# Живой ли xray. В режиме proxy VPN держится только на нём (sing-box не нужен).
+xray_up() {
+    command -v pgrep >/dev/null 2>&1 || return 0
+    pgrep -x xray >/dev/null 2>&1
+}
+
+# Жив ли VPN. В режиме tun признак — интерфейс omavpn0 (флаг running в
+# state.json ставится при запуске и сам не снимается, поэтому падение туннеля по
+# нему не видно). В режиме proxy TUN нет по определению: там живой VPN — это
+# записанный running=true и живой процесс xray. Раньше живость проверялась
+# только по `ip link show omavpn0`, и guard каждые 10 минут зря делал
+# `omavpn on` (off+on — реальный обрыв) и слал «туннель не поднялся».
+vpn_alive() {
+    tun_up && return 0
+    [ "$(vpn_mode)" = "proxy" ] || return 1
+    [ "$(runtime_field running)" = "true" ] || return 1
+    xray_up
+}
+
+wait_vpn() {
+    local i
+    for i in $(seq 1 "$TUN_WAIT"); do
+        vpn_alive && return 0
+        sleep 1
+    done
+    return 1
+}
+
 # intent: включён ли VPN по воле пользователя.
 # omavpn пишет running=false и при ошибке запуска, и в переходные моменты,
-# поэтому живой TUN = «включён», а непустой last_error = «упало, не выключали».
+# поэтому живой VPN = «включён», а непустой last_error = «упало, не выключали».
 intent_read() {
-    local running err prev
+    local err prev
     if [ ! -f "$VPN_STATE" ]; then
         cat "$INTENT_FILE" 2>/dev/null || echo on
         return
     fi
-    running=$(runtime_field running)
     err=$(runtime_field last_error)
     prev=$(cat "$INTENT_FILE" 2>/dev/null || echo "on")
 
-    if [ "$running" = "true" ] || tun_up; then
+    if vpn_alive; then
         echo on
+        return
+    fi
+    # Процесс умер, но VPN не выключали: `running=true` остаётся только после
+    # `omavpn on`, а намеренный `off` пишет `running=false`. Без этой проверки
+    # в режиме proxy падение xray выглядело бы как «пользователь выключил VPN».
+    if [ "$(runtime_field running)" = "true" ]; then
+        echo "$prev"
         return
     fi
     if [ -n "$err" ]; then
@@ -156,14 +185,26 @@ intent_update() {
     echo "$want"
 }
 
-caps_ok() {
-    [ -x "$SB_BIN" ] || return 1
+# Состояние прав sing-box: ok | nobin (нет бинаря) | nocaps (нет cap_net_admin).
+# Разные причины — разные сообщения: «нет бинаря» лечится переустановкой, а не
+# setcap, и раньше оба случая валили guard целиком.
+caps_state() {
+    [ -x "$SB_BIN" ] || { echo nobin; return; }
     # без getcap (нет libcap) не можем судить — не блокируем работу
-    command -v getcap >/dev/null 2>&1 || return 0
-    local caps
-    caps=$(getcap "$SB_BIN" 2>/dev/null)
-    [[ "$caps" == *cap_net_admin* ]]
+    command -v getcap >/dev/null 2>&1 || { echo ok; return; }
+    if getcap "$SB_BIN" 2>/dev/null | grep -q cap_net_admin; then
+        echo ok
+    else
+        echo nocaps
+    fi
 }
+
+caps_ok() { [ "$(caps_state)" = "ok" ]; }
+
+# Нужен ли TUN для текущего режима. В proxy sing-box не запускается вовсе,
+# поэтому отсутствие caps там не поломка: раньше guard из-за него не лечил даже
+# Telegram (прокси caps не нужны).
+tun_needed() { [ "$(vpn_mode)" != "proxy" ]; }
 
 # Установлен ли tg-ws-proxy вообще. Если компонента нет, Telegram не считаем
 # сломанным (иначе guard будет зря включать VPN и слать тревоги).
@@ -200,7 +241,35 @@ PY
     return 1
 }
 
+json_field() { # $1 JSON, $2 имя поля -> значение или пусто
+    # has(), а не `// empty`: `//` считает false отсутствующим значением, и
+    # changed=false неотличим от «поля нет».
+    printf '%s' "$1" | jq -r --arg f "$2" \
+        'if type == "object" and has($f) then (.[$f] | tostring) else empty end' 2>/dev/null
+}
+
+json_actions() { # $1 JSON -> действия одной строкой
+    printf '%s' "$1" | jq -r '((.actions // []) | join("; "))' 2>/dev/null
+}
+
+# Путь домена по правилам omavpn: `route list` проходит их в том же порядке, что
+# и sing-box (override/always-proxy → direct-правило → final=proxy), поэтому
+# ответ совпадает с конфигом. Правка direct_domains.txt тут ничего не решает:
+# видео YouTube подмешивается встроенным BUILTIN_DIRECT_DOMAINS, стоит в
+# direct-правиле ПЕРЕД файлом, и раньше guard «переводил YouTube на VPN»
+# правкой файла, которая ни на что не влияла.
+route_path_of() { # $1 домен -> direct|proxy|"" (спросить не удалось)
+    local out
+    out=$(timeout 20 "$OMAVPN" --json route list 2>/dev/null) || return 0
+    printf '%s' "$out" | jq -r --arg d "$1" \
+        'first(.routes[]? | select(.domain == $d) | .path) // empty' 2>/dev/null || true
+}
+
 path_now() {
+    local p
+    p=$(route_path_of youtube.com)
+    [ -n "$p" ] && { echo "$p"; return; }
+    # omavpn не ответил — грубая оценка по собранному конфигу sing-box
     if service_in_direct "$YT_DOMAINS"; then echo "direct"; return; fi
     [ -f "$SINGBOX_CFG" ] && echo "vpn" || echo unknown
 }
@@ -262,7 +331,16 @@ autotune_lastscan() {
 
 zapret_active() { systemctl is-active --quiet zapret.service 2>/dev/null; }
 
+# Идёт ли перебор стратегий прямо сейчас (автотюн ходит под своим flock).
+autotune_running() { systemctl is-active --quiet zapret-autotune.service 2>/dev/null; }
+
 request_rescan() {
+    # Свой перебор уже идёт — второй запрос только сбил бы его и добавил
+    # guard'у ложное «перебор не начался».
+    if autotune_running; then
+        log "autotune уже перебирает стратегии — жду его результат"
+        return 0
+    fi
     mkdir -p "$(dirname "$RESCAN_REQUEST")" 2>/dev/null
     rm -f "$RESCAN_REQUEST" 2>/dev/null
     printf '%s\n' "$(now)" >"$RESCAN_REQUEST" 2>/dev/null || return 1
@@ -293,30 +371,64 @@ wait_rescan_result() {
 }
 
 # --- проверки сервисов -----------------------------------------------------
+# Каждая проверка пробуется дважды: одиночный обрыв curl не должен выглядеть
+# сломанным сервисом — после него guard 10 минут перебирает стратегии и включает
+# VPN, который человек только что выключил.
+
+http_code() { # $1 url -> HTTP-код (000 — не ответил)
+    local code="" i=0 tries=${HTTP_TRIES:-2}
+    while [ "$i" -lt "$tries" ]; do
+        i=$((i + 1))
+        code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time "$CURL_T" "$1" 2>/dev/null)
+        [ -n "$code" ] && [ "$code" != "000" ] && break
+        [ "$i" -lt "$tries" ] && sleep 1
+    done
+    printf '%s' "${code:-000}"
+}
+
+http_body() { # $1 url, $2 лимит байт; 1 — тело не пришло
+    local body="" i=0 tries=${HTTP_TRIES:-2}
+    while [ "$i" -lt "$tries" ]; do
+        i=$((i + 1))
+        body=$(curl -4 -s --max-time "$CURL_T" "$1" 2>/dev/null | head -c "${2:-150000}")
+        [ -n "$body" ] && { printf '%s' "$body"; return 0; }
+        [ "$i" -lt "$tries" ] && sleep 1
+    done
+    return 1
+}
+
+http_meta() { # $1 url -> "код content-type размер"
+    local out="" i=0 tries=${HTTP_TRIES:-2}
+    while [ "$i" -lt "$tries" ]; do
+        i=$((i + 1))
+        out=$(curl -4 -s -o /dev/null -w '%{http_code} %{content_type} %{size_download}' \
+            --max-time "$CURL_T" "$1" 2>/dev/null)
+        case "${out%% *}" in 2??|3??) break ;; esac
+        [ "$i" -lt "$tries" ] && sleep 1
+    done
+    printf '%s' "$out"
+}
 
 svc_youtube_ok() {
     local code ctype size body img rest
-    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 https://www.youtube.com/ 2>/dev/null)
+    code=$(http_code https://www.youtube.com/)
     [ "$code" = "200" ] || return 1
-    body=$(curl -4 -s --max-time 8 https://www.youtube.com/ 2>/dev/null | head -c 150000)
+    body=$(http_body https://www.youtube.com/) || return 1
     grep -qiE 'ytimg|youtube' <<<"$body" || return 1
     # CDN превью — generate_204 на самом i.ytimg.com. Раньше здесь стоял жёсткий
     # id видео (dQw4w9WgXcQ/hqdefault.jpg): если видео удалят, guard считал бы
     # YouTube сломанным по кругу и лечил несуществующую поломку. generate_204
     # от конкретного видео не зависит и проверяет то же самое: DNS + TLS + ответ CDN.
-    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 \
-        https://i.ytimg.com/generate_204 2>/dev/null)
+    code=$(http_code https://i.ytimg.com/generate_204)
     { [ "$code" = "204" ] || [ "$code" = "200" ]; } || return 1
     # ...и что картинки реально отдаются картинками (favicon — вечный image/*).
-    img=$(curl -4 -s -o /dev/null -w '%{http_code} %{content_type} %{size_download}' \
-        --max-time 8 https://www.youtube.com/favicon.ico 2>/dev/null)
+    img=$(http_meta https://www.youtube.com/favicon.ico)
     code=${img%% *}
     rest=${img#* }
     ctype=${rest%% *}
     size=${rest##* }
     [ "$code" = "200" ] && [ "${size:-0}" -gt 500 ] 2>/dev/null && [[ "${ctype:-}" == image/* ]] || return 1
-    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 \
-        https://redirector.googlevideo.com/generate_204 2>/dev/null)
+    code=$(http_code https://redirector.googlevideo.com/generate_204)
     { [ "$code" = "204" ] || [ "$code" = "200" ]; } || return 1
     # Служебный API YouTube (youtubei.googleapis.com) блокируют наглухо: страница
     # и картинки открываются, а плеер висит по 10 с на каждом запросе. Успех —
@@ -325,28 +437,22 @@ svc_youtube_ok() {
     # поэтому проверять его напрямую бессмысленно: при выключенном VPN и в
     # режиме «proxy» (без TUN) он недоступен по определению — и guard каждые
     # 10 минут «лечил» бы несуществующую поломку (rescan zapret + включение VPN).
-    tun_up || return 0
-    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 10 \
-        https://youtubei.googleapis.com/youtubei/v1/player 2>/dev/null)
+    vpn_alive || return 0
+    code=$(http_code https://youtubei.googleapis.com/youtubei/v1/player)
     [ -n "$code" ] && [ "$code" != "000" ]
 }
 
 svc_discord_ok() {
-    local code
-    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 \
-        https://discord.com/api/v9/gateway 2>/dev/null)
-    [ "$code" = "200" ] || return 1
-    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 https://discord.com/ 2>/dev/null)
-    [ "$code" = "200" ]
+    [ "$(http_code https://discord.com/api/v9/gateway)" = "200" ] || return 1
+    [ "$(http_code https://discord.com/)" = "200" ]
 }
 
 svc_telegram_ok() {
     local code
     systemctl --user is-active --quiet "$TG_UNIT" 2>/dev/null || return 1
-    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 https://api.telegram.org/ 2>/dev/null)
+    code=$(http_code https://api.telegram.org/)
     [ "$code" = "200" ] || [ "$code" = "302" ] || return 1
-    code=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 https://web.telegram.org/ 2>/dev/null)
-    [ "$code" = "200" ]
+    [ "$(http_code https://web.telegram.org/)" = "200" ]
 }
 
 # Список сломанных сервисов через пробел.
@@ -381,7 +487,11 @@ ensure_profile() {
         sed -i 's/"stack": "mixed"/"stack": "gvisor"/' "$OMAVPN" && changed=1
     fi
     if [ "$changed" = "1" ]; then
-        if python3 -B -m py_compile "$OMAVPN" 2>/dev/null; then
+        # py_compile пишет __pycache__ в ~/.local/bin даже с -B (это лишь запрет
+        # импорта байткода, а не компиляции). Проверяем синтаксис компиляцией в
+        # памяти: ни следа на диске.
+        if python3 -c 'import sys; f = sys.argv[1]; compile(open(f, encoding="utf-8").read(), f, "exec")' \
+            "$OMAVPN" 2>/dev/null; then
             log "профиль omavpn поправлен (mtu 1500 / stack gvisor)"
         else
             log "ОШИБКА: правка профиля сломала синтаксис — откатываю"
@@ -396,19 +506,19 @@ ensure_profile() {
 # --- VPN -------------------------------------------------------------------
 
 vpn_up() {
-    tun_up && return 0
+    vpn_alive && return 0
     timeout 90 "$OMAVPN" on >/dev/null 2>&1
-    wait_tun
+    wait_vpn
 }
 
 vpn_restart() {
     timeout 90 "$OMAVPN" restart >/dev/null 2>&1
-    wait_tun || vpn_up
+    wait_vpn || vpn_up
 }
 
 vpn_consistent() {
-    tun_up || return 0
-    pgrep -x xray >/dev/null 2>&1
+    vpn_alive || return 0
+    xray_up
 }
 
 try_nodes() {
@@ -425,7 +535,7 @@ try_nodes() {
         [ "$tries" -gt "$MAX_NODES" ] && break
         log "пробую ноду $node"
         timeout 90 "$OMAVPN" node "$node" >/dev/null 2>&1
-        wait_tun || vpn_up
+        wait_vpn || vpn_up
         if health_ok_quiet; then
             log "помогла нода $node"
             return 0
@@ -434,7 +544,7 @@ try_nodes() {
 
     if [ "${orig:--1}" != "-1" ] && [ "${orig:-0}" -ge 0 ] 2>/dev/null; then
         timeout 90 "$OMAVPN" node "$orig" >/dev/null 2>&1
-        wait_tun || vpn_up
+        wait_vpn || vpn_up
         log "вернул прежнюю ноду $orig"
     fi
     return 1
@@ -457,6 +567,9 @@ switches_last_hour() {
 note_switch() {
     date +%s >>"$SWITCH_HISTORY" 2>/dev/null
     tail -n 20 "$SWITCH_HISTORY" >"$SWITCH_HISTORY.tmp" 2>/dev/null && mv "$SWITCH_HISTORY.tmp" "$SWITCH_HISTORY" 2>/dev/null
+    # метка последней ручной смены пути: раньше её ставил только set_path, и
+    # после перехода на `omavpn route set` кулдаун COOLDOWN перестал работать
+    date +%s >"$LAST_SWITCH" 2>/dev/null
 }
 
 can_switch() {
@@ -475,49 +588,29 @@ direct_file_settled() {
     [ "$age" -ge 60 ]
 }
 
-# set_path <vpn|direct> <список доменов>
-set_path() {
-    local want="$1" list="$2" tmp dom changed=0 rc
-    if [ ! -f "$DIRECT_FILE" ]; then
-        # не создаём файл с нуля: иначе вместе со сломанным сервисом
-        # в VPN уедет второй, который пока работает
-        log "direct_domains.txt отсутствует — ручную смену пути не делаю"
+# route_force <домен> <proxy|direct> <причина>
+# Крайняя мера — оверрайд маршрута через сам omavpn, а не правка
+# direct_domains.txt: видео YouTube подмешивается встроенным
+# BUILTIN_DIRECT_DOMAINS, который стоит в direct-правиле ПЕРЕД файлом, поэтому
+# правка файла ни на что не влияла и `path_now` продолжал говорить «direct».
+# Оверрайд proxy ставится в правило proxy — оно первое, и его ничего не перебивает.
+# Возврат: 0 — путь изменён, 2 — уже такой, 1 — ошибка.
+route_force() {
+    local dom="$1" path="$2" reason="$3" out rc changed
+    out=$(timeout 60 "$OMAVPN" --json route set "$dom" "$path" \
+        --reason "$reason" --no-restart 2>/dev/null)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "route set $dom $path: ошибка (код $rc)"
         return 1
     fi
-    tmp=$(mktemp "$DIRECT_FILE.XXXXXX" 2>/dev/null) || return 1
-    cp -p "$DIRECT_FILE" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-
-    while IFS= read -r dom; do
-        [ -n "$dom" ] || continue
-        if [ "$want" = "vpn" ]; then
-            if grep -qxF "$dom" "$tmp"; then
-                grep -vxF "$dom" "$tmp" >"$tmp.n" 2>/dev/null
-                rc=$?
-                if [ "$rc" -le 1 ]; then
-                    mv -f "$tmp.n" "$tmp" 2>/dev/null && [ "$rc" -eq 0 ] && changed=1
-                else
-                    log "ОШИБКА: не смог переписать direct_domains (код $rc)"
-                    rm -f "$tmp" "$tmp.n"
-                    return 1
-                fi
-            fi
-        else
-            if ! grep -qxF "$dom" "$tmp"; then
-                printf '%s\n' "$dom" >>"$tmp" && changed=1
-            fi
-        fi
-    done <<<"$list"
-
-    if [ "$changed" = "0" ]; then
-        rm -f "$tmp"
-        return 2
-    fi
-    cp -p "$DIRECT_FILE" "$DIRECT_FILE.bak-guard" 2>/dev/null
-    mv "$tmp" "$DIRECT_FILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    date +%s >"$LAST_SWITCH"
-    log "путь «$want» применён (ручная мера)"
-    vpn_restart
-    return 0
+    changed=$(json_field "$out" changed)
+    case "$changed" in
+        true)  return 0 ;;
+        false) return 2 ;;
+        *)     log "route set $dom $path: непонятный ответ omavpn"
+               return 1 ;;
+    esac
 }
 
 # --- лечение ---------------------------------------------------------------
@@ -529,14 +622,38 @@ restart_tg() {
     svc_telegram_ok
 }
 
+# Разбор ответа `omavpn --json heal`. Раньше вывод уходил в /dev/null, и шаг
+# «heal не помог» одинаково выглядел и при reason=throttled (VPN не трогали —
+# не чаще раза в 10 минут), и при dead-ноде: guard шёл дальше по лечению,
+# считая, что мера применена и не сработала.
+heal_vpn() {
+    local out rc reason
+    out=$(timeout "$HEAL_TIMEOUT" "$OMAVPN" --json heal 2>/dev/null)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "omavpn heal: код $rc (таймаут — $HEAL_TIMEOUT с)"
+        return 1
+    fi
+    reason=$(json_field "$out" reason)
+    case "$reason" in
+        "")        log "omavpn heal выполнен: $(json_actions "$out")" ;;
+        throttled) log "omavpn heal на паузе (не чаще раза в 10 мин) — иду дальше"; return 1 ;;
+        vpn_off)   log "omavpn heal: VPN выключен и не запущен"; return 1 ;;
+        deadline)  log "omavpn heal упёрся в дедлайн перебора нод: $(json_actions "$out")"; return 1 ;;
+        *)         log "omavpn heal: причина «$reason» $(json_actions "$out")" ;;
+    esac
+    return 0
+}
+
 heal() {
-    local mode broken svc fixed=0
+    local mode broken svc fixed=0 path_vpn
 
     mode=$(autotune_mode)
-    log "лечение: путь $(path_now), autotune=$mode, zapret=$(zapret_active && echo on || echo off)"
+    path_vpn=$(vpn_mode)
+    log "лечение: путь $(path_now), режим VPN $path_vpn, autotune=$mode, zapret=$(zapret_active && echo on || echo off)"
 
-    if ! tun_up; then
-        if vpn_up; then log "туннель поднят"; else log "туннель не поднимается"; return 1; fi
+    if ! vpn_alive; then
+        if vpn_up; then log "VPN поднят"; else log "VPN не поднимается"; return 1; fi
     fi
 
     broken=$(broken_services_quiet)
@@ -556,8 +673,8 @@ heal() {
 
     # Общие меры для YouTube/Discord
     if [[ " $broken " == *" youtube "* || " $broken " == *" discord "* ]]; then
-        timeout 240 "$OMAVPN" --json heal >/dev/null 2>&1
-        wait_tun
+        heal_vpn
+        wait_vpn
         if health_ok_quiet; then log "помогло: omavpn heal"; return 0; fi
 
         if [ "$mode" = "vpn" ]; then
@@ -572,7 +689,7 @@ heal() {
             if vpn_up && try_nodes; then return 0; fi
         fi
 
-        # Крайняя мера: направить сломанный сервис через VPN.
+        # Крайняя мера: увести сломанный сервис в VPN оверрайдом маршрута.
         if [ "$(switches_last_hour)" -ge 3 ]; then
             log "путь переключался 3+ раза за час — не воюю с autotune"
         elif ! can_switch; then
@@ -583,20 +700,33 @@ heal() {
             for svc in $broken; do
                 case "$svc" in
                     youtube)
-                        if service_in_direct "$YT_DOMAINS"; then
-                            set_path vpn "$YT_DOMAINS" && note_switch && fixed=1
-                            log "YouTube переведён на VPN"
+                        # переводим только если домен реально на direct, иначе
+                        # оверрайд вернул бы 2 и «переведён» было бы ложью
+                        if [ "$(route_path_of youtube.com)" = "direct" ]; then
+                            route_force youtube.com proxy "аудит: guard — обход не тянет"
+                            case $? in
+                                0) note_switch; fixed=1
+                                   log "YouTube переведён на VPN (route override)" ;;
+                                2) log "YouTube уже идёт через VPN — переключать нечего" ;;
+                                *) : ;;
+                            esac
                         fi
                         ;;
                     discord)
-                        if service_in_direct "$DISCORD_DOMAINS"; then
-                            set_path vpn "$DISCORD_DOMAINS" && note_switch && fixed=1
-                            log "Discord переведён на VPN"
+                        if [ "$(route_path_of discord.com)" = "direct" ]; then
+                            route_force discord.com proxy "аудит: guard — обход не тянет"
+                            case $? in
+                                0) note_switch; fixed=1
+                                   log "Discord переведён на VPN (route override)" ;;
+                                2) log "Discord уже идёт через VPN — переключать нечего" ;;
+                                *) : ;;
+                            esac
                         fi
                         ;;
                 esac
             done
             if [ "$fixed" = "1" ]; then
+                # оверрайды ставились с --no-restart: один перезапуск на пачку
                 vpn_restart
                 health_ok_quiet && return 0
             fi
@@ -660,38 +790,66 @@ reset_on_net_change() {
 cmd_autostart() {
     local want
     want=$(intent_read)
-    if [ "$want" = "on" ] && ! tun_up; then
+    if [ "$want" = "on" ] && ! vpn_alive; then
         log "автозапуск: VPN был включён — поднимаю"
         vpn_up || { log "автозапуск: поднять VPN не удалось"; notify "VPN не поднялся при входе"; }
     fi
-    caps_ok || { log "ВНИМАНИЕ: у sing-box нет cap_net_admin"; notify "У sing-box нет cap_net_admin: VPN не поднимется без пароля"; }
+    # caps нужны только TUN: в режиме proxy sing-box не запускается, и ругаться
+    # «VPN не поднимется без пароля» там не за что.
+    if tun_needed; then
+        case "$(caps_state)" in
+            nocaps)
+                log "ВНИМАНИЕ: у sing-box нет cap_net_admin"
+                notify "У sing-box нет cap_net_admin: VPN не поднимется без пароля" ;;
+            nobin)
+                log "ВНИМАНИЕ: нет $SB_BIN — TUN поднимать нечем"
+                notify "Нет sing-box ($SB_BIN): VPN не поднимется" ;;
+        esac
+    fi
 }
 
 cmd_status() {
-    printf '{"tun_up":%s,"intent":"%s","path":"%s","autotune":"%s","zapret":%s,"caps_ok":%s,"streak":%s,"broken":"%s"}\n' \
+    # --status зовут для отладки, а не для лечения: одна попытка на запрос и
+    # таймаут 4 с (было 8 с и без повторов — ответ шёл около минуты).
+    CURL_T=4
+    HTTP_TRIES=1
+    printf '{"vpn_alive":%s,"tun_up":%s,"mode":"%s","intent":"%s","path":"%s","autotune":"%s","zapret":%s,"caps_ok":%s,"caps":"%s","streak":%s,"broken":"%s"}\n' \
+        "$(vpn_alive && echo true || echo false)" \
         "$(tun_up && echo true || echo false)" \
+        "$(vpn_mode)" \
         "$(intent_read)" \
         "$(path_now)" \
         "$(autotune_mode)" \
         "$(zapret_active && echo true || echo false)" \
         "$(caps_ok && echo true || echo false)" \
+        "$(caps_state)" \
         "$(streak)" \
         "$(broken_services_quiet)"
 }
 
 cmd_check() {
-    local want broken
+    local want broken caps
 
     reset_on_net_change
     want=$(intent_update)
 
-    if ! caps_ok; then
-        log "нет cap_net_admin у sing-box — нужен sudo setcap, лечить нечем"
-        notify "VPN не может подняться: у sing-box нет cap_net_admin"
+    # caps нужны только для TUN. В режиме proxy их отсутствие — не поломка:
+    # Telegram (локальный прокси) и VPN через socks работают и без них, а раньше
+    # guard из-за отсутствия caps не лечил вообще ничего.
+    caps=$(caps_state)
+    if [ "$caps" != "ok" ] && tun_needed; then
+        case "$caps" in
+            nobin)
+                log "нет $SB_BIN — TUN поднять нечем (переустанови omavpn)"
+                notify "VPN не поднимется: не найден sing-box" ;;
+            *)
+                log "нет cap_net_admin у sing-box — нужен sudo setcap, лечить нечем"
+                notify "VPN не может подняться: у sing-box нет cap_net_admin" ;;
+        esac
         return 1
     fi
 
-    if in_backoff && ! { [ "$want" = "on" ] && ! tun_up; }; then
+    if in_backoff && ! { [ "$want" = "on" ] && ! vpn_alive; }; then
         log "пауза после неудач — пропускаю до $(date -d "@$(cat "$NEXT_TRY_FILE")" '+%F %T' 2>/dev/null)"
         return 0
     fi
@@ -699,23 +857,23 @@ cmd_check() {
     if [ "$want" = "on" ]; then
         if ensure_profile; then vpn_restart; fi
         if ! vpn_consistent; then
-            log "туннель есть, но xray мёртв — перезапускаю VPN"
+            log "VPN числится живым, но xray мёртв — перезапускаю"
             vpn_restart
         fi
-        if ! tun_up; then
-            log "туннеля нет, хотя VPN должен быть включён — поднимаю"
-            vpn_up || log "туннель не поднялся"
+        if ! vpn_alive; then
+            log "VPN должен быть включён, но не отвечает (режим $(vpn_mode)) — поднимаю"
+            vpn_up || log "VPN не поднялся"
         fi
     fi
 
     broken=$(broken_services_quiet)
     if [ -z "$broken" ]; then
         mark_ok
-        log "всё в порядке (путь $(path_now), autotune $(autotune_mode))"
+        log "всё в порядке (путь $(path_now), autotune $(autotune_mode), режим $(vpn_mode))"
         return 0
     fi
 
-    if [ "$want" = "off" ] && ! tun_up; then
+    if [ "$want" = "off" ] && ! vpn_alive; then
         # VPN выключен пользователем: сначала чиним каждый сервис по его природе,
         # VPN — только если обход действительно не тянет.
         log "VPN выключен, не работают:$broken — чиню без VPN"
@@ -730,7 +888,15 @@ cmd_check() {
                 return 0
             fi
         fi
-        log "обход не тянет — поднимаю VPN"
+        # Перед включением VPN проверяем ещё раз: за время перебора (до 20 мин)
+        # сеть могла ожить сама, и поднимать туннель вопреки выключению не за что.
+        broken=$(broken_services_quiet)
+        if [ -z "$broken" ]; then
+            mark_ok
+            log "сервисы заработали сами — VPN не трогаю"
+            return 0
+        fi
+        log "обход не тянет (не работают:$broken) — поднимаю VPN"
         if vpn_up && health_ok_quiet; then
             mark_ok
             notify "Обход в этой сети не справляется, включил VPN"
