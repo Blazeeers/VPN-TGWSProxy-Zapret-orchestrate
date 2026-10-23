@@ -816,10 +816,10 @@ Panel {
   Timer { id: statusWatch; interval: 60000; running: statusProc.running; onTriggered: root.killProc("status") }
   Timer { id: vpnWatch; interval: 60000; running: vpnProc.running; onTriggered: root.killProc("vpn") }
   Timer { id: healthWatch; interval: 300000; running: healthProc.running; onTriggered: root.killProc("health") }
-  Timer { id: auditWatch; interval: 180000; running: auditProc.running; onTriggered: root.killProc("audit") }
+  Timer { id: auditWatch; interval: 900000; running: auditProc.running; onTriggered: root.killProc("audit") }
   Timer { id: optimizeWatch; interval: 240000; running: optimizeProc.running; onTriggered: root.killProc("optimize") }
   Timer { id: rescanWatch; interval: 120000; running: rescanProc.running; onTriggered: root.killProc("rescan") }
-  Timer { id: updWatch; interval: 240000; running: updProc.running; onTriggered: root.killProc("upd") }
+  Timer { id: updWatch; interval: 1800000; running: updProc.running; onTriggered: root.killProc("upd") }
   Timer { id: actionWatch; interval: 180000; running: actionProc.running; onTriggered: root.killProc("action") }
 
   // ---- кнопка в панели -----------------------------------------------------

@@ -164,6 +164,13 @@ intent_read() {
         echo on
         return
     fi
+    # Процесс умер, но VPN не выключали: `running=true` остаётся только после
+    # `omavpn on`, а намеренный `off` пишет `running=false`. Без этой проверки
+    # в режиме proxy падение xray выглядело бы как «пользователь выключил VPN».
+    if [ "$(runtime_field running)" = "true" ]; then
+        echo "$prev"
+        return
+    fi
     if [ -n "$err" ]; then
         echo "$prev"
         return
@@ -696,7 +703,7 @@ heal() {
                         # переводим только если домен реально на direct, иначе
                         # оверрайд вернул бы 2 и «переведён» было бы ложью
                         if [ "$(route_path_of youtube.com)" = "direct" ]; then
-                            route_force youtube.com proxy "guard: обход не тянет"
+                            route_force youtube.com proxy "аудит: guard — обход не тянет"
                             case $? in
                                 0) note_switch; fixed=1
                                    log "YouTube переведён на VPN (route override)" ;;
@@ -707,7 +714,7 @@ heal() {
                         ;;
                     discord)
                         if [ "$(route_path_of discord.com)" = "direct" ]; then
-                            route_force discord.com proxy "guard: обход не тянет"
+                            route_force discord.com proxy "аудит: guard — обход не тянет"
                             case $? in
                                 0) note_switch; fixed=1
                                    log "Discord переведён на VPN (route override)" ;;

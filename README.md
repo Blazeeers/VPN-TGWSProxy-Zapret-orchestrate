@@ -87,10 +87,9 @@ YouTube, Discord и Telegram действительно открываются, 
 | Компонент | Роль | Расположение |
 |---|---|---|
 | `omavpn` (CLI) | управление VPN | `~/.local/bin/omavpn` |
-| `shell-plugin/omavpn` | виджет управления VPN в панели Omarchy | `~/.config/omarchy/plugins/io.github.blazeeers.omavpn` |
 | `bin/bypass-status` | агрегатор статуса всех обходов (JSON) | `~/.local/bin/bypass-status` |
 | `bin/omavpn-guard` | надзиратель: следит, что YouTube/Discord/Telegram работают, и лечит | `~/.local/bin/omavpn-guard` |
-| `shell-plugin/bypass-status` | виджет «Обходы» — статусы всего | `~/.config/omarchy/plugins/io.github.blazeeers.bypass-status` |
+| `shell-plugin/bypass-status` | виджет «Обходы» — статусы всего | `~/.config/omarchy/plugins/io.github.blazeeers.omavpn` |
 | `zapret/*` | DPI-обход и автотюн | `/usr/local/bin`, `/opt/zapret`, `/etc`, `/var/lib` |
 | `tgwsproxy/install.sh` | установка tg-ws-proxy | `~/.local/bin/tg-ws-proxy` |
 
@@ -465,7 +464,7 @@ bypass-status --route-audit # аудит маршрутов: нерабочий 
 
 ```bash
 install -m 0755 bin/bypass-status ~/.local/bin/bypass-status
-ID=io.github.blazeeers.bypass-status
+ID=io.github.blazeeers.omavpn
 mkdir -p ~/.config/omarchy/plugins/$ID/icons
 cp shell-plugin/bypass-status/manifest.json shell-plugin/bypass-status/Panel.qml ~/.config/omarchy/plugins/$ID/
 cp shell-plugin/bypass-status/icons/*.png ~/.config/omarchy/plugins/$ID/icons/
@@ -479,10 +478,10 @@ omarchy restart shell
 
 Плагин один: `io.github.blazeeers.omavpn` (этот репозиторий). Его виджет в панели —
 **«Обходы»** (`shell-plugin/bypass-status/Panel.qml`, прописан в
-`entryPoints.barWidget` корневого манифеста). Старый отдельный виджет подключения
-VPN (`shell-plugin/omavpn/Panel.qml`) остаётся в репозитории как справочный: его
-функции — включение/выключение VPN, выбор страны и сервера, «Подключаться при
-входе» — перенесены в «Обходы», поэтому второй кнопки в панели не нужно.
+`entryPoints.barWidget` корневого манифеста). Отдельного виджета подключения VPN
+больше нет (`shell-plugin/omavpn/` удалён в 2.3.0): его функции — включение и
+выключение VPN (правый клик по иконке), выбор страны и сервера, «Подключаться при
+входе» — перенесены в «Обходы», поэтому вторая кнопка в панели не нужна.
 
 Маркетплейс ставит плагин из этого репозитория и обновляет его из него же:
 `omarchy plugin add <url>` ставит, `omarchy plugin update io.github.blazeeers.omavpn`
@@ -547,7 +546,6 @@ sudo bash zapret/zapret-blockcheck.sh standard
 | `~/.config/TgWsProxy/config.json` | конфиг tg-ws-proxy (secret, port) |
 | `~/.config/autostart/tg-ws-proxy.desktop` | автозапуск tg-ws-proxy |
 | `manifest.json` (корень репозитория) | манифест плагина (id `io.github.blazeeers.omavpn`) |
-| `shell-plugin/omavpn/Panel.qml` | QML-виджет панели |
 | `~/.config/omarchy/plugins/io.github.blazeeers.omavpn/` | установленный плагин VPN |
 | `~/.local/bin/bypass-status` | агрегатор статусов обходов (JSON) |
 | `~/.local/bin/omavpn-guard` | надзиратель за обходами |
@@ -558,7 +556,7 @@ sudo bash zapret/zapret-blockcheck.sh standard
 | `~/.config/systemd/user/omavpn-autostart.service` | поднятие VPN при входе |
 | `~/.local/state/omavpn-guard/intent` | включён ли VPN по решению пользователя |
 | `shell-plugin/bypass-status/` | QML виджета «Обходы» |
-| `~/.config/omarchy/plugins/io.github.blazeeers.bypass-status/` | установленный виджет «Обходы» |
+| `~/.config/omarchy/plugins/io.github.blazeeers.omavpn/` | установленный виджет «Обходы» |
 
 ---
 
