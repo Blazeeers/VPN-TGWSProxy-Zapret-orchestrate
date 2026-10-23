@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.blazeeers.omavpn",
   "name": "Bypass Status",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "author": "blazeeers",
   "license": "MIT",
   "description": "Bar widget for all bypasses at once: VPN with region+server autotune, zapret DPI, tg-ws-proxy, route audit (a blocked domain moves to a working route itself) and a 5-minute health monitor (YouTube, Discord, DeepSeek, Telegram).",
