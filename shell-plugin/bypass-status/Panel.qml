@@ -38,6 +38,18 @@ Panel {
   // Лечение, запущенное самим виджетом (не кнопкой): уведомления о нём не нужны.
   property bool healthAuto: false
   property real autoHealAt: 0
+  // Лечение уже пробовали в этой сессии — без этого автоподбор сервера не
+  // запускаем: сначала надо дать шанс лечению, оно дешевле.
+  property bool healTried: false
+  // Сколько проверок подряд закончились bad. Две подряд — повод менять сервер.
+  property int badStreak: 0
+  // Отметки автоматических шагов (подбор сервера, аудит маршрутов): по ним
+  // считаем «не чаще раза в час / полчаса». Ноль — берём время из кэша бэкенда.
+  property real autoOptimizeAt: 0
+  property real autoAuditAt: 0
+  // Автозапуск подбора/аудита: об успехе молчим, о неудаче — одно уведомление.
+  property bool optimizeAuto: false
+  property bool auditAuto: false
   // Кулдаун лечения в бэкенде (HEAL_MIN_GAP в bin/bypass-status — 2700 с).
   // Свой порог обязан быть не меньше: при 900 с каждые 15 минут уходил полный
   // --health, который тут же получал heal.skipped, — лишняя нагрузка и ложное
@@ -45,6 +57,9 @@ Panel {
   readonly property real autoHealGap: 2700
 
   readonly property bool autoconnect: root.setting("autoconnect", false)
+  // Тихая иконка: когда всё в порядке, пиктограмма в баре не красится и не
+  // притягивает взгляд. Ключ живёт в настройках плагина (setSetting ниже).
+  readonly property bool quietBar: root.setting("quietBar", true)
 
   function setSetting(key, value) {
     if (!root.bar || !root.bar.shell || typeof root.bar.shell.updateEntryInline !== "function") return
@@ -420,13 +435,24 @@ Panel {
     : (root.vtRunning || root.zapTesting || root.healthBusy) ? "refresh"
     : root.verdict === "ok" ? "check"
     : "vpn"
-  readonly property color healthColor:
+  readonly property color healthColorBase:
     root.statusError !== "" ? root.urgent
     : root.verdict === "bad" ? root.urgent
     : root.verdict === "warn" ? root.warn
     : (root.vtRunning || root.zapTesting || root.healthBusy) ? root.warn
     : root.verdict === "ok" ? root.okColor
     : (root.vpnOn ? root.okColor : root.dim)
+
+  // «Всё хорошо и делать нечего»: только тогда тихая иконка гасит цвет.
+  // Не гасит его тревога (ошибка статуса, идущая проверка/действие) и наличие
+  // новых версий (upAny). А вот ошибки самих обновлений (upError: молчит
+  // апдейтер, нет сети) бар НЕ красят — это не авария VPN, и подсвечивать их
+  // в баре значило бы держать иконку цветной из-за недоступного GitHub.
+  readonly property bool allCalm: root.verdict === "ok" && !root.upAny
+    && !root.vtRunning && !root.zapTesting && !root.healthBusy
+    && root.busy === "" && root.statusError === ""
+  readonly property color healthColor:
+    (root.quietBar && root.allCalm) ? root.dim : root.healthColorBase
 
   // Одна строка «что сломано и что нажать» — вместо перечисления имён.
   readonly property string advice: {
@@ -530,6 +556,142 @@ Panel {
     return bad !== "" ? on + " · " + bad : on
   }
 
+  // ---- обновления и журнал (omavpn-updater) --------------------------------
+  // Отдельный инструмент: проверка раз в сутки (его собственный кэш), в виджете
+  // — только чтение снимка раз в 5 минут. Без подтверждения ничего не ставит.
+  readonly property string updaterPath: Quickshell.env("HOME") + "/.local/bin/omavpn-updater"
+  property var up: ({})
+  property bool upLoaded: false
+  property bool stateAwait: false
+  // Мягкая ошибка раздела обновлений. Отдельная от statusError: молчащий
+  // апдейтер или отсутствие сети не должны выглядеть как «нет данных» о VPN.
+  property string upError: ""
+  // Скачивание апдейтера — ровно одна попытка за сессию: иначе при пустой
+  // сети он лез бы за ним на каждом тике.
+  property bool updaterFetching: false
+  property real upChecked: 0
+  // Очередь записей журнала: --note пишется по одной строке за процесс.
+  property var noteQueue: []
+  // Тихий уведомлятор об обновлениях: одно сообщение в сутки, без спама.
+  property real upNotifiedAt: 0
+
+  readonly property var upUpdates: (root.up && root.up.updates) ? root.up.updates : ({})
+
+  // Состояние guard из снимка апдейтера: "active" / "inactive" / "unknown".
+  // Нет снимка (апдейтер недоступен) — считаем guard активным: иначе виджет
+  // начнёт лечить туннель параллельно guard, и они будут перезапускать VPN
+  // друг у друга. Ложная «активность» тут безопаснее ложной «выключенности».
+  readonly property string guardTimerState: String((root.up.guard || {}).timer || "unknown")
+  readonly property bool guardKnown:
+    root.guardTimerState === "active" || root.guardTimerState === "inactive"
+  readonly property bool guardActive: root.guardKnown ? root.guardTimerState === "active" : true
+  // Аудит маршрутов: аудит рвёт трафик, поэтому без данных автоаудит не
+  // запускаем — только известное "inactive" разрешает.
+  readonly property string auditTimerState: String((root.up.guard || {}).route_audit || "unknown")
+  readonly property bool auditTimerActive: root.auditTimerState !== "inactive"
+  // Питание неизвестно (нет up.power) — ведём себя как на батарее: автоподбор
+  // и автоаудит не гоняем, проверяем реже. Это дешевле, чем будить туннель.
+  readonly property bool powerKnown:
+    !!root.up && !!root.up.power && typeof root.up.power === "object"
+  readonly property bool onBattery: root.powerKnown ? (root.up.power.on_battery === true) : true
+
+  // Фолбэк на снимок статуса: если апдейтера нет (виджет новее CLI) или он
+  // молчит, но bypass-status уже проверял zapret/tg-ws-proxy, показываем хотя
+  // бы эти строки — иначе раздел пуст, хотя данные есть.
+  readonly property var bsUpdates: {
+    var u = root.bs ? root.bs.updates : null
+    return (u && typeof u === "object") ? u : ({})
+  }
+  readonly property real bsUpdatesChecked: Number(root.bsUpdates.checked || 0)
+  readonly property bool upFallbackActive:
+    root.bsUpdatesChecked > 0 && (!root.upLoaded || root.upError !== "")
+  readonly property var updFallbackItems: {
+    var out = []
+    if (!root.upFallbackActive) return out
+    var u = root.bsUpdates
+    var comp = [["zapret", "zapret"], ["tgwsproxy", "tg-ws-proxy"]]
+    for (var i = 0; i < comp.length; i++) {
+      var p = u[comp[i][0]]
+      if (!p || !p.update) continue
+      out.push({ name: comp[i][1],
+                 text: comp[i][1] + " " + (p.installed || "?") + " → " + (p.latest || "?") })
+    }
+    return out
+  }
+
+  // Строки обновлений: по одной на компонент, у которого есть новая версия.
+  readonly property var updItems: {
+    var u = root.upUpdates
+    var out = []
+    if (u && typeof u === "object") {
+      var w = u.widget
+      if (w && w.update)
+        out.push({ name: "Виджет", text: "Виджет " + (w.installed || "?") + " → " + (w.latest || "?") })
+      var core = [["xray", "Xray"], ["singbox", "sing-box"]]
+      for (var i = 0; i < core.length; i++) {
+        var c = u[core[i][0]]
+        if (!c || !c.update) continue
+        // Ядро ставим до проверенной версии из install.sh; последний релиз —
+        // только справка, иначе человек ждёт версию, которую мы не ставим.
+        var t = core[i][1] + " " + (c.installed || "?") + " → проверенная " + (c.pinned || "?")
+        if (c.latest && c.latest !== c.pinned) t += " · в апстриме " + c.latest
+        out.push({ name: core[i][1], text: t })
+      }
+      var comp = [["zapret", "zapret"], ["tgwsproxy", "tg-ws-proxy"]]
+      for (var j = 0; j < comp.length; j++) {
+        var p = u[comp[j][0]]
+        if (!p || !p.update) continue
+        out.push({ name: comp[j][1],
+                   text: comp[j][1] + " " + (p.installed || "?") + " → " + (p.latest || "?") })
+      }
+    }
+    if (out.length === 0 && root.upFallbackActive) return root.updFallbackItems
+    return out
+  }
+  readonly property bool upAny: root.updItems.length > 0
+  // Строка «нет обновлений / нет данных»: три разных состояния, один текст.
+  readonly property string upStatusText: {
+    if (root.upFallbackActive) {
+      var bsAt = Qt.formatTime(new Date(root.bsUpdatesChecked * 1000), "HH:mm")
+      return "проверено " + bsAt + " (по данным статуса)"
+        + (root.upError !== "" ? " · " + root.upError : "")
+    }
+    if (root.upError !== "") return root.upError
+    if (!root.upLoaded) return "обновления: проверяю…"
+    var at = root.upChecked > 0 ? Qt.formatTime(new Date(root.upChecked * 1000), "HH:mm") : ""
+    return "всё актуально" + (at !== "" ? " · проверено " + at : "")
+  }
+  // Что именно обновится — прямо в диалоге подтверждения, а не «обновить всё?».
+  readonly property string updateAllMessage: {
+    var names = []
+    for (var i = 0; i < root.updItems.length; i++) names.push(root.updItems[i].name)
+    var lines = ["Обновить всё?"]
+    if (names.length > 0) lines.push("Новое: " + names.join(", ") + ".")
+    lines.push("Если нужно ядро (Xray, sing-box), откроется терминал — понадобится пароль (pkexec): "
+      + "установщик обновит не только ядро, но и CLI, скрипты и виджет, "
+      + "а после него оболочка перезапустится сама.")
+    if (root.upUpdates.widget && root.upUpdates.widget.update)
+      lines.push("Виджет подменится с бэкапом; без терминала оболочка перезапустится через 4 секунды.")
+    return lines.join("\n")
+  }
+
+  // Последние 5 записей журнала — новые сверху.
+  readonly property var upActions: {
+    var a = (root.up && root.up.actions instanceof Array) ? root.up.actions : []
+    var out = []
+    var from = Math.max(0, a.length - 5)
+    for (var i = a.length - 1; i >= from; i--) {
+      var it = a[i]
+      if (!it || !it.text) continue
+      out.push({
+        when: Number(it.ts) > 0 ? Qt.formatTime(new Date(Number(it.ts) * 1000), "HH:mm") : "",
+        text: String(it.text),
+        kind: String(it.kind || "")
+      })
+    }
+    return out
+  }
+
   // ---- действия ------------------------------------------------------------
   function refreshStatus() {
     if (statusProc.running) return
@@ -558,6 +720,8 @@ Panel {
   function startHealth(heal, auto) {
     if (healthProc.running || root.vtRunning || root.busy !== "") return false
     root.healthAuto = auto === true
+    // Лечение пробовали (кнопкой или сами): это условие автоподбора сервера.
+    if (heal) root.healTried = true
     root.healthRunning = heal ? "heal" : "quick"
     root.healthStartedAt = Date.now() / 1000
     healthProc.command = [root.scriptPath, heal ? "--health" : "--health-json"]
@@ -579,7 +743,9 @@ Panel {
     else if (which === "audit") auditProc.running = false
     else if (which === "optimize") optimizeProc.running = false
     else if (which === "rescan") rescanProc.running = false
-    else if (which === "upd") updProc.running = false
+    else if (which === "state") stateProc.running = false
+    else if (which === "upall") updateAllProc.running = false
+    else if (which === "note") noteProc.running = false
     else if (which === "action") actionProc.running = false
   }
 
@@ -599,6 +765,13 @@ Panel {
   function healthDue(sec) {
     if (!(root.healthChecked > 0)) return true
     return (Date.now() / 1000 - root.healthChecked) > (sec || 600)
+  }
+
+  // Порог «пора перепроверить». Под guard проверки реже: восстановлением
+  // занимается он, а лишние опросы только шумят и греют сеть.
+  function healthMaxAge() {
+    if (!root.guardActive) return 600
+    return root.onBattery ? 1200 : 900
   }
 
   // Смена сети по ключу из снимка. Ключ может мигнуть (каскад источников в
@@ -627,6 +800,104 @@ Panel {
     // Долгие операции идут минутами — человек успевает отойти от экрана.
     notifyProc.command = ["notify-send", "-a", "Обходы", title, body || ""]
     notifyProc.running = true
+  }
+
+  // ---- обновления: запуск, скачивание апдейтера, журнал --------------------
+  function refreshUpdater() {
+    if (stateProc.running) return
+    root.stateAwait = true
+    stateProc.running = true
+  }
+
+  // Апдейтера нет (виджет обновился раньше CLI) — скачиваем один раз.
+  function fetchUpdater() {
+    if (root.updaterFetching) return
+    root.updaterFetching = true
+    root.upError = "обновления: нет omavpn-updater — скачиваю"
+    fetchProc.running = true
+  }
+
+  function startUpdateAll() {
+    if (root.busy !== "" || updateAllProc.running || root.healthBusy || root.vtRunning) return false
+    root.busy = "upall"
+    root.opError = ""
+    root.notice = ""
+    updateAllProc.running = true
+    return true
+  }
+
+  // Запись в журнал действий: одна строка "kind|текст". Очередь на один
+  // процесс — иначе вторая запись затирала команду первой и терялась.
+  function logNote(kind, text) {
+    var line = (kind || "note") + "|" + text
+    var q = root.noteQueue.slice()
+    q.push(line)
+    if (noteProc.running) { root.noteQueue = q; return }
+    root.noteQueue = q
+    root.noteNext()
+  }
+  function noteNext() {
+    if (noteProc.running || root.noteQueue.length === 0) return
+    var q = root.noteQueue.slice()
+    var line = q.shift()
+    root.noteQueue = q
+    noteProc.command = [root.updaterPath, "--note", line]
+    noteProc.running = true
+  }
+
+  // Тихий уведомлятор: об обновлениях сообщаем не чаще раза в сутки.
+  function maybeNotifyUpdates() {
+    if (!root.upAny) return
+    var now = Date.now() / 1000
+    if (root.upNotifiedAt > 0 && (now - root.upNotifiedAt) < 86400) return
+    root.upNotifiedAt = now
+    var names = []
+    for (var i = 0; i < root.updItems.length; i++) names.push(root.updItems[i].name)
+    root.notify("Обходы: есть обновления", names.join(", "))
+  }
+
+  // Автоподбор сервера — фолбэк без guard: лечение уже пробовали, плохо две
+  // проверки подряд. Туннель перезапускается, поэтому на батарее не трогаем.
+  // Триггер узкий — только VPN и YouTube: общий verdict "bad" мог означать
+  // zapret/tg-ws-proxy/DeepSeek/Telegram, и менять из-за них регион нельзя —
+  // это молчаливая смена сервера по чужой проблеме.
+  function maybeAutoOptimize() {
+    if (root.guardActive || root.onBattery) return
+    if (!root.vpnOn || root.vpn.installed === false) return
+    if (root.badStreak < 2 || !root.healTried) return
+    if (root.hState("vpn", "") !== "bad" && root.hState("youtube", "") !== "bad") return
+    if (root.busy !== "" || root.healthBusy || root.vtRunning || optimizeProc.running) return
+    var now = Date.now() / 1000
+    // Ноль — берём время прошлого подбора из кэша: сразу после ручного подбора
+    // автоматический был бы лишним.
+    var last = root.autoOptimizeAt > 0 ? root.autoOptimizeAt
+      : Number(root.vt.finished || root.vt.updated || 0)
+    if (last > 0 && (now - last) < 3600) return
+    root.autoOptimizeAt = now
+    root.optimizeAuto = true
+    root.busy = "vtest"
+    optimizeProc.running = true
+    root.logNote("auto", "плохо две проверки подряд — подбираю другой сервер")
+  }
+
+  // Автоаудит маршрутов — только если аудитом не занимается таймер guard.
+  // Аудит рвёт трафик на минуту, поэтому: две плохие проверки подряд и
+  // предупреждение человеку до запуска (уведомление, а не тихий разрыв).
+  function maybeAutoAudit() {
+    if (root.auditTimerActive || root.onBattery || !root.vpnOn) return
+    if (root.busy !== "" || root.healthBusy || root.vtRunning || auditProc.running) return
+    if (root.hState("youtube", "") !== "bad" && root.hState("discord", "") !== "bad") return
+    if (root.badStreak < 2) return
+    var now = Date.now() / 1000
+    var last = root.autoAuditAt > 0 ? root.autoAuditAt : Number(root.ra.checked || 0)
+    if (last > 0 && (now - last) < 1800) return
+    root.autoAuditAt = now
+    root.auditAuto = true
+    root.busy = "audit"
+    root.notify("Обходы: домены не отвечают",
+      "проверяю маршруты (трафик прервётся на минуту)")
+    auditProc.running = true
+    root.logNote("auto", "домены не отвечают — запускаю аудит маршрутов")
   }
 
   function askConfirm(kind, message) {
@@ -661,7 +932,7 @@ Panel {
   // Функция, а не property: при инициализации соседние id ещё могут быть null,
   // а к моменту нажатия клавиши они уже существуют.
   function actionButtons() {
-    return [checkAllBtn, bestBtn, rescanBtn, auditBtn, updateBtn]
+    return [checkAllBtn, bestBtn, rescanBtn, auditBtn, updateBtn, updateAllBtn]
   }
   function keyTab(dir) {
     if (confirmDlg.opened) { root.confirmToggle(); return }
@@ -708,11 +979,9 @@ Panel {
     } else if (kind === "update") {
       if (blocked) { refuse(); return }
       root.run(["update"], "update")
-    } else if (kind === "upd") {
-      if (updProc.running || blocked) { refuse(); return }
-      root.opError = ""
-      root.busy = "upd"
-      updProc.running = true
+    } else if (kind === "updateall") {
+      if (blocked) { refuse(); return }
+      root.startUpdateAll()
     }
   }
 
@@ -767,12 +1036,15 @@ Panel {
     // после открытия мышью нажимал кнопку, которую человек не выбирал.
     root.keyIndex = -1
     root.refreshStatus()
+    // Открытие панели — повод перечитать и обновления: снимок --state-json
+    // дешёвый (systemctl + чтение кэша), сеть он не трогает.
+    root.refreshUpdater()
     if (!root.vpnLoaded || (Date.now() / 1000 - (root.vpnInfo.updated || 0)) > 120)
       root.refreshVpn()
     // Открытие панели — это не повод лечить VPN и не повод занимать busy:
     // только чтение готового health.json, лечение — по кнопке. Перезапускаем
     // проверку, если результата нет или он старше 10 минут (по отметке checked).
-    if (!root.healthBusy && root.healthDue(600)) root.startHealth(false)
+    if (!root.healthBusy && root.healthDue(root.healthMaxAge())) root.startHealth(false)
   }
 
   implicitWidth: button.implicitWidth
@@ -982,19 +1254,36 @@ Panel {
             root.notice = "VPN: " + h.actions.join("; ")
             noticeTimer.restart()
           }
+          // Серия плохих проверок: две подряд — повод менять сервер.
+          root.badStreak = d.verdict === "bad" ? root.badStreak + 1 : 0
           if (was === "heal") {
             // Лечение могло переключить профиль/сервер — список серверов устарел.
             root.refreshVpn()
             // Автоматическое лечение не должно дёргать человека уведомлением:
             // философия виджета — он работает незаметно.
             if (!auto) root.notify("Обходы: проверка", d.summary || "готово")
-          } else if (d.verdict === "bad" && root.vpnOn && root.vpn.installed !== false
-              && (Date.now() / 1000 - root.autoHealAt) > root.autoHealGap) {
-            // Плохо при включённом VPN → лечим сами, без нажатий. Порог равен
-            // HEAL_MIN_GAP бэкенда: при меньшем каждые 15 минут уходил полный
-            // --health, который тут же получал heal.skipped.
-            root.autoHealAt = Date.now() / 1000
-            Qt.callLater(function() { root.startHealth(true, true) })
+          } else {
+            // Плохо при включённом VPN — повод что-то делать; хорошо — сброс серии.
+            if (d.verdict === "bad" && root.vpnOn && root.vpn.installed !== false) {
+              if (root.guardActive) {
+                // Единый лечащий контур: туннель восстанавливает guard, виджет
+                // только показывает результат. Своё лечение здесь означало бы
+                // два перезапуска VPN подряд — они мешают друг другу.
+                root.maybeAutoOptimize()
+              } else if ((Date.now() / 1000 - root.autoHealAt) > root.autoHealGap) {
+                // Фолбэк без guard: лечим сами, без нажатий. Порог равен
+                // HEAL_MIN_GAP бэкенда: при меньшем каждые 15 минут уходил полный
+                // --health, который тут же получал heal.skipped.
+                root.autoHealAt = Date.now() / 1000
+                root.logNote("auto", "плохо при выключенном guard — лечу VPN")
+                Qt.callLater(function() { root.startHealth(true, true) })
+              } else {
+                // Лечение уже пробовали и не помогло — дальше имеет смысл менять
+                // сервер, а не повторять то же лечение.
+                root.maybeAutoOptimize()
+              }
+            }
+            Qt.callLater(function() { root.maybeAutoAudit() })
           }
         }
       }
@@ -1040,18 +1329,24 @@ Panel {
     }
     onExited: function(code) {
       var timedOut = root.takeTimeout("optimize")
+      var auto = root.optimizeAuto
+      root.optimizeAuto = false
       root.busy = ""
       var msg = timedOut ? "подбор не ответил за 4 минуты — прерван" : "не удалось запустить подбор"
+      var failed = timedOut || code !== 0
       if (code === 0 && !timedOut) {
         try {
           var d = JSON.parse(optimizeOut.text)
           if (d && d.message) msg = d.message
           else if (d && d.error) msg = d.error
+          if (d && d.error) failed = true
         } catch (e) { /* пустой вывод */ }
       }
       root.notice = msg
       noticeTimer.restart()
-      root.notify("Обходы: подбор", msg)
+      // Автоматический подбор работает незаметно: уведомление только о неудаче.
+      if (!auto || failed) root.notify("Обходы: подбор", msg)
+      if (auto) root.logNote("auto", failed ? ("подбор не удался: " + msg) : ("подобрал сервер: " + msg))
       root.refreshStatus()
       root.refreshVpn()
     }
@@ -1071,8 +1366,11 @@ Panel {
     }
     onExited: function(code) {
       var timedOut = root.takeTimeout("audit")
+      var auto = root.auditAuto
+      root.auditAuto = false
       root.busy = ""
       var msg = timedOut ? "аудит маршрутов не ответил за 20 минут" : "не удалось проверить маршруты"
+      var failed = timedOut || code !== 0
       var d = null
       try { d = JSON.parse(auditOut.text) } catch (e) { d = null }
       if (!timedOut && code === 0 && d) {
@@ -1080,39 +1378,133 @@ Panel {
         else if (d.reason === "lock_error") msg = "уже идёт проверка — лок занят"
         else if (d.verdict === "error") msg = "аудит не выполнился: " + (d.error || d.summary || "неизвестная ошибка")
         else if (d.summary) msg = d.summary
+        if (d.verdict === "error" || d.reason === "already_running" || d.reason === "lock_error")
+          failed = true
       } else if (!timedOut) {
         root.opError = "аудит маршрутов завершился ошибкой (код " + code + ")"
       }
       root.notice = msg
       noticeTimer.restart()
-      root.notify("Обходы: маршруты", msg)
+      // Автоматический аудит молчит об успехе: он и должен работать незаметно.
+      if (!auto || failed) root.notify("Обходы: маршруты", msg)
+      if (auto) root.logNote("auto", failed ? ("аудит не удался: " + msg) : ("аудит: " + msg))
       root.refreshStatus()
     }
   }
 
+  // ---- обновления (omavpn-updater) -----------------------------------------
+  // Снимок: обновления (кэш 24 ч), guard, питание и журнал действий. Ничего не
+  // меняет, поэтому спрашивать можно и раз в 5 минут, и при открытии панели.
   Process {
-    id: updProc
-    command: [root.scriptPath, "--update-components"]
-    stdout: StdioCollector { id: updOut; waitForEnd: true }
+    id: stateProc
+    command: [root.updaterPath, "--state-json"]
+    stdout: StdioCollector { id: stateOut; waitForEnd: true }
     onRunningChanged: {
-      if (running || root.busy !== "upd") return
-      root.busy = ""
-      root.opError = "обновление не выполнено: " + root.startErrorText
+      if (running || !root.stateAwait) return
+      root.stateAwait = false
+      // Таймаут сторожа — не отсутствие апдейтера: скачивание тут не помогает.
+      if (root.timeouts.state === true) return
+      // Не запустился — почти всегда апдейтера нет: скачиваем один раз.
+      root.fetchUpdater()
     }
     onExited: function(code) {
-      var timedOut = root.takeTimeout("upd")
-      root.busy = ""
-      var msg = timedOut ? "обновление не ответило за 30 минут" : "не удалось обновить"
-      if (code === 0 && !timedOut) {
-        try {
-          var d = JSON.parse(updOut.text)
-          if (d && d.messages && d.messages.length) msg = d.messages.join("; ")
-        } catch (e) { /* пустой вывод */ }
+      root.stateAwait = false
+      if (root.takeTimeout("state")) {
+        root.upError = "обновления: проверка не ответила за 90 с"
+        return
       }
-      root.notice = msg
-      noticeTimer.restart()
-      root.notify("Обходы: обновления", msg)
+      var d = null
+      try { d = JSON.parse(stateOut.text) } catch (e) { d = null }
+      if (code !== 0 || !d || d.ok !== true) {
+        root.upError = (d && d.error) ? ("обновления: " + d.error)
+          : ("обновления: проверка не удалась (код " + code + ")")
+        return
+      }
+      root.upError = ""
+      root.up = d
+      root.upChecked = Number(d.checked || 0)
+      root.upLoaded = true
+      root.maybeNotifyUpdates()
+    }
+  }
+
+  // Апдейтера может не быть (виджет обновился раньше CLI): одна попытка за
+  // сессию, результат — мягким текстом в разделе обновлений.
+  Process {
+    id: fetchProc
+    command: ["bash", "-lc",
+      "mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/main/bin/omavpn-updater -o ~/.local/bin/omavpn-updater && chmod 755 ~/.local/bin/omavpn-updater"]
+    stderr: StdioCollector { id: fetchErr; waitForEnd: true }
+    // Не запустился сам bash — снимаем флаг, иначе повторов не будет вовсе.
+    onRunningChanged: {
+      if (running || !root.updaterFetching) return
+      root.updaterFetching = false
+      root.upError = "обновления: не удалось получить omavpn-updater (нет сети?)"
+    }
+    onExited: function(code) {
+      root.updaterFetching = false
+      if (code === 0) {
+        root.upError = ""
+        root.refreshUpdater()
+      } else {
+        root.upError = "обновления: не удалось получить omavpn-updater (нет сети?)"
+      }
+    }
+  }
+
+  // Обновление всего: компоненты, ядро (в терминале) и виджет. Только по
+  // подтверждению — апдейтер ядра сам спрашивает пароль через pkexec.
+  Process {
+    id: updateAllProc
+    command: [root.updaterPath, "--update-json", "--only", "all"]
+    stdout: StdioCollector { id: updateAllOut; waitForEnd: true }
+    onRunningChanged: {
+      if (running || root.busy !== "upall") return
+      root.busy = ""
+      root.upError = "обновление не выполнено: нет " + root.updaterPath
+    }
+    onExited: function(code) {
+      var timedOut = root.takeTimeout("upall")
+      root.busy = ""
+      var d = null
+      try { d = JSON.parse(updateAllOut.text) } catch (e) { d = null }
+      var msg = ""
+      if (d && d.messages && d.messages.length) msg = d.messages.join("; ")
+      var failed = timedOut || code !== 0 || (d && d.ok === false)
+      if (timedOut) msg = "обновление не ответило за 60 минут"
+      else if (msg === "") msg = failed ? "обновление завершилось ошибкой (код " + code + ")" : "обновлять нечего"
+      if (failed) root.opError = msg
+      else { root.notice = msg; noticeTimer.restart() }
+      // В журнал не пишем: апдейтер сам добавляет строку "update: …" — иначе
+      // на одно обновление появлялись две записи с разным текстом.
+      if (d && d.restart_required) {
+        root.notify("Обходы: обновления", "оболочка перезапустится через 4 секунды")
+        restartShellProc.running = true
+      } else {
+        root.refreshUpdater()
+      }
       root.refreshStatus()
+    }
+  }
+
+  // Перезапуск оболочки после подмены Panel.qml. Отдельная сессия (setsid
+  // --fork): quickshell при выходе убивает своего потомка, и обычный дочерний
+  // процесс не успел бы довести перезапуск до конца.
+  Process {
+    id: restartShellProc
+    command: ["setsid", "--fork", "bash", "-lc", "sleep 4; omarchy restart shell"]
+    onExited: function(code) { root.refreshUpdater() }
+  }
+
+  // Журнал действий: одна строка "kind|текст" на запуск.
+  Process {
+    id: noteProc
+    command: [root.updaterPath, "--note", "note|"]
+    onExited: function(code) {
+      // Сторож noteWatch мог прервать запись: метку забираем здесь, иначе она
+      // висит до конца сессии (никто, кроме нас, её не читает).
+      root.takeTimeout("note")
+      root.noteNext()
     }
   }
 
@@ -1208,16 +1600,30 @@ Panel {
     onTriggered: root.refreshStatus()
   }
 
-  // Монитор работоспособности: комплексная проверка каждые 5 минут — только чтение.
+  // Монитор работоспособности: комплексная проверка — только чтение.
+  // Под guard проверки реже (15 минут, на батарее 20): туннель восстанавливает
+  // он, а частые опросы только шумят. Без guard — 5 минут, на батарее 15.
   Timer {
     id: healthTimer
-    interval: 300000
+    interval: root.guardActive ? (root.onBattery ? 1200000 : 900000)
+      : (root.onBattery ? 900000 : 300000)
     running: true
     repeat: true
     onTriggered: {
       if (root.busy !== "" || root.healthBusy || root.vtRunning) return
       root.startHealth(false)
     }
+  }
+
+  // Снимок обновлений и журнала: раз в 5 минут и при открытии панели.
+  // Апдейтер сам ходит в сеть не чаще раза в сутки (его кэш), остальное — чтение.
+  Timer {
+    id: stateTimer
+    interval: 300000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.refreshUpdater()
   }
 
   // Сторожа процессов: интервал = предел ожидания, взводится вместе с запуском.
@@ -1234,7 +1640,15 @@ Panel {
   Timer { id: auditWatch; interval: 1200000; running: auditProc.running; onTriggered: root.killProc("audit") }
   Timer { id: optimizeWatch; interval: 240000; running: optimizeProc.running; onTriggered: root.killProc("optimize") }
   Timer { id: rescanWatch; interval: 120000; running: rescanProc.running; onTriggered: root.killProc("rescan") }
-  Timer { id: updWatch; interval: 1800000; running: updProc.running; onTriggered: root.killProc("upd") }
+  // 90 с, а не 30: --state-json делает четыре сетевых запроса (GitHub, AUR,
+  // репозитории ядра) и на плохой сети честно идёт до ~80 с. Тридцатисекундный
+  // сторож рубил законную проверку и показывал ошибку.
+  Timer { id: stateWatch; interval: 90000; running: stateProc.running; onTriggered: root.killProc("state") }
+  // 60 минут: ядро тянется с GitHub, а один шаг установки идёт в терминале с
+  // паролем — человеку нужно время вернуться. Компоненты (zapret, tg-ws-proxy)
+  // на плохой сети идут до 15–30 минут каждая.
+  Timer { id: updateAllWatch; interval: 3600000; running: updateAllProc.running; onTriggered: root.killProc("upall") }
+  Timer { id: noteWatch; interval: 20000; running: noteProc.running; onTriggered: root.killProc("note") }
   Timer { id: actionWatch; interval: 180000; running: actionProc.running; onTriggered: root.killProc("action") }
 
   // ---- кнопка в панели -----------------------------------------------------
@@ -1920,73 +2334,148 @@ Panel {
             }
           }
 
-          // обновления компонентов
-          Rectangle {
-            id: updRow
-            readonly property var u: root.bs ? root.bs.updates : null
-            readonly property bool has: !!(u && ((u.zapret && u.zapret.update) || (u.tgwsproxy && u.tgwsproxy.update)))
-            visible: has
-            width: parent.width
-            implicitHeight: ur.implicitHeight + Style.space(14)
-            radius: Style.cornerRadius > 0 ? Style.space(10) : 0
-            color: umouse.containsMouse ? root.hoverFill : "transparent"
+        }
+
+        // ---------- обновления ----------
+        // Отдельный раздел, а не строка в списке статусов: тут видно, что именно
+        // и на какую версию обновится, и одна кнопка на всё.
+        Rectangle {
+          width: parent.width
+          radius: Style.cornerRadius > 0 ? Style.space(12) : 0
+          color: root.cardFill
+          border.width: 1
+          border.color: root.hairline
+          implicitHeight: updBox.implicitHeight + Style.space(24)
+
+          Column {
+            id: updBox
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: Style.space(12)
+            spacing: Style.space(8)
 
             Row {
-              id: ur
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(10)
+              width: parent.width
               spacing: Style.space(10)
 
               Pictogram {
                 name: "update"
-                tint: root.warn
+                tint: root.upAny ? root.warn : root.dim
                 px: Style.space(18)
                 anchors.verticalCenter: parent.verticalCenter
               }
-              Column {
-                width: parent.width - Style.space(120)
-                spacing: Style.space(1)
-                Text {
-                  textFormat: Text.PlainText
-                  text: "Обновления"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                }
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: root.busy === "upd" ? "обновляю…" : "есть новые версии — нажми, чтобы обновить"
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
-                }
-              }
               Text {
                 textFormat: Text.PlainText
-                text: "обновить"
-                color: root.warn
+                text: "ОБНОВЛЕНИЯ"
+                color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 0.8
+                anchors.verticalCenter: parent.verticalCenter
               }
             }
 
-            MouseArea {
-              id: umouse
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: {
-                if (root.busy !== "" || root.tunnelBusy || root.healthBusy) return
-                // Обновление компонентов идёт через pkexec, то есть с паролем.
-                root.askConfirm("upd",
-                  "Обновить zapret и tg-ws-proxy?\nПонадобится пароль (pkexec) и 1–2 минуты. Трафик может прерваться.")
+            // по строке на компонент с новой версией
+            Repeater {
+              model: root.updItems
+
+              Text {
+                required property var modelData
+                width: parent.width
+                textFormat: Text.PlainText
+                text: modelData.text
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
               }
             }
+
+            // ничего нового или ошибка проверки — одна приглушённая строка
+            Text {
+              width: parent.width
+              // В фолбэке (апдейтер недоступен, данные из снимка статуса) строки
+              // компонентов показаны, но «проверено HH:mm» всё равно нужно.
+              visible: !root.upAny || root.upFallbackActive
+              textFormat: Text.PlainText
+              text: root.upStatusText
+              color: root.upError !== "" ? root.warn : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            ActionButton {
+              id: updateAllBtn
+              keyIndex: 5
+              visible: root.upAny
+              text: root.busy === "upall" ? "обновляю…" : "Обновить всё"
+              accent: root.warn
+              tooltipText: "Компоненты, ядро (в терминале с паролем) и виджет с перезапуском оболочки"
+              // Туннель занят подбором или лечением — обновление подождёт.
+              enabled: root.upAny && root.busy === "" && !root.healthBusy && !root.tunnelBusy
+              onClicked: root.askConfirm("updateall", root.updateAllMessage)
+            }
+          }
+        }
+
+        // ---------- журнал: что виджет сделал сам ----------
+        Column {
+          width: parent.width
+          spacing: Style.space(4)
+          visible: root.upActions.length > 0 || (root.guardActive && root.guardKnown)
+
+          Text {
+            textFormat: Text.PlainText
+            visible: root.upActions.length > 0
+            text: "ЧТО ВИДЖЕТ СДЕЛАЛ САМ"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 0.8
+          }
+
+          Repeater {
+            model: root.upActions
+
+            Row {
+              id: arow
+              required property var modelData
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                textFormat: Text.PlainText
+                text: arow.modelData.when
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                width: Style.space(38)
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: arow.modelData.text
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+                width: parent.width - Style.space(46)
+              }
+            }
+          }
+
+          // Единый лечащий контур: видно, кто именно держит туннель. Без снимка
+          // апдейтера состояние неизвестно — не утверждаем, что guard работает.
+          Text {
+            textFormat: Text.PlainText
+            visible: root.guardActive && root.guardKnown
+            text: "автовосстановление: guard"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
         }
 
@@ -2036,6 +2525,55 @@ Panel {
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
             onClicked: root.setSetting("autoconnect", !root.autoconnect)
+          }
+        }
+
+        // Тихая иконка: когда всё в порядке, пиктограмма в баре не красится.
+        Rectangle {
+          id: quietRowBox
+          width: parent.width
+          implicitHeight: quietRow.implicitHeight + Style.space(12)
+          radius: Style.cornerRadius > 0 ? Style.space(10) : 0
+          color: quietMouse.containsMouse ? root.hoverFill : "transparent"
+
+          Row {
+            id: quietRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(10)
+            spacing: Style.space(10)
+
+            Pictogram {
+              name: "check"
+              tint: root.quietBar ? Color.accent : root.dim
+              px: Style.space(18)
+              anchors.verticalCenter: parent.verticalCenter
+            }
+            Text {
+              textFormat: Text.PlainText
+              text: "Тихая иконка"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              width: parent.width - Style.space(90)
+            }
+            Text {
+              textFormat: Text.PlainText
+              text: root.quietBar ? "вкл" : "выкл"
+              color: root.quietBar ? Color.accent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          MouseArea {
+            id: quietMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.setSetting("quietBar", !root.quietBar)
           }
         }
 

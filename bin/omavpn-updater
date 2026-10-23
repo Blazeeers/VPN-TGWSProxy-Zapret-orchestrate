@@ -1,0 +1,950 @@
+#!/usr/bin/env python3
+"""omavpn-updater — проверка и установка обновлений omavpn.
+
+Отдельный самостоятельный инструмент: ничего в существующих скриптах не меняет,
+bypass-status только читает (его кэш updates.json) и вызывает в готовых режимах.
+
+Вывод всегда JSON в stdout, ошибки — тоже JSON с ok:false.
+
+    omavpn-updater --state-json [--force]        # состояние + проверка обновлений (кэш 24 ч)
+    omavpn-updater --update-json --only widget|components|core|all
+    omavpn-updater --note "kind|текст"           # записать действие в журнал
+
+Зависимостей нет (только stdlib), root не нужен: установщик ядра сам спросит
+пароль через pkexec в терминале.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+try:
+    import fcntl
+except ImportError:  # не POSIX — журнал работает без блокировки
+    fcntl = None
+
+# --- Пути --------------------------------------------------------------------
+# Всё через HOME/XDG: дома у ноутбука и ПК разные, хардкод путей недопустим.
+HOME = os.path.expanduser("~")
+APP = "omavpn"
+CACHE_DIR = os.path.join(HOME, ".cache", APP)
+CACHE_UPDATER = os.path.join(CACHE_DIR, "updater.json")   # наш кэш проверки (24 ч)
+CACHE_UPDATES = os.path.join(CACHE_DIR, "updates.json")   # пишет bypass-status --updates
+ACTIONS_FILE = os.path.join(CACHE_DIR, "actions.jsonl")   # журнал действий
+SHARE_BIN = os.path.join(HOME, ".local", "share", APP, "bin")
+LOCAL_BIN = os.path.join(HOME, ".local", "bin")
+PLUGIN_ID = "io.github.blazeeers.omavpn"
+PLUGIN_DIR = os.path.join(HOME, ".config", "omarchy", "plugins", PLUGIN_ID)
+
+REPO = "Blazeeers/VPN-TGWSProxy-Zapret-orchestrate"
+BRANCH = "main"
+RAW = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}"
+TARBALL = f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/{BRANCH}"
+
+CHECK_TTL = 24 * 3600      # как часто ходим в сеть за проверкой обновлений
+PARTIAL_TTL = 600          # сбойная проверка (нет сети) — кэш на 10 минут
+ACTIONS_MAX = 200          # журнал действий не растёт бесконечно
+ACTIONS_SHOW = 10          # сколько последних действий отдаём в состоянии
+CURL_TIMEOUT = 15          # обычный запрос (манифест, API)
+TARBALL_TIMEOUT = 300      # архив репозитория
+SYSTEMCTL_TIMEOUT = 5
+UPDATES_TIMEOUT = 15       # bypass-status --updates (не держим панель дольше)
+COMPONENTS_TIMEOUT = 900   # bypass-status --update-components (zapret/tg-ws-proxy)
+WIDGET_BACKUPS_KEEP = 3    # сколько бэкапов виджета оставлять в кэше
+TERMINALS = ("foot", "xterm", "alacritty", "kitty")
+
+# Мусор, который не должен доезжать до плагина при копировании.
+COPY_SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini", ".git", "__pycache__",
+                   ".idea", ".vscode", ".directory"}
+COPY_SKIP_SUFFIXES = ("~", ".swp", ".swo", ".tmp", ".bak")
+
+
+# --- Мелочи ------------------------------------------------------------------
+def emit(data: dict) -> None:
+    """Единственный способ писать в stdout — всегда валидный JSON."""
+    print(json.dumps(data, ensure_ascii=False))
+
+
+def _num(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ver_tuple(value: str):
+    """Версия в кортеж чисел: '1.14.1' -> (1, 14, 1), мусор -> ()."""
+    parts = re.findall(r"\d+", value or "")
+    return tuple(int(p) for p in parts[:4]) if parts else ()
+
+
+def _read_json(path: str, default=None):
+    """Чтение JSON без исключений: нет файла/битый — default."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(path: str, data) -> None:
+    """Атомарная запись JSON (tmp + os.replace): половины файла не бывает."""
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=folder or ".")
+    try:
+        # mkstemp даёт 0600 — файл плагина должен читаться как обычный (0644),
+        # а у существующего сохраняем его же права.
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            mode = 0o644
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.chmod(tmp, mode)
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_copy(src: str, dst: str, mode: int | None = None) -> None:
+    """Копирование через временный файл: старый файл не пропадает до успеха."""
+    folder = os.path.dirname(dst)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    if mode is None:
+        # Права берём у исходника (в репозитории 0644), mkstemp по умолчанию 0600.
+        try:
+            mode = os.stat(src).st_mode & 0o777
+        except OSError:
+            mode = 0o644
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=folder or ".")
+    os.close(fd)
+    try:
+        shutil.copyfile(src, tmp)
+        os.chmod(tmp, mode)
+        os.replace(tmp, dst)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def run(cmd: list[str], timeout: float, cwd: str | None = None) -> tuple[int, str]:
+    """Запуск без shell: пути с пробелами и кавычками безопасны."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                              timeout=timeout, cwd=cwd)
+        return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        # Нет бинаря / таймаут — это не повод падать, вернём ошибку кодом.
+        return 1, ""
+
+
+# --- Сеть --------------------------------------------------------------------
+def _http_text(url: str, timeout: float = CURL_TIMEOUT, api: bool = False) -> str:
+    """Текст по HTTP через curl. Нет сети/curl — пустая строка, без трейсбека."""
+    if not shutil.which("curl"):
+        return ""
+    cmd = ["curl", "-fsSL", "--max-time", str(int(timeout))]
+    if api:
+        cmd += ["-H", "Accept: application/vnd.github+json"]
+    cmd.append(url)
+    code, out = run(cmd, timeout + 5)
+    return out if code == 0 else ""
+
+
+def _gh_latest(repo: str) -> str:
+    """Тег последнего релиза на GitHub (без ведущего 'v'), иначе ''."""
+    text = _http_text(f"https://api.github.com/repos/{repo}/releases/latest",
+                      api=True)
+    data = _read_json_text(text)
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("tag_name") or "").lstrip("v")
+
+
+def _read_json_text(text: str):
+    try:
+        return json.loads(text) if text else None
+    except ValueError:
+        return None
+
+
+def _safe(fn, *args):
+    """Обёртка для потоков: любое исключение -> ''."""
+    try:
+        return fn(*args)
+    except Exception:  # noqa: BLE001 — проверка обновлений не должна падать вовсе
+        return ""
+
+
+def _bin_version(path: str, prefix: str | None = None) -> str:
+    """Версия из `<бинарь> version` (первая строка)."""
+    if not os.path.isfile(path) or not os.access(path, os.X_OK):
+        return ""
+    code, out = run([path, "version"], timeout=10)
+    first = (out.splitlines() or [""])[0].strip()
+    if not first:
+        return ""
+    # xray: "Xray 26.3.27 …", sing-box: "sing-box version 1.14.1" — «version» необязателен.
+    pattern = (rf"{re.escape(prefix)}\s+(?:version\s+)?(\d[\d.]*)" if prefix
+               else r"(\d+\.\d+[.\d]*)")
+    match = re.search(pattern, first)
+    return match.group(1) if match else ""
+
+
+def _pinned_from_install(text: str, name: str) -> str:
+    """XRAY_VER из install.sh: `XRAY_VER="${XRAY_VER:-26.3.27}"` -> 26.3.27."""
+    match = re.search(rf'{name}="\$\{{{name}:-([^}}"]+)\}}"', text or "")
+    return match.group(1) if match else ""
+
+
+def _bypass_status() -> str:
+    """Где лежит bypass-status: сначала свой ~/.local/bin, потом PATH."""
+    own = os.path.join(LOCAL_BIN, "bypass-status")
+    if os.path.isfile(own) and os.access(own, os.X_OK):
+        return own
+    return shutil.which("bypass-status") or ""
+
+
+def _components_meta() -> dict:
+    """zapret/tg-ws-proxy из кэша bypass-status; устарел — один раз обновляем."""
+    data = _read_json(CACHE_UPDATES, {})
+    fresh = (isinstance(data, dict)
+             and time.time() - _num(data.get("checked")) < CHECK_TTL)
+    if not fresh:
+        tool = _bypass_status()
+        if tool:
+            # bypass-status не меняем и не дублируем: просто просим пересчитать кэш.
+            run([tool, "--updates"], timeout=UPDATES_TIMEOUT)
+            data = _read_json(CACHE_UPDATES, {}) or (data if isinstance(data, dict) else {})
+    return data if isinstance(data, dict) else {}
+
+
+def _component_entry(data: dict, key: str, what: str) -> dict:
+    """Строка обновления компонента из кэша bypass-status."""
+    item = (data or {}).get(key)
+    item = item if isinstance(item, dict) else {}
+    entry = {
+        "installed": str(item.get("installed") or ""),
+        "latest": str(item.get("latest") or ""),
+        "update": bool(item.get("update")),
+    }
+    problems = []
+    if not data:
+        problems.append("нет кэша updates.json (bypass-status не запускался)")
+    elif not item:
+        problems.append("нет данных по компоненту")
+    if isinstance(item, dict) and not entry["latest"]:
+        problems.append("не удалось получить последнюю версию")
+    if problems:
+        entry["error"] = "; ".join(problems) + f" ({what})"
+    return entry
+
+
+def _gather_updates() -> dict:
+    """Полная проверка: виджет, ядро, компоненты. Сетевые сбои — в поле error."""
+    installed = _read_json(os.path.join(PLUGIN_DIR, "manifest.json"), {})
+    installed = installed if isinstance(installed, dict) else {}
+    widget_installed = str(installed.get("version") or "")
+
+    # Четыре независимых сетевых запроса — параллельно, чтобы --state-json не подвисал.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        f_manifest = pool.submit(_safe, _http_text, f"{RAW}/manifest.json")
+        f_install = pool.submit(_safe, _http_text, f"{RAW}/install.sh")
+        f_xray = pool.submit(_safe, _gh_latest, "XTLS/Xray-core")
+        f_singbox = pool.submit(_safe, _gh_latest, "SagerNet/sing-box")
+        manifest_text = f_manifest.result() or ""
+        install_text = f_install.result() or ""
+        xray_latest = f_xray.result() or ""
+        singbox_latest = f_singbox.result() or ""
+
+    remote = _read_json_text(manifest_text)
+    widget_latest = str(remote.get("version") or "") if isinstance(remote, dict) else ""
+    widget = {
+        "installed": widget_installed,
+        "latest": widget_latest,
+        "update": bool(widget_latest and _ver_tuple(widget_latest) > _ver_tuple(widget_installed)),
+    }
+    if not widget_latest:
+        widget["error"] = "не удалось прочитать manifest.json из main (нет сети?)"
+
+    def core(name: str, binary: str, prefix: str, var: str, latest: str) -> dict:
+        """Ядро: сравнение закреплённой версии с установленной.
+
+        latest — только информация: обновляемся до проверенной (pinned), иначе
+        можно поймать релиз без проверки sha256 и с другим поведением TUN.
+        """
+        installed_ver = _bin_version(os.path.join(SHARE_BIN, binary), prefix)
+        pinned = _pinned_from_install(install_text, var)
+        entry = {
+            "installed": installed_ver,
+            "pinned": pinned,
+            "latest": latest,
+            "update": bool(pinned and _ver_tuple(pinned) > _ver_tuple(installed_ver)),
+        }
+        problems = []
+        if not installed_ver:
+            problems.append(f"{name} не установлен в ~/.local/share/omavpn/bin")
+        if not pinned:
+            problems.append(f"не прочитан {var} из install.sh")
+        if not latest:
+            problems.append("не получен последний релиз (GitHub API)")
+        if problems:
+            entry["error"] = "; ".join(problems)
+        return entry
+
+    components = _components_meta()
+    return {
+        "widget": widget,
+        "xray": core("xray", "xray", "Xray", "XRAY_VER", xray_latest),
+        "singbox": core("sing-box", "sing-box", "sing-box", "SB_VER", singbox_latest),
+        "zapret": _component_entry(components, "zapret", "zapret"),
+        "tgwsproxy": _component_entry(components, "tgwsproxy", "tg-ws-proxy"),
+    }
+
+
+def network_updates(force: bool = False) -> tuple[float, dict, bool]:
+    """Проверка не чаще раза в 24 ч; --force — принудительно.
+
+    Третий элемент — partial: у части компонентов ошибка (обычно нет сети).
+    Такой результат кэшируем всего на PARTIAL_TTL, иначе сутки панель
+    показывала бы «всё актуально» после одной неудачной проверки.
+    """
+    cache = _read_json(CACHE_UPDATER, {})
+    if not force and isinstance(cache, dict):
+        checked = _num(cache.get("checked"))
+        updates = cache.get("updates")
+        partial = bool(cache.get("partial"))
+        ttl = PARTIAL_TTL if partial else CHECK_TTL
+        if checked and isinstance(updates, dict) and time.time() - checked < ttl:
+            return checked, updates, partial
+    updates = _gather_updates()
+    checked = time.time()
+    partial = any(isinstance(item, dict) and item.get("error")
+                  for item in updates.values())
+    try:
+        _write_json(CACHE_UPDATER, {"checked": checked, "partial": partial,
+                                    "updates": updates})
+    except OSError:
+        pass  # кэш — удобство, а не условие работы
+    return checked, updates, partial
+
+
+def _invalidate_cache() -> None:
+    """После установки виджета кэш проверки устарел — пусть пересчитается."""
+    try:
+        os.unlink(CACHE_UPDATER)
+    except OSError:
+        pass
+
+
+# --- Локальное состояние -----------------------------------------------------
+def _guard() -> dict:
+    def active(unit: str) -> str:
+        code, out = run(["systemctl", "--user", "is-active", unit],
+                        timeout=SYSTEMCTL_TIMEOUT)
+        value = out.strip().splitlines()[0] if out.strip() else ""
+        if value in ("active", "inactive", "failed", "activating", "deactivating"):
+            return "active" if value == "active" else "inactive"
+        return "unknown"
+
+    return {"timer": active("omavpn-guard.timer"),
+            "route_audit": active("omavpn-route-audit.timer")}
+
+
+def _power() -> dict:
+    """Питание по /sys: нет батареи — on_battery false, percent null."""
+    batteries = sorted(glob.glob("/sys/class/power_supply/BAT*"))
+    percent = None
+    on_battery = False
+    for path in batteries:
+        try:
+            with open(os.path.join(path, "capacity"), encoding="utf-8") as handle:
+                value = int(handle.read().strip())
+            if percent is None or value < percent:
+                percent = value
+        except (OSError, ValueError):
+            continue
+        status = ""
+        try:
+            with open(os.path.join(path, "status"), encoding="utf-8") as handle:
+                status = handle.read().strip()
+        except OSError:
+            pass
+        if status == "Discharging":
+            on_battery = True
+    return {"on_battery": on_battery, "percent": percent}
+
+
+def _read_actions(limit: int = ACTIONS_SHOW) -> list[dict]:
+    """Последние записи журнала; битые строки пропускаем."""
+    items: list[dict] = []
+    try:
+        with open(ACTIONS_FILE, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                items.append({
+                    "ts": _num(record.get("ts")),
+                    "kind": str(record.get("kind") or ""),
+                    "text": str(record.get("text") or ""),
+                })
+    except OSError:
+        return []
+    return items[-limit:]
+
+
+def _ends_with_newline() -> bool:
+    """Оканчивается ли журнал переводом строки (нет файла — считаем что да)."""
+    try:
+        size = os.path.getsize(ACTIONS_FILE)
+        if not size:
+            return True
+        fd = os.open(ACTIONS_FILE, os.O_RDONLY)
+        try:
+            return os.pread(fd, 1, size - 1) == b"\n"
+        finally:
+            os.close(fd)
+    except OSError:
+        return True
+
+
+def _trim_locked(handle) -> None:
+    """Обрезка журнала под уже взятой блокировкой: строки читаем через тот же fd.
+
+    Файл открыт в режиме "a+": запись всегда уходит в конец, чтение — с текущей
+    позиции, поэтому перед чтением делаем seek(0).
+    """
+    handle.seek(0)
+    lines = handle.readlines()
+    if len(lines) <= ACTIONS_MAX:
+        return
+    handle.seek(0)
+    handle.truncate()
+    handle.writelines(lines[-ACTIONS_MAX:])
+    handle.flush()
+
+
+def log_action(kind: str, text: str) -> bool:
+    """Запись действия в журнал (для автоматических шагов виджета тоже).
+
+    flock держим на append+trim: иначе параллельный писалщик (другой процесс
+    updater'а или виджет) теряет строку при перезаписи файла целиком.
+    """
+    record = {"ts": time.time(), "kind": kind, "text": text}
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        handle = open(ACTIONS_FILE, "a+", encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        # Если файл не оканчивается \n (оборванная запись), дописываем перевод
+        # строки: иначе наша строка склеится с мусором и станет нечитаемой.
+        # Последний байт читаем бинарно: seek в текстовом режиме на многобайтном
+        # символе ломает декодирование.
+        if not _ends_with_newline():
+            line = "\n" + line
+        handle.write(line)
+        handle.flush()
+        _trim_locked(handle)
+    except OSError:
+        return False
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
+    return True
+
+
+# --- Скачивание репозитория --------------------------------------------------
+class RepoBundle:
+    """Архив main-ветки, распакованный в кэш. Скачивается один раз на запуск.
+
+    Каталог НЕ удаляется, если из него запущен установщик в терминале: иначе
+    install.sh исчезнет из-под ног у работающего скрипта.
+    """
+
+    def __init__(self) -> None:
+        self.dir = ""
+        self.root = ""
+        self.keep = False
+
+    def ensure(self) -> str:
+        """Пустая строка — успех, иначе текст ошибки."""
+        if self.root:
+            return ""
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            self.dir = tempfile.mkdtemp(prefix="repo-", dir=CACHE_DIR)
+        except OSError as exc:
+            return f"не удалось создать временный каталог: {exc}"
+        archive = os.path.join(self.dir, "repo.tar.gz")
+        code, _ = run(["curl", "-fsSL", "--max-time", str(TARBALL_TIMEOUT),
+                       "-o", archive, TARBALL], timeout=TARBALL_TIMEOUT + 30)
+        if code != 0 or not os.path.isfile(archive) or os.path.getsize(archive) == 0:
+            self.cleanup()
+            return "не удалось скачать архив репозитория (нет сети?)"
+        try:
+            _extract(archive, self.dir)
+        except (OSError, ValueError, tarfile.TarError) as exc:
+            self.cleanup()
+            return f"не удалось распаковать архив: {exc}"
+        try:
+            os.unlink(archive)
+        except OSError:
+            pass
+        self.root = _repo_root(self.dir)
+        if not self.root:
+            self.cleanup()
+            return "в архиве не найден корень репозитория (manifest.json)"
+        return ""
+
+    def cleanup(self) -> None:
+        if self.keep or not self.dir:
+            return
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.dir = ""
+        self.root = ""
+
+
+def _extract(archive: str, dest: str) -> None:
+    """Распаковка с защитой от выхода за пределы каталога (../ и абсолютные пути).
+
+    Без `filter="data"` (Python < 3.11.4) распаковывать отказываемся: ручная
+    проверка путей не покрывает симлинки, устройства и права, а архив чужой.
+    """
+    root = os.path.realpath(dest)
+    with tarfile.open(archive) as tar:
+        for member in tar.getmembers():
+            target = os.path.realpath(os.path.join(dest, member.name))
+            if target != root and not target.startswith(root + os.sep):
+                raise ValueError(f"подозрительный путь в архиве: {member.name}")
+        if not hasattr(tarfile, "data_filter"):
+            raise ValueError("для безопасной распаковки нужен Python 3.11.4+")
+        tar.extractall(dest, filter="data")
+
+
+def _repo_root(dest: str) -> str:
+    """Корень архива GitHub: <repo>-main/manifest.json."""
+    try:
+        names = os.listdir(dest)
+    except OSError:
+        return ""
+    for name in sorted(names):
+        path = os.path.join(dest, name)
+        if os.path.isdir(path) and os.path.isfile(os.path.join(path, "manifest.json")):
+            return path
+    return ""
+
+
+def _cleanup_old_temps() -> None:
+    """Старые распаковки (старше суток) убираем: кэш не должен пухнуть."""
+    cutoff = time.time() - 24 * 3600
+    for path in glob.glob(os.path.join(CACHE_DIR, "repo-*")):
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def _skip_copy(name: str) -> bool:
+    """Мусор, который не копируем в плагин (по расширениям не фильтруем)."""
+    return name in COPY_SKIP_NAMES or name.endswith(COPY_SKIP_SUFFIXES)
+
+
+def _copy_tree(src: str, dst: str) -> list[str]:
+    """Рекурсивное копирование каталога с сохранением структуры.
+
+    Возвращает список относительных путей, которые не удалось скопировать:
+    один сломанный файл не должен отменять установку остальных.
+    """
+    failed: list[str] = []
+    for current, dirs, files in os.walk(src):
+        dirs[:] = sorted(d for d in dirs if not _skip_copy(d))
+        rel = os.path.relpath(current, src)
+        target_dir = dst if rel == "." else os.path.join(dst, rel)
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError:
+            failed.append(target_dir)
+            continue
+        for name in sorted(files):
+            if _skip_copy(name):
+                continue
+            src_file = os.path.join(current, name)
+            rel_file = os.path.normpath(os.path.join(rel, name))
+            try:
+                if os.path.islink(src_file):
+                    # Симлинки в репозитории не нужны, а копировать их опасно.
+                    continue
+                _atomic_copy(src_file, os.path.join(dst, rel_file))
+            except OSError:
+                failed.append(rel_file)
+    return failed
+
+
+def _prune_widget_backups() -> None:
+    """Оставляем WIDGET_BACKUPS_KEEP последних бэкапов виджета.
+
+    Удаляем только каталоги строго своего вида `widget-backup-YYYYmmdd-HHMMSS`
+    внутри CACHE_DIR — чужие файлы не трогаем.
+    """
+    pattern = re.compile(r"^widget-backup-\d{8}-\d{6}$")
+    try:
+        names = os.listdir(CACHE_DIR)
+    except OSError:
+        return
+    backups = sorted((name for name in names
+                      if pattern.match(name)
+                      and os.path.isdir(os.path.join(CACHE_DIR, name))),
+                     reverse=True)
+    for name in backups[WIDGET_BACKUPS_KEEP:]:
+        shutil.rmtree(os.path.join(CACHE_DIR, name), ignore_errors=True)
+
+
+# --- Обновление виджета ------------------------------------------------------
+def update_widget(bundle: RepoBundle) -> dict:
+    """Обновление плагина панели. Никогда не удаляет рабочий каталог заранее."""
+    error = bundle.ensure()
+    if error:
+        return {"ok": False, "error": error}
+
+    source = os.path.join(bundle.root, "manifest.json")
+    remote = _read_json(source)
+    if not isinstance(remote, dict):
+        return {"ok": False, "error": "в архиве битый manifest.json"}
+    new_version = str(remote.get("version") or "")
+
+    installed = _read_json(os.path.join(PLUGIN_DIR, "manifest.json"), {})
+    installed = installed if isinstance(installed, dict) else {}
+    installed_version = str(installed.get("version") or "")
+
+    if installed_version and _ver_tuple(new_version) <= _ver_tuple(installed_version):
+        return {"ok": True, "updated": False, "message": "уже последняя версия",
+                "version": installed_version}
+
+    plugin_src = os.path.join(bundle.root, "shell-plugin", "bypass-status")
+    panel = os.path.join(plugin_src, "Panel.qml")
+    if not os.path.isfile(panel):
+        return {"ok": False, "error": "в архиве нет shell-plugin/bypass-status/Panel.qml"}
+
+    # Бэкап того, что реально стоит: весь каталог плагина как есть.
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = os.path.join(CACHE_DIR, f"widget-backup-{stamp}")
+    try:
+        os.makedirs(backup, exist_ok=True)
+        if os.path.isdir(PLUGIN_DIR):
+            missed = _copy_tree(PLUGIN_DIR, backup)
+            if missed:
+                return {"ok": False,
+                        "error": f"не удалось забэкапить: {', '.join(missed[:3])}"}
+    except OSError as exc:
+        return {"ok": False, "error": f"не удалось сделать бэкап: {exc}"}
+
+    # Копируем только после успешного бэкапа, каждый файл — атомарно.
+    try:
+        os.makedirs(PLUGIN_DIR, exist_ok=True)
+        # Копируем весь плагин рекурсивно: новые компоненты, шрифты и прочее
+        # из репозитория должны доезжать, а не только Panel.qml и картинки.
+        missed = _copy_tree(plugin_src, PLUGIN_DIR)
+        if missed:
+            return {"ok": False,
+                    "error": f"скопировано не всё: {', '.join(missed[:3])} "
+                             f"(бэкап: {backup})"}
+        # Как в install.sh: локальная установка кладёт Panel.qml в корень плагина.
+        entry_points = remote.get("entryPoints")
+        if not isinstance(entry_points, dict):
+            entry_points = {}
+        entry_points["barWidget"] = "Panel.qml"
+        remote["entryPoints"] = entry_points
+        _write_json(os.path.join(PLUGIN_DIR, "manifest.json"), remote)
+        # Сам обновлятор тоже обновляем — иначе новая логика не доедет никогда.
+        updater = os.path.join(bundle.root, "bin", "omavpn-updater")
+        if os.path.isfile(updater):
+            os.makedirs(LOCAL_BIN, exist_ok=True)
+            _atomic_copy(updater, os.path.join(LOCAL_BIN, "omavpn-updater"), mode=0o755)
+    except OSError as exc:
+        return {"ok": False,
+                "error": f"копирование не удалось: {exc} (бэкап: {backup})"}
+
+    _prune_widget_backups()
+    _invalidate_cache()
+    return {"ok": True, "updated": True, "version": new_version,
+            "restart_required": True,
+            "message": "виджет обновлён — перезапусти оболочку"}
+
+
+# --- Обновление компонентов (zapret / tg-ws-proxy) ---------------------------
+def update_components() -> dict:
+    """Готовый режим bypass-status: он сам скачивает и ставит компоненты."""
+    tool = _bypass_status()
+    if not tool:
+        return {"ok": False, "error": "bypass-status не найден (нет ~/.local/bin/bypass-status)"}
+    code, out = run([tool, "--update-components"], timeout=COMPONENTS_TIMEOUT)
+    data = _read_json_text(out)
+    if not isinstance(data, dict):
+        # Иногда перед JSON что-то печатается — пробуем последнюю строку.
+        for line in reversed([ln.strip() for ln in out.splitlines() if ln.strip()]):
+            data = _read_json_text(line)
+            if isinstance(data, dict):
+                break
+    if not isinstance(data, dict):
+        return {"ok": False, "deferred": False, "messages": [],
+                "error": f"bypass-status --update-components не вернул JSON (код {code})"}
+    messages = data.get("messages")
+    messages = [str(m) for m in messages] if isinstance(messages, list) else []
+    return {"ok": bool(data.get("ok")), "deferred": False,
+            "messages": messages or ["обновлений компонентов нет"],
+            "results": data.get("results") or []}
+
+
+# --- Обновление ядра ---------------------------------------------------------
+def _terminal() -> list[str] | None:
+    """Команда запуска терминала (первый найденный из TERMINALS)."""
+    for name in TERMINALS:
+        path = shutil.which(name)
+        if not path:
+            continue
+        if name == "kitty":
+            return [path]  # kitty больше не любит -e, команда идёт следом
+        return [path, "-e"]
+    return None
+
+
+def update_core(bundle: RepoBundle) -> dict:
+    """Ядро обновляем только руками: без setcap sing-box теряет cap_net_admin."""
+    _, updates, _partial = network_updates(force=False)
+    needed = [name for name in ("xray", "singbox")
+              if (updates.get(name) or {}).get("update")]
+    if not needed:
+        return {"ok": True, "deferred": False,
+                "messages": ["ядро уже актуальное (закреплённые версии установлены)"]}
+
+    error = bundle.ensure()
+    if error:
+        return {"ok": False, "deferred": False, "error": error}
+
+    manual = f"cd {shlex.quote(bundle.root)} && FORCE=1 ./install.sh"
+    terminal = _terminal()
+    if not terminal:
+        return {"ok": False, "deferred": False,
+                "error": "терминал не найден (foot/xterm/alacritty/kitty)",
+                "messages": [f"запусти вручную: {manual}"]}
+
+    # read -rp оставляет окно открытым: иначе ошибка установки исчезнет вместе с ним.
+    # stdin терминала мы отдаём в /dev/null (DEVNULL), поэтому читаем с /dev/tty —
+    # иначе read получает EOF сразу и пауза не работает. Оболочку перезапускаем
+    # при любом исходе: install.sh копирует Panel.qml ДО setcap и остальных шагов,
+    # поэтому ненулевой код (например, не вышло setcap — «sudo setcap …» в
+    # предупреждении) не значит, что виджет остался старым. Без перезапуска
+    # пользователь застрял бы с подменённым Panel.qml.
+    script = (
+        f"cd {shlex.quote(bundle.root)} && FORCE=1 ./install.sh; rc=$?; echo; "
+        f"if [ $rc -eq 0 ]; then "
+        f"read -rp 'Установка завершена. Enter — перезапустить оболочку…' _ < /dev/tty; "
+        f"else "
+        f"read -rp 'Установка завершилась ошибкой (часто это только setcap). "
+        f"Enter — перезапустить оболочку…' _ < /dev/tty; "
+        f"fi; omarchy restart shell"
+    )
+    try:
+        subprocess.Popen(terminal + ["bash", "-lc", script],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        return {"ok": False, "deferred": False,
+                "error": f"не удалось открыть терминал: {exc}",
+                "messages": [f"запусти вручную: {manual}"]}
+
+    bundle.keep = True  # установщик читает файлы отсюда — каталог не удаляем
+    return {"ok": True, "deferred": True,
+            "messages": [f"обновление ядра ({', '.join(needed)}) открыто в терминале — введи пароль"]}
+
+
+# --- Режимы ------------------------------------------------------------------
+def cmd_state(force: bool) -> dict:
+    checked, updates, partial = network_updates(force=force)
+    return {
+        "ok": True,
+        "checked": checked,
+        # partial: часть компонентов не проверена (нет сети) — «всё актуально»
+        # показывать нельзя, кэш такого ответа живёт 10 минут.
+        "partial": partial,
+        "updates": updates,
+        "guard": _guard(),
+        "power": _power(),
+        "actions": _read_actions(ACTIONS_SHOW),
+    }
+
+
+def cmd_update(only: str) -> dict:
+    _cleanup_old_temps()
+    bundle = RepoBundle()
+    messages: list[str] = []
+    updated = False
+    deferred = False
+    restart = False
+    ok = True
+    detail: dict = {}
+
+    try:
+        if only in ("components", "all"):
+            result = update_components()
+            messages += result.get("messages") or []
+            # Реально установленное видно по непустому results: «обновлений нет» — не действие.
+            if any(item.get("ok") for item in (result.get("results") or [])):
+                updated = True
+            if not result.get("ok"):
+                ok = False
+                if result.get("error"):
+                    messages.append(str(result["error"]))
+            detail["components"] = {k: v for k, v in result.items() if k != "results"}
+
+        core_deferred = False
+        if only in ("core", "all"):
+            result = update_core(bundle)
+            messages += result.get("messages") or []
+            core_deferred = bool(result.get("deferred"))
+            deferred = deferred or core_deferred
+            if not result.get("ok"):
+                ok = False
+                if result.get("error"):
+                    messages.append(str(result["error"]))
+            detail["core"] = {k: v for k, v in result.items() if k != "messages"}
+
+        if only in ("widget", "all"):
+            if only == "all" and core_deferred:
+                # Установщик в терминале уже ставит и ядро, и скрипты, и виджет.
+                # Копировать Panel.qml из того же архива, пока install.sh ещё
+                # работает, — гонка за файлы; установщик перезапустит оболочку сам.
+                messages.append("ядро, скрипты и виджет обновит установщик в терминале; "
+                                "после него оболочка перезапустится сама")
+                detail["widget"] = {"ok": True, "skipped": True,
+                                    "message": "пропущено: обновляет установщик в терминале"}
+                # Оболочку перезапускает установщик — виджету делать это не нужно.
+                restart = False
+            else:
+                result = update_widget(bundle)
+                if result.get("ok"):
+                    updated = updated or bool(result.get("updated"))
+                    restart = restart or bool(result.get("restart_required"))
+                    messages.append(str(result.get("message") or ""))
+                else:
+                    ok = False
+                    messages.append(f"виджет: {result.get('error')}")
+                detail["widget"] = result
+    finally:
+        bundle.cleanup()
+
+    messages = [m for m in messages if m]
+    text = "; ".join(messages) or "обновлять нечего"
+    # В журнал — только то, что действительно изменило систему (или сорвалось):
+    # иначе каждая проверка «обновлений нет» забивает историю.
+    if updated or deferred or not ok:
+        log_action("update", f"{only}: {text}")
+
+    return {"ok": ok, "only": only, "updated": updated, "deferred": deferred,
+            "restart_required": restart, "messages": messages or ["обновлять нечего"],
+            "detail": detail}
+
+
+def cmd_note(raw: str) -> dict:
+    """`kind|текст` — запись в журнал действий (зовёт виджет из авто-шагов).
+
+    Без разделителя вся строка считается текстом (kind "note"): виджету проще
+    звать `--note "текст"`, чем помнить формат.
+    """
+    raw = raw or ""
+    if "|" in raw:
+        kind, _, text = raw.partition("|")
+        kind, text = kind.strip(), text.strip()
+    else:
+        kind, text = "note", raw.strip()
+    if not kind:
+        kind = "note"
+    if not text:
+        return {"ok": False, "error": "пустая заметка: нужен формат 'kind|текст'"}
+    if not log_action(kind, text):
+        return {"ok": False, "error": f"не удалось записать {ACTIONS_FILE}"}
+    return {"ok": True, "kind": kind, "text": text, "actions": _read_actions(ACTIONS_SHOW)}
+
+
+class JsonParser(argparse.ArgumentParser):
+    """argparse по умолчанию печатает текст в stderr и выходит — нам нужен JSON."""
+
+    def error(self, message):
+        emit({"ok": False, "error": message})
+        raise SystemExit(2)
+
+
+def main(argv: list[str]) -> int:
+    parser = JsonParser(
+        prog="omavpn-updater",
+        description="Проверка и установка обновлений omavpn (JSON в stdout)")
+    parser.add_argument("--state-json", action="store_true",
+                        help="состояние и проверка обновлений (кэш 24 ч)")
+    parser.add_argument("--force", action="store_true",
+                        help="проверить обновления принудительно, мимо кэша")
+    parser.add_argument("--update-json", action="store_true",
+                        help="установить обновления (только по явному вызову)")
+    parser.add_argument("--only", choices=("widget", "components", "core", "all"),
+                        default="all", help="что обновлять (по умолчанию all)")
+    parser.add_argument("--note", metavar='"kind|текст"',
+                        help="добавить запись в журнал действий")
+    args = parser.parse_args(argv)
+
+    try:
+        if args.note is not None:
+            result = cmd_note(args.note)
+        elif args.state_json:
+            result = cmd_state(force=args.force)
+        elif args.update_json:
+            result = cmd_update(args.only)
+        else:
+            emit({"ok": False, "error": "укажи режим: --state-json | --update-json | --note"})
+            return 2
+    except Exception as exc:  # noqa: BLE001 — наружу всегда JSON, без трейсбека
+        emit({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        return 1
+
+    emit(result)
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
