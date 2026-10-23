@@ -22,6 +22,26 @@ SB_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-b
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 
+# Юнит systemd пишем только если содержимое изменилось: раньше `cat >` каждый
+# раз затирал файл, и правки пользователя (интервал в таймере, Environment=)
+# пропадали молча. Изменённый юнит сохраняем рядом как .bak — так видно, что
+# установщик переписал непустой файл, и есть откуда вернуть свои строки.
+write_unit() { # $1 — путь юнита, stdin — новое содержимое
+  local path="$1" new
+  new="$(mktemp)"
+  cat >"$new"
+  if [ -f "$path" ]; then
+    if cmp -s "$new" "$path"; then
+      rm -f "$new"
+      return 0
+    fi
+    cp -p "$path" "$path.bak"
+    warn "$(basename "$path") отличался от шаблона — прежняя версия в $path.bak"
+  fi
+  install -m 0644 "$new" "$path"
+  rm -f "$new"
+}
+
 verify_sha256() { # $1 — файл, $2 — ожидаемый sha256, $3 — имя
   if [ -z "$2" ]; then
     echo "Нет sha256 для $3. Задай XRAY_SHA256/SB_SHA256 для своей версии и повтори."
@@ -38,9 +58,18 @@ verify_sha256() { # $1 — файл, $2 — ожидаемый sha256, $3 — и
   say "sha256 $3 — ок"
 }
 
-for tool in curl python3 tar sha256sum jq ip flock getcap; do
+for tool in curl python3 tar sha256sum jq ip flock; do
   command -v "$tool" >/dev/null || { echo "Нужен '$tool' в PATH"; exit 1; }
 done
+# getcap — только чтобы показать выданные caps и подсказать, что записать.
+# Без него (нет libcap) установка не должна отказывать: caps ставятся setcap,
+# а guard умеет жить без getcap и не считает это поломкой.
+HAVE_GETCAP=0
+if command -v getcap >/dev/null 2>&1; then
+  HAVE_GETCAP=1
+else
+  warn "getcap не найден (libcap) — выданные caps не покажу; на работу TUN это не влияет"
+fi
 
 mkdir -p "$BIN_DIR" "$LOCAL_BIN" "$HOME_DIR/.config/omavpn" "$HOME_DIR/.local/state/omavpn" "$HOME_DIR/.cache/omavpn"
 
@@ -102,7 +131,7 @@ elif command -v pkexec >/dev/null 2>&1 &&
   CAPS_OK=1
 fi
 if [ "$CAPS_OK" = 1 ]; then
-  getcap "$BIN_DIR/sing-box" || true
+  if [ "$HAVE_GETCAP" = 1 ]; then getcap "$BIN_DIR/sing-box" || true; fi
 else
   warn "Не удалось выдать CAP_NET_ADMIN (sudo/pkexec недоступны)."
   warn "Выдай вручную, иначе TUN не поднимется:"
@@ -157,7 +186,7 @@ if [ -f "$HERE/bin/omavpn-guard" ]; then
   install -m 0755 "$HERE/bin/omavpn-guard" "$LOCAL_BIN/omavpn-guard"
   mkdir -p "$HOME_DIR/.config/systemd/user"
 
-  cat > "$HOME_DIR/.config/systemd/user/omavpn-guard.service" <<EOF
+  write_unit "$HOME_DIR/.config/systemd/user/omavpn-guard.service" <<EOF
 [Unit]
 Description=Проверка и самовосстановление VPN/YouTube/Discord/Telegram (omavpn-guard)
 
@@ -174,7 +203,7 @@ Nice=10
 KillMode=process
 EOF
 
-  cat > "$HOME_DIR/.config/systemd/user/omavpn-guard.timer" <<'EOF'
+  write_unit "$HOME_DIR/.config/systemd/user/omavpn-guard.timer" <<'EOF'
 [Unit]
 Description=Периодическая проверка обходов
 
@@ -188,7 +217,7 @@ Unit=omavpn-guard.service
 WantedBy=timers.target
 EOF
 
-  cat > "$HOME_DIR/.config/systemd/user/omavpn-autostart.service" <<'EOF'
+  write_unit "$HOME_DIR/.config/systemd/user/omavpn-autostart.service" <<'EOF'
 [Unit]
 Description=Поднять VPN при входе, если он был включён (omavpn)
 After=graphical-session.target
@@ -224,7 +253,7 @@ if [ -x "$LOCAL_BIN/bypass-status" ] && [ -x "$LOCAL_BIN/omavpn" ]; then
     say "Ставлю таймеры аудита маршрутов (route-audit)…"
     mkdir -p "$HOME_DIR/.config/systemd/user"
 
-    cat > "$HOME_DIR/.config/systemd/user/omavpn-route-audit.service" <<EOF
+    write_unit "$HOME_DIR/.config/systemd/user/omavpn-route-audit.service" <<EOF
 [Unit]
 Description=Router audit: a domain that fails on its current route moves to a working one
 After=network-online.target
@@ -244,7 +273,7 @@ TimeoutStartSec=1200
 KillMode=process
 EOF
 
-    cat > "$HOME_DIR/.config/systemd/user/omavpn-route-audit.timer" <<'EOF'
+    write_unit "$HOME_DIR/.config/systemd/user/omavpn-route-audit.timer" <<'EOF'
 [Unit]
 Description=Periodic route audit (direct/proxy per domain)
 
@@ -259,7 +288,7 @@ Unit=omavpn-route-audit.service
 WantedBy=timers.target
 EOF
 
-    cat > "$HOME_DIR/.config/systemd/user/omavpn-route-recheck.service" <<EOF
+    write_unit "$HOME_DIR/.config/systemd/user/omavpn-route-recheck.service" <<EOF
 [Unit]
 Description=Route overrides recheck: try direct again for old proxy overrides
 After=network-online.target
@@ -278,7 +307,7 @@ TimeoutStartSec=1200
 KillMode=process
 EOF
 
-    cat > "$HOME_DIR/.config/systemd/user/omavpn-route-recheck.timer" <<'EOF'
+    write_unit "$HOME_DIR/.config/systemd/user/omavpn-route-recheck.timer" <<'EOF'
 [Unit]
 Description=Daily route override recheck
 
@@ -307,7 +336,7 @@ fi
 if [ -x "$LOCAL_BIN/bypass-status" ]; then
   say "Ставлю таймер проверки обновлений (zapret, tg-ws-proxy)…"
   mkdir -p "$HOME_DIR/.config/systemd/user"
-  cat > "$HOME_DIR/.config/systemd/user/omavpn-updates.service" <<EOF
+  write_unit "$HOME_DIR/.config/systemd/user/omavpn-updates.service" <<EOF
 [Unit]
 Description=Check component updates (zapret, tg-ws-proxy)
 
@@ -315,7 +344,7 @@ Description=Check component updates (zapret, tg-ws-proxy)
 Type=oneshot
 ExecStart=$LOCAL_BIN/bypass-status --updates
 EOF
-  cat > "$HOME_DIR/.config/systemd/user/omavpn-updates.timer" <<'EOF'
+  write_unit "$HOME_DIR/.config/systemd/user/omavpn-updates.timer" <<'EOF'
 [Unit]
 Description=Daily component update check
 

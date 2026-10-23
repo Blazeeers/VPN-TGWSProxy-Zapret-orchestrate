@@ -103,8 +103,11 @@ echo "==> NetworkManager dispatcher"
 cat > /etc/NetworkManager/dispatcher.d/90-zapret-autotune <<'EOF'
 #!/bin/sh
 # Перезапуск автотюнера zapret при смене физической сети.
+# Пропускаем виртуальные интерфейсы: VPN/туннели, docker/podman, libvirt-мосты,
+# wireguard и ppp — их поднятие не меняет физическую сеть, а прогон запускало бы
+# (перебор идёт минутами и на это время держит сервисы в VPN).
 case "$1" in
-  omavpn0|tailscale0|tun*|lo|docker*|veth*) exit 0 ;;
+  omavpn0|tailscale0|tun*|lo|docker*|veth*|br-*|virbr*|wg*|ppp*) exit 0 ;;
 esac
 case "$2" in
   up|connectivity-change) systemctl start --no-block zapret-autotune.service ;;
@@ -143,7 +146,9 @@ Description=Forced zapret strategy rescan (requested from UI)
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/zapret-autotune rescan
-ExecStopPost=/usr/bin/rm -f $REQUEST_FILE
+# Кавычки обязательны: $USER_HOME может содержать пробел, а без них systemd
+# разбирает строку на аргументы и rm получает мусор (или удаляет не то).
+ExecStopPost=/usr/bin/rm -f "$REQUEST_FILE"
 EOF
 
 cat > /etc/systemd/system/zapret-autotune-rescan.path <<EOF
@@ -151,6 +156,9 @@ cat > /etc/systemd/system/zapret-autotune-rescan.path <<EOF
 Description=Watch for a forced zapret rescan request
 
 [Path]
+# Без кавычек: для Path*-настроек systemd 261 кавычки НЕ снимает (проверено
+# systemd-analyze verify: PathExists="/path with space" → «path is not
+# absolute, ignoring»). Цитата тут сделала бы хуже, чем было.
 PathExists=$REQUEST_FILE
 Unit=zapret-autotune-rescan.service
 

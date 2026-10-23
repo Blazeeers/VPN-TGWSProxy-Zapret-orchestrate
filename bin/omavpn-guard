@@ -521,10 +521,25 @@ vpn_consistent() {
     xray_up
 }
 
+# Статус omavpn — один раз на прогон. `omavpn --json status` прогоняет все
+# проверки сервисов и складывает их результаты в probe.results (десятки КБ), а
+# try_nodes запрашивал его дважды подряд: два тяжёлых прогона на тик и два разных
+# снимка (orig из одного, node_count из другого). Кэш — в переменной, поэтому
+# функция обязана вызываться в текущей оболочке, а не в $(…).
+VPN_STATUS_JSON=""
+VPN_STATUS_LOADED=0
+vpn_status_load() {
+    [ "$VPN_STATUS_LOADED" = 1 ] && return 0
+    VPN_STATUS_JSON=$(timeout 20 "$OMAVPN" --json status 2>/dev/null)
+    VPN_STATUS_LOADED=1
+    return 0
+}
+
 try_nodes() {
     local orig node_count node tries=0
-    orig=$(timeout 20 "$OMAVPN" --json status 2>/dev/null | jq -r '.node_index // -1' 2>/dev/null)
-    node_count=$(timeout 20 "$OMAVPN" --json status 2>/dev/null | jq -r '.nodes | length' 2>/dev/null)
+    vpn_status_load
+    orig=$(printf '%s' "$VPN_STATUS_JSON" | jq -r '.node_index // -1' 2>/dev/null)
+    node_count=$(printf '%s' "$VPN_STATUS_JSON" | jq -r '.nodes | length' 2>/dev/null)
     [ -n "$orig" ] || orig=-1
     [ -n "$node_count" ] || node_count=0
     [ "$node_count" -gt 0 ] || return 1

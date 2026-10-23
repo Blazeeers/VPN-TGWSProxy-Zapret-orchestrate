@@ -32,32 +32,56 @@
 
 1. `sniff` — определять протокол/домен из пакета.
 2. `protocol: dns → hijack-dns` — DNS заворачивается в sing-box.
-3. `ip_is_private` → `direct` — LAN, loopback.
-4. **`domain_suffix: proxy_domains()` → `proxy`** — домены, которым положено в
+3. `ip_cidr: 77.88.8.8/32` → `direct` — запросы к российскому резолверу `ru`
+   идут мимо туннеля (иначе ответ вернулся бы «из-за границы», см. раздел DNS).
+4. `ip_is_private` → `direct` — LAN, loopback.
+5. **`domain_suffix: proxy_domains()` → `proxy`** — домены, которым положено в
    туннель: `ALWAYS_PROXY_DOMAINS` (`youtubei.googleapis.com`,
    `youtube.googleapis.com` — напрямую блокируются наглухо) плюс оверрайды
    `proxy` из `~/.config/omavpn/route_overrides.json`. Стоит **перед**
    direct-правилом, поэтому автотюн не может вытолкнуть их из туннеля.
-5. `domain_suffix: direct_domains()` → `direct` — MAX, Яндекс, Discord, YouTube
-   (`ALWAYS_DIRECT_DOMAINS` — MAX/Яндекс — применяется всегда; Discord/YouTube
-   берутся из `DEFAULT_DIRECT_DOMAINS` либо `~/.config/omavpn/direct_domains.txt`;
-   оверрайды `direct` тоже попадают сюда).
-6. `process_name: tg-ws-proxy, TgWsProxy, Telegram, telegram-desktop` → `direct` —
+6. **`domain_suffix: ALWAYS_DIRECT_DOMAINS → action: resolve, server: ru`** —
+   внутренний резолв sing-box для «прямых» доменов идёт в `ru`. Действие
+   `resolve` не финальное: маршрут домена решает следующее правило.
+7. `domain_suffix: direct_domains()` → `direct` — MAX, Яндекс, Discord, YouTube
+   (`ALWAYS_DIRECT_DOMAINS` — MAX/Яндекс/DeepSeek/Tailscale — применяется всегда;
+   Discord/YouTube берутся из `DEFAULT_DIRECT_DOMAINS` либо
+   `~/.config/omavpn/direct_domains.txt`; оверрайды `direct` тоже попадают сюда).
+8. `process_name: tg-ws-proxy, TgWsProxy, Telegram, telegram-desktop` → `direct` —
    локальный MTProto-прокси и Telegram Desktop.
-7. `bypass` — адреса серверов подписки (`ip_cidr`/`domain`) → `direct`,
+9. `bypass` — адреса серверов подписки (`ip_cidr`/`domain`) → `direct`,
    чтобы туннель не зациклился.
-8. `port: 25,465,587` → `direct` — SMTP.
-9. `process_name: xray` → `direct` — соединения самого Xray.
-10. `ip_version: 6` → `block` — IPv6 выключен.
+10. `port: 25,465,587` → `direct` — SMTP.
+11. `process_name: xray` → `direct` — соединения самого Xray.
+12. `ip_version: 6` → `block` — IPv6 выключен.
 
 Полный приоритет источников: **overrides → `ALWAYS_PROXY_DOMAINS` →
 `direct_domains.txt` → `final = proxy`**. Оверрайды правятся командой
 `omavpn route set|unset` и автоматически — аудитом маршрутов
 ([docs/route-audit.md](route-audit.md)).
 
-DNS: сервер `1.1.1.1` через прокси (`remote`), финальный резолвер — тоже remote.
-Это важно: провайдерский DNS для заблокированных доменов может отдавать
-недоступные IP, а через туннель приходит «чистый» адрес.
+## DNS
+
+Резолверов два, и это не резервная копия, а разные задачи:
+
+| Тег | Сервер | Куда ходит | Для чего |
+|---|---|---|---|
+| `remote` (`final`) | `1.1.1.1` | через туннель (`detour: proxy`) | всё остальное: провайдерский DNS для заблокированных доменов отдаёт недоступные IP, а через туннель приходит «чистый» адрес |
+| `ru` | `77.88.8.8` | напрямую | домены из `ALWAYS_DIRECT_DOMAINS` (`max.ru`, Яндекс, DeepSeek, Tailscale): им нужен **российский** адрес, зарубежный ломает прямой путь |
+
+- `dns.rules`: `domain_suffix: ALWAYS_DIRECT_DOMAINS` → `action: route`,
+  `server: ru`. Всё, что не попало в правило, идёт на `final: remote`.
+  Стратегия — `ipv4_only`.
+- У сервера `ru` **нет** `detour`: `detour: direct` sing-box отвергает при старте
+  («detour to an empty direct outbound makes no sense»). Поэтому запросы к самому
+  `77.88.8.8` уводятся в обход туннеля маршрутным правилом
+  `ip_cidr: 77.88.8.8/32 → direct` (правило 3 в списке выше). `sing-box check`
+  такую ошибку не ловит — проверять надо запуском.
+- `resolve(ru)` — правило 6: без него внутренний резолв sing-box
+  (`default_domain_resolver = remote`, например socks5h-запрос с доменом в
+  запросе) обошёл бы `dns.rules` и вернул зарубежный адрес.
+- Зачем вообще: `max.ru` отдаётся `77.88.8.8` за ~55 мс, а через туннель — ~3 с,
+  при этом адрес из туннеля может быть недоступен напрямую (проверено 23.10.2026).
 
 ## Почему что исключено
 

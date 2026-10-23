@@ -62,7 +62,20 @@ YT_HOST_URL=""        # кэш ссылки на видео (боевой тра
 YT_URL_FAILS=0        # сколько раз не удалось получить ссылку через yt-dlp
 YT_DL_CODE=0; YT_DL_SIZE=0; YT_DL_SECS=0; YT_DL_KBPS=0
 
-log() { echo "$(date '+%F %T') $*" | tee -a "$LOG" 2>/dev/null; }
+# Ротация лога: раньше он рос бесконечно (208 КБ за сутки при живой работе —
+# это ~75 МБ в год, да ещё и в /var/log). При превышении 2 МиБ оставляем
+# последние 2000 строк: этого хватает на несколько суток разбора, а файл
+# остаётся читаемым для tail/grep.
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-2097152}"
+LOG_KEEP_LINES="${LOG_KEEP_LINES:-2000}"
+log() {
+  echo "$(date '+%F %T') $*" | tee -a "$LOG" 2>/dev/null
+  local size
+  size=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+  if [ "${size:-0}" -gt "$LOG_MAX_BYTES" ]; then
+    tail -n "$LOG_KEEP_LINES" "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG" 2>/dev/null
+  fi
+}
 
 # --- списки доменов ---------------------------------------------------------
 write_lists() {

@@ -93,6 +93,10 @@ apply_preset() {
   local name="$1" opt optf rc
   opt="$(preset_text "$name")" || return 1
   cp -a "$CFG" "$CFG.bak.strategy.$(date +%Y%m%d-%H%M%S)"
+  # Бэкапы копятся: один `scan` делает 5–6 копий, и никто их не чистил. Держим
+  # последние 3 — этого хватает, чтобы откатить текущий и предыдущий прогон.
+  { ls -1dt "$CFG".bak.strategy.* 2>/dev/null || true; } \
+    | tail -n +4 | while IFS= read -r old; do rm -f -- "$old"; done
   # Файл с опцией — только через mktemp: раньше писали в фиксированный
   # /tmp/zapret-nfqws-opt.txt от root, и подсунутая заранее симлинк-ссылка
   # уводила запись в любой файл системы.

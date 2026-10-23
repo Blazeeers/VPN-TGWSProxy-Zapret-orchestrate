@@ -106,6 +106,13 @@ ALWAYS_DIRECT_DOMAINS = [
     "ts.net",
 ]
 
+# DNS для «прямых» доменов в TUN-режиме. Все остальные домены резолвятся через
+# туннель (`remote`), но для доменов из ALWAYS_DIRECT_DOMAINS зарубежный
+# резолвер вреден: max.ru/яндекс должны получать российский адрес, иначе прямой
+# путь до них ломается. Проверено 23.10.2026: 77.88.8.8 отдаёт для max.ru
+# 155.212.204.5 и отвечает за ~55 мс (через туннель — ~3 с).
+RU_DNS = "77.88.8.8"
+
 # Домены, которые ВСЕГДА идут через VPN — даже если zapret-autotune вернул их
 # в direct_domains.txt. Причина (проверено 22.10.2026): youtubei.googleapis.com
 # блокируется наглухо напрямую (все IP — таймаут 10 с), а zapret его не пробивает,
@@ -1002,8 +1009,14 @@ def get_configs() -> list:
 def update_sub() -> list:
     configs = fetch_sub()
     save_json(SUBFILE, {"updated": time.time(), "configs": configs})
+    # Настройки пересохраняем только при фактическом изменении: `update` зовут
+    # по таймеру, а каждая перезапись меняла mtime и будила наблюдателей
+    # (виджет, сторож) без причины. Новый файл или недостающие ключи умолчаний —
+    # уже изменение, тогда пишем.
     s = settings()
-    save_json(SETTINGS, s)
+    current = load_json(SETTINGS, None)
+    if not isinstance(current, dict) or current != s:
+        save_json(SETTINGS, s)
     return configs
 
 
@@ -1089,6 +1102,22 @@ def server_endpoints(profile_index: int) -> tuple[list, list]:
 # генерация конфигов
 # --------------------------------------------------------------------------- #
 
+def _strip_balancers(cfg: dict) -> None:
+    """Убирает `balancers`/`observatory` из конфига Xray.
+
+    Подписка приходит с балансировщиком (`routing.balancers` + `leastPing`) и
+    `observatory`, который его обслуживает. Для временного Xray одной ноды это
+    лишнее (probe гоняет одну ноду), а в общем конфиге balancerTag без самих
+    balancers — невалидная ссылка: xray ругается и правила игнорирует.
+    """
+    cfg.pop("observatory", None)
+    cfg.pop("burstObservatory", None)
+    routing = cfg.get("routing")
+    if isinstance(routing, dict):
+        routing.pop("balancers", None)
+        routing.pop("observatoryTag", None)
+
+
 def build_xray(profile_index: int, node_index: int) -> dict:
     configs = get_configs()
     if not (0 <= profile_index < len(configs)):
@@ -1107,15 +1136,19 @@ def build_xray(profile_index: int, node_index: int) -> dict:
     # ручной выбор ноды: заменяем правило с балансировщиком на outboundTag.
     # Индекс зажимаем: он приходит из settings.json, а после `update` нод может
     # стать меньше — IndexError здесь ломал бы каждый следующий запуск.
+    nd = nodes(profile_index)
     node_index = _num(node_index, -1)
-    if not (0 <= node_index < len(nodes(profile_index))):
+    if not (0 <= node_index < len(nd)):
         node_index = -1
-    if node_index >= 0:
-        tag = nodes(profile_index)[node_index]["tag"]
+    # Без явного выбора ноды берём первую: после вырезания balancers правило с
+    # balancerTag осталось бы без цели, и xray отказался бы грузить конфиг.
+    target = nd[node_index]["tag"] if node_index >= 0 else (nd[0]["tag"] if nd else "")
+    if target:
         for rule in cfg.get("routing", {}).get("rules", []):
             if "balancerTag" in rule:
                 rule.pop("balancerTag", None)
-                rule["outboundTag"] = tag
+                rule["outboundTag"] = target
+        _strip_balancers(cfg)
 
     cfg["log"] = {"loglevel": "warning", "error": str(XRAY_LOG), "access": "none"}
     return cfg
@@ -1135,11 +1168,37 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
     # zapret-autotune, доверять ему как источнику истины нельзя.
     forced = proxy_domains()
     forced_rule = [{"domain_suffix": forced, "outbound": "proxy"}] if forced else []
+    # Домены из ALWAYS_DIRECT_DOMAINS резолвим российским DNS и при внутреннем
+    # резолве самого sing-box (socks5h, домен в запросе): иначе
+    # `default_domain_resolver` увёл бы их через туннель мимо dns.rules и вернул
+    # зарубежный адрес. Действие `resolve` не финальное — следующее за ним
+    # правило direct по домену всё равно срабатывает (проверено запуском).
+    ru_resolve = [{"domain_suffix": list(ALWAYS_DIRECT_DOMAINS), "action": "resolve",
+                   "server": "ru"}]
     return {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
+            # Два резолвера. `remote` (через туннель) — по умолчанию: DNS
+            # провайдера для заблокированных доменов отдаёт недоступные IP, а
+            # через туннель приходит «чистый» адрес. `ru` (российский DNS) — для
+            # доменов, которые мы НИКОГДА не туннелируем (ALWAYS_DIRECT_DOMAINS):
+            # им нужен именно российский адрес, а не зарубежный из туннеля.
+            #
+            # У `ru` НЕТ `detour`: `detour: direct` sing-box на старте отвергает
+            # («detour to an empty direct outbound makes no sense» — у обычного
+            # direct нет своих настроек, и обход бессмыслен). Поэтому запросы к
+            # самому 77.88.8.8 уводятся напрямую маршрутным правилом ниже
+            # (`route.rules` → ip_cidr RU_DNS), а `sing-box check` такое не
+            # ловит — проверять надо запуском.
             "servers": [
                 {"type": "udp", "tag": "remote", "server": "1.1.1.1", "detour": "proxy"},
+                {"type": "udp", "tag": "ru", "server": RU_DNS},
+            ],
+            # `action: route` — актуальная форма (с 1.11 поле адресата в правиле
+            # DNS задаётся действием: dns.rules[].action + server).
+            "rules": [
+                {"domain_suffix": list(ALWAYS_DIRECT_DOMAINS), "action": "route",
+                 "server": "ru"},
             ],
             "final": "remote",
             "strategy": "ipv4_only",
@@ -1171,8 +1230,12 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
             "rules": [
                 {"action": "sniff"},
                 {"protocol": "dns", "action": "hijack-dns"},
+                # сам резолвер `ru` — напрямую, иначе запрос к 77.88.8.8 ушёл бы
+                # в туннель (final = proxy) и российский адрес не вернулся бы
+                {"ip_cidr": [f"{RU_DNS}/32"], "outbound": "direct"},
                 {"ip_is_private": True, "outbound": "direct"},
                 *forced_rule,
+                *ru_resolve,
                 {"domain_suffix": direct_domains(), "outbound": "direct"},
                 {"process_name": TELEGRAM_PROCESSES, "outbound": "direct"},
                 *bypass,
@@ -1184,9 +1247,14 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
     }
 
 
-def validate(cmd: list, path: Path) -> str:
+def validate(cmd: list, path: Path, timeout: float = 30.0) -> str:
+    """Проверка конфига; `timeout` урезается, когда прогон ограничен бюджетом.
+
+    `heal` считает общий дедлайн, и жёсткие 30 с на проверку конфига были
+    главным источником перерасхода: ноды перебирались уже «за дедлайном».
+    """
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=max(1.0, timeout))
     except (OSError, subprocess.TimeoutExpired) as exc:
         return str(exc)
     if p.returncode != 0:
@@ -1592,7 +1660,13 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
     try:
         xray_proc = spawn([str(XRAY_BIN), "run", "-c", str(XRAY_CFG)], XRAY_LOG, XRAY_PID)
         if not wait_port(SOCKS_PORT, 6, xray_proc):
-            raise RuntimeError("Xray не открыл SOCKS-порт: " + log_tail(XRAY_LOG))
+            # порт мог занять чужой процесс (старый xray, другой клиент) — тогда
+            # «Xray не открыл порт» вводит в заблуждение, добавляем подсказку
+            hint = ""
+            if _listen_inodes(SOCKS_PORT):
+                hint = (f" — порт {SOCKS_PORT} слушает посторонний процесс, "
+                        "завершите его или освободите порт")
+            raise RuntimeError("Xray не открыл SOCKS-порт: " + log_tail(XRAY_LOG) + hint)
         if mode == "tun":
             sb_proc = spawn([str(SB_BIN), "run", "-c", str(SB_CFG)], SB_LOG, SB_PID)
             if not wait_iface(TUN_IFACE, 8, sb_proc):
@@ -1641,6 +1715,21 @@ def caps_ok() -> bool:
     return "cap_net_admin" in out
 
 
+def _index_valid(value) -> bool:
+    """Похоже ли значение из настроек на индекс: int (не bool) или строка с числом."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, str):
+        try:
+            int(value.strip())
+        except ValueError:
+            return False
+        return True
+    return False
+
+
 def status() -> dict:
     """Состояние для виджета. Не падает никогда: любой мусор → валидный JSON.
 
@@ -1664,8 +1753,22 @@ def status() -> dict:
     except (RuntimeError, OSError, ValueError):
         pro = []
     pi = _num(s.get("profile_index"), 0)
-    if not (0 <= pi < len(pro)):
-        pi = 0
+    settings_error = ""
+    if not pro:
+        pi = 0                      # подписки нет — сравнивать не с чем
+    else:
+        if not (0 <= pi < len(pro)):
+            pi = 0
+        # Молчаливый кламп — это ложь в статусе: виджет показывал профиль #0 как
+        # выбранный человеком, хотя в настройках стояло 99 или "abc". Теперь
+        # причина видна в JSON (`settings_error`) и в тексте статуса.
+        raw_pi = s.get("profile_index")
+        if not _index_valid(raw_pi):
+            settings_error = (f"в настройках профиль {raw_pi!r} — не число, "
+                              f"использую #{pi}")
+        elif _num(raw_pi, -1) != pi:
+            settings_error = (f"в настройках профиль #{_num(raw_pi, -1)}, "
+                              f"доступно {len(pro)} — использую #{pi}")
     ni = _num(s.get("node_index"), -1)
     try:
         nd = nodes(pi) if pro else []
@@ -1677,6 +1780,11 @@ def status() -> dict:
     installed = XRAY_BIN.exists() and SB_BIN.exists()
     sub = load_json(SUBFILE, {})
     updated = _num(sub.get("updated"), 0) if isinstance(sub, dict) else 0
+    last_error = str(st.get("last_error") or "")
+    # если другой ошибки нет, показываем хотя бы расхождение настроек: иначе
+    # виджет считает, что всё в порядке, и человек не понимает, откуда чужой профиль
+    if not last_error and settings_error:
+        last_error = settings_error
     return {
         "ok": True,
         "installed": installed,
@@ -1689,6 +1797,7 @@ def status() -> dict:
         "strict_route": bool(s.get("strict_route", False)),
         "profile_index": pi,
         "profile_name": pro[pi]["name"] if pro else "",
+        "settings_error": settings_error,
         "node_index": ni,
         "node_name": (nd[ni]["tag"] if 0 <= ni < len(nd) else "auto"),
         "uptime": uptime,
@@ -1697,7 +1806,7 @@ def status() -> dict:
         "socks_port": SOCKS_PORT,
         "http_port": HTTP_PORT,
         "tun_iface": TUN_IFACE,
-        "last_error": str(st.get("last_error") or ""),
+        "last_error": last_error,
         "updated": updated,
         "profiles": pro,
         "nodes": nd,
@@ -1723,6 +1832,8 @@ def status_text(st: dict) -> str:
         parts.append("xray не работает")
     if str(st.get("mode")) == "tun" and not st.get("sbox_alive", True):
         parts.append("sing-box не работает — туннеля нет")
+    if st.get("settings_error"):
+        parts.append(str(st["settings_error"]))
     return " · ".join(part for part in parts if part)
 
 
@@ -1730,9 +1841,12 @@ def check() -> dict:
     url = "https://api.ipify.org"
     if shutil.which("curl") is None:
         return {"ok": False, "error": "curl не найден — внешний IP не проверить"}
-    direct = _run_out(["curl", "-s", "--max-time", "12", url], 15).strip()
     if not is_on():
-        return {"ok": False, "error": "не подключено", "direct_ip": direct}
+        # VPN выключен: прямой запрос ничего не доказывает, а стоит до 12 с —
+        # check зовут сторож и виджет, и они ждали впустую. Отвечаем сразу.
+        return {"ok": False, "error": "не подключено", "direct_ip": "",
+                "note": "VPN выключен — прямой IP не запрашивался"}
+    direct = _run_out(["curl", "-s", "--max-time", "12", url], 15).strip()
     proxied = _run_out(["curl", "-s", "--max-time", "20", "--socks5-hostname",
                         f"127.0.0.1:{SOCKS_PORT}", url], 23).strip()
     return {
@@ -1746,7 +1860,8 @@ def check() -> dict:
 def check_text(res: dict) -> str:
     """Короткая человеческая строка `omavpn check` (печатает только main)."""
     if res.get("error"):
-        return str(res["error"])
+        note = str(res.get("note") or "")
+        return str(res["error"]) + (f" · {note}" if note else "")
     if not res.get("ok"):
         return f"через VPN ответа нет · прямой IP: {res.get('direct_ip') or '—'}"
     return (f"прямой IP: {res.get('direct_ip') or '—'} · через VPN: {res.get('proxy_ip')}"
@@ -1770,6 +1885,14 @@ def on_text(res: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 def _free_port(start: int, tries: int = 200) -> int:
+    """Первый свободный локальный порт из диапазона.
+
+    Проверка «bind → close» не гарантирует, что порт останется нашим: между
+    закрытием сокета и стартом Xray его может занять чужой процесс (TOCTOU).
+    Поэтому вызывающий обязан перепроверить занятость прямо перед запуском
+    (`_port_busy`) и, если порт увели, сказать об этом внятно, а не гадать по
+    логу «xray не поднялся».
+    """
     for port in range(start, start + tries):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
@@ -1778,6 +1901,13 @@ def _free_port(start: int, tries: int = 200) -> int:
                 continue
             return port
     raise RuntimeError("нет свободного локального порта для теста")
+
+
+def _port_busy(port: int) -> bool:
+    """Слушает ли порт кто-то прямо сейчас (повторная проверка после _free_port)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
 
 
 def probe_running() -> bool:
@@ -1841,25 +1971,30 @@ def _probe_once(port: int, url: str, timeout: float):
 
 
 def probe_node(profile_index: int, node_index: int, probes: int, url: str,
-               timeout: float) -> dict:
+               timeout: float, budget: float | None = None) -> dict:
     """Поднимает временный Xray с одной нодой и меряет её реальные пробы.
 
     Каждая проба идёт в собственном каталоге: раньше все писали в общие
     `probe/node.json` и `probe/node.log`, и два одновременных теста (виджет и
     CLI) затирали друг другу конфиг и лог — результат был случайным.
+
+    `budget` — сколько секунд есть на всю ноду (передаёт `heal` из остатка
+    общего дедлайна). Бюджет режет и `validate` (до 30 с), и ожидание порта
+    (до 8 с), и сами пробы: иначе одна нода съедала до ~40 с сверх дедлайна.
     """
     PROBE_DIR.mkdir(parents=True, exist_ok=True)
     stamp = int(time.time() * 1000) % 10 ** 6
     workdir = PROBE_DIR / f"node-{os.getpid()}-{_num(node_index, 0)}-{stamp}"
     workdir.mkdir(parents=True, exist_ok=True)
     try:
-        return _probe_node_in(profile_index, node_index, probes, url, timeout, workdir)
+        return _probe_node_in(profile_index, node_index, probes, url, timeout, workdir,
+                              budget)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _probe_node_in(profile_index: int, node_index: int, probes: int, url: str,
-                   timeout: float, workdir: Path) -> dict:
+                   timeout: float, workdir: Path, budget: float | None = None) -> dict:
     """Тело probe_node: работает в своём временном каталоге `workdir`."""
     nd = nodes(profile_index)[node_index]
     result = {"index": node_index, "tag": nd["tag"], "detail": nd["detail"],
@@ -1867,26 +2002,41 @@ def _probe_node_in(profile_index: int, node_index: int, probes: int, url: str,
               "ok_count": 0, "loss": probes, "med": None, "p90": None, "max": None,
               "tls_med": None, "score": None, "secs": 0.0}
     started = time.time()
+
+    def left() -> float:
+        """Сколько осталось от бюджета; без бюджета — не ограничиваем."""
+        return float("inf") if budget is None else budget - (time.time() - started)
+
     port = _free_port(PROBE_PORT_BASE)
     cfg_path = workdir / "node.json"
     log_path = workdir / "node.log"
 
     cfg = build_xray(profile_index, node_index)
-    cfg.pop("observatory", None)
-    cfg.pop("burstObservatory", None)
-    routing = cfg.get("routing")
-    if isinstance(routing, dict):
-        routing.pop("balancers", None)
-        routing.pop("observatoryTag", None)
+    # подписка может принести balancers/observatory — для одной ноды они лишние
+    _strip_balancers(cfg)
     cfg["inbounds"] = [{"tag": "probe-in", "listen": "127.0.0.1", "port": port,
                         "protocol": "socks",
                         "settings": {"udp": False, "auth": "noauth"}}]
     cfg["log"] = {"loglevel": "error", "error": str(log_path), "access": "none"}
     save_json(cfg_path, cfg)
 
-    err = validate([str(XRAY_BIN), "run", "-c", str(cfg_path), "-test"], cfg_path)
+    if left() <= 1.0:
+        result["note"] = "бюджет времени исчерпан — этот сервер не проверялся"
+        result["secs"] = round(time.time() - started, 1)
+        return result
+
+    err = validate([str(XRAY_BIN), "run", "-c", str(cfg_path), "-test"], cfg_path,
+                   timeout=min(30.0, left()))
     if err:
         result["note"] = "конфиг отклонён: " + (err.splitlines() or [""])[0][:140]
+        result["secs"] = round(time.time() - started, 1)
+        return result
+
+    # повторная проверка порта: между _free_port и Popen его мог занять чужой
+    # процесс, и тогда пробы ушли бы через чужой прокси (или в никуда)
+    if _port_busy(port):
+        result["note"] = (f"порт 127.0.0.1:{port} занят другим процессом — "
+                          "сервер не проверен, повторите тест")
         result["secs"] = round(time.time() - started, 1)
         return result
 
@@ -1894,12 +2044,17 @@ def _probe_node_in(profile_index: int, node_index: int, probes: int, url: str,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, start_new_session=True)
     try:
-        if not _port_up(port, 8.0, proc):
+        if not _port_up(port, min(8.0, left()), proc):
             result["note"] = "Xray не поднялся с этой нодой"
         else:
             totals, tlss, streak = [], [], 0
             for _ in range(max(1, probes)):
-                one = _probe_once(port, url, timeout)
+                # -1 с на то, чтобы успеть вернуться до дедлайна: у curl внутри
+                # ещё свой запас на запуск
+                cap = left() - 1.0
+                if cap <= 0.5:
+                    break
+                one = _probe_once(port, url, min(timeout, cap))
                 if one is None:
                     streak += 1
                     if streak >= 3:      # нода явно не отвечает — не тянем таймауты
@@ -2163,7 +2318,8 @@ def heal(min_gap: float = 600.0, probes: int = 3, timeout: float = 4.0,
                 # таймаут одной пробы урезаем под остаток бюджета: иначе пробы
                 # 14 нод при внешнем таймауте 180–240 с прогон не заканчивали
                 per_probe = max(0.5, min(timeout, (budget - 1.0) / max(1, probes)))
-                results.append(probe_node(pi, n["index"], probes, PROBE_URL, per_probe))
+                results.append(probe_node(pi, n["index"], probes, PROBE_URL, per_probe,
+                                          budget=budget))
             if left() <= 0:
                 deadline_hit = True
             alive = sorted((r for r in results if not r["dead"]), key=lambda r: r["score"])

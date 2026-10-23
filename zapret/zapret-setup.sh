@@ -63,7 +63,14 @@ open(path, 'w').write(text)
 PY
 
 echo "==> Формирую исключение серверов omavpn"
-python3 - "$USER_HOME" > "$EXCL" <<'PY'
+# Считаем во временный файл, а не в $EXCL: раньше `> "$EXCL"` уже обнулял
+# боевой список, и при пустом результате (нет sub.json, DNS не разрешил имена
+# серверов) скрипт печатал «0 адресов исключено», выходил с кодом 0 и
+# перезапускал zapret. Дальше zapret десинкал рукопожатие собственного туннеля —
+# то есть «успех» ломал VPN. Теперь пустой результат — ошибка: боевой файл не
+# трогаем, zapret не перезапускаем.
+EXCL_NEW="$(mktemp)"
+python3 - "$USER_HOME" > "$EXCL_NEW" <<'PY'
 import ipaddress, json, socket, sys
 home = sys.argv[1]
 try:
@@ -94,7 +101,29 @@ for cfg in configs or []:
                         pass
 print("\n".join(sorted(ips)))
 PY
-echo "    $(grep -c . "$EXCL" 2>/dev/null || echo 0) адресов исключено"
+EXCL_COUNT=$(grep -c . "$EXCL_NEW" 2>/dev/null || true)
+if [ "${EXCL_COUNT:-0}" -eq 0 ]; then
+  rm -f "$EXCL_NEW"
+  cat >&2 <<EOF
+ОШИБКА: не удалось определить ни одного адреса серверов omavpn — исключать из
+         zapret нечего. Это не «0 адресов исключено», а поломка: без исключений
+         zapret начнёт десинхронизировать рукопожатие собственного туннеля и VPN
+         перестанет работать.
+
+  Причины, по которым так бывает:
+    * нет ~/.cache/omavpn/sub.json      -> сначала: omavpn update
+    * серверы заданы доменами и DNS их не разрешил -> проверь сеть и
+      /etc/resolv.conf, затем повтори
+    * в подписке нет outbound'ов vless/vmess/trojan/shadowsocks/hysteria2/wireguard
+
+  Что сделано: $CFG обновлён (бэкап $CFG.bak.$stamp), $EXCL НЕ изменён,
+  zapret.service НЕ перезапущен.
+EOF
+  exit 1
+fi
+install -m 0644 "$EXCL_NEW" "$EXCL"
+rm -f "$EXCL_NEW"
+echo "    $EXCL_COUNT адресов исключено"
 
 echo "==> Перезапуск zapret.service"
 systemctl daemon-reload

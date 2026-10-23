@@ -52,7 +52,10 @@ Panel {
   property real statusAt: 0
   property real healthStartedAt: 0
   // Кто именно не ответил (для понятного сообщения вместо «ошибка»).
-  property string timeoutHit: ""
+  // Метка на каждый процесс отдельная: два сторожа могут сработать подряд, и
+  // общий признак «что-то зависло» доставался бы не тому onExited — сообщение
+  // уходило бы о чужом процессе, а второй сбой терял свою метку.
+  property var timeouts: ({})
   // Тик раз в секунду только для надписей («проверяю… N с», возраст данных).
   property real nowSec: Date.now() / 1000
 
@@ -100,7 +103,12 @@ Panel {
   readonly property var hl: (root.health && root.health.items instanceof Array)
     ? root.health : ((root.bs && root.bs.health && root.bs.health.items instanceof Array) ? root.bs.health : ({}))
   readonly property string verdict: root.hl.verdict || ""
+  // Отметка последней проверки. Свежесть считаем именно по ней: в свежем ответе
+  // --health-json поля age нет (его добавляет только чтение кэша health.json),
+  // поэтому проверка «hl.age > 600» не срабатывала никогда.
+  readonly property real healthChecked: Number(root.hl.checked || 0)
   readonly property bool healthStale: root.hl.stale === true
+    || (root.healthChecked > 0 && (root.nowSec - root.healthChecked) > 600)
   // VPN выключен намеренно: плохой YouTube/Discord — не поломка.
   readonly property bool vpnIdle: root.hl.vpn_idle === true
   readonly property bool healthBusy: root.healthRunning !== ""
@@ -115,9 +123,10 @@ Panel {
   // actions нельзя выдавать за «исправлено» — виджет врал «исправлено: 1»
   // после отката.
   readonly property int raFixed: Number(root.ra.fixed) || 0
-  // Аудит считается невыполненным, если бэкенд так и сказал (verdict=error),
-  // если проб нет вовсе (нечего проверять) или если раздел не собрался.
-  // Раньше пустой список проб давал зелёное «маршруты в порядке» — ложь.
+  // Аудит считается провалившимся, если бэкенд так и сказал (verdict=error),
+  // вернул ok=false без единой пробы или раздел не собрался. Отдельный случай —
+  // файл без verdict и без проб, но с отметкой checked: это не провал, а
+  // отсутствие результата (raUnclear ниже), иначе он давал ложное зелёное.
   readonly property bool raFailed: {
     if (root.raDegraded) return true
     if (String(root.ra.verdict || "") === "error") return true
@@ -125,7 +134,15 @@ Panel {
     if (String(root.ra.verdict || "") === "bad" && root.raProbes.length === 0) return true
     return false
   }
-  readonly property bool raHas: !root.raFailed
+  // Страховка от ложного зелёного: в файле стоит отметка checked, но при этом
+  // ни verdict, ни единой пробы — значит результата аудита в нём нет (битый или
+  // очень старый файл). Зелёное «маршруты в порядке» здесь было бы выдумкой, а
+  // красное «аудит не выполнился» — перебором: показываем нейтрально-жёлтым.
+  readonly property bool raUnclear: !root.raFailed
+    && root.raProbes.length === 0
+    && String(root.ra.verdict || "") === ""
+    && Number(root.ra.checked || 0) > 0
+  readonly property bool raHas: !root.raFailed && !root.raUnclear
     && (Number(root.ra.checked || 0) > 0 || root.raProbes.length > 0)
   readonly property var raBroken: {
     var bad = []
@@ -139,6 +156,7 @@ Panel {
       if (why === "" && root.raDegraded) why = "раздел route_audit не собрался"
       return "маршруты: аудит не выполнился" + (why !== "" ? " — " + why : "")
     }
+    if (root.raUnclear) return "маршруты: аудит не дал результата — нажми «Проверить маршруты»"
     if (!root.raHas) return ""
     if (root.raFixed > 0)
       return "маршруты: проверено " + root.raCount + ", исправлено " + root.raFixed
@@ -153,8 +171,9 @@ Panel {
     return t
   }
   readonly property color raColor: root.raFailed ? root.urgent
-    : (root.raFixed > 0 ? root.warn
-      : (root.raBroken.length > 0 ? root.urgent : root.okColor))
+    : (root.raUnclear ? root.warn
+      : (root.raFixed > 0 ? root.warn
+        : (root.raBroken.length > 0 ? root.urgent : root.okColor)))
 
   function hItem(id) {
     var it = root.hl && root.hl.items ? root.hl.items : []
@@ -400,8 +419,13 @@ Panel {
   }
 
   // Сторож: Process без таймаута при зависании оставлял флаг занятым навсегда.
+  // Метка ставится конкретному процессу и снимается только его собственным
+  // onExited — соседние сторожа друг другу не мешают.
   function killProc(which) {
-    root.timeoutHit = which
+    var t = {}
+    for (var k in root.timeouts) t[k] = true
+    t[which] = true
+    root.timeouts = t
     if (which === "status") statusProc.running = false
     else if (which === "vpn") vpnProc.running = false
     else if (which === "health") healthProc.running = false
@@ -410,6 +434,24 @@ Panel {
     else if (which === "rescan") rescanProc.running = false
     else if (which === "upd") updProc.running = false
     else if (which === "action") actionProc.running = false
+  }
+
+  // Забрать метку «не ответил» у своего процесса (и только у него).
+  function takeTimeout(which) {
+    if (root.timeouts[which] !== true) return false
+    var t = {}
+    for (var k in root.timeouts) if (k !== which) t[k] = true
+    root.timeouts = t
+    return true
+  }
+
+  // Пора ли перезапустить проверку: результата нет или он старше sec секунд.
+  // Считаем по отметке checked, а не по age: в свежем ответе --health-json поля
+  // age нет вовсе (его добавляет только чтение кэша), из-за чего прежнее условие
+  // «hl.age > 600» не срабатывало никогда.
+  function healthDue(sec) {
+    if (!(root.healthChecked > 0)) return true
+    return (Date.now() / 1000 - root.healthChecked) > (sec || 600)
   }
 
   function notify(title, body) {
@@ -431,7 +473,9 @@ Panel {
     var kind = root.confirmKind
     root.cancelConfirm()
     if (kind === "audit") {
-      if (auditProc.running || root.busy !== "") return
+      // Идущая health-проверка тоже трогает маршруты: перекрывать их нельзя,
+      // иначе результаты обеих проверок будут мусорными.
+      if (auditProc.running || root.busy !== "" || root.healthBusy) return
       root.busy = "audit"
       auditProc.running = true
     } else if (kind === "update") {
@@ -477,8 +521,9 @@ Panel {
     if (!vpnProc.running && (!root.vpnLoaded || (Date.now() / 1000 - (root.vpnInfo.updated || 0)) > 120))
       vpnProc.running = true
     // Открытие панели — это не повод лечить VPN и не повод занимать busy:
-    // только чтение готового health.json, лечение — по кнопке.
-    if (!root.healthBusy && (!root.hl.checked || root.hl.age > 600)) root.startHealth(false)
+    // только чтение готового health.json, лечение — по кнопке. Перезапускаем
+    // проверку, если результата нет или он старше 10 минут (по отметке checked).
+    if (!root.healthBusy && root.healthDue(600)) root.startHealth(false)
   }
 
   implicitWidth: button.implicitWidth
@@ -494,7 +539,7 @@ Panel {
     function health(): string { root.startHealth(false); return "ok" }
     function heal(): string { root.startHealth(true); return "ok" }
     function audit(): string {
-      if (auditProc.running || root.busy !== "") return "busy"
+      if (auditProc.running || root.busy !== "" || root.healthBusy) return "busy"
       root.busy = "audit"
       auditProc.running = true
       return "ok"
@@ -547,8 +592,7 @@ Panel {
     command: [root.scriptPath, "--json"]
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
     onExited: function(code) {
-      if (root.timeoutHit === "status") {
-        root.timeoutHit = ""
+      if (root.takeTimeout("status")) {
         root.lastError = "статус не ответил за 60 с — данные могли устареть"
         return
       }
@@ -578,8 +622,7 @@ Panel {
     command: [root.scriptPath, "--vpn"]
     stdout: StdioCollector { id: vpnOut; waitForEnd: true }
     onExited: function(code) {
-      if (root.timeoutHit === "vpn") {
-        root.timeoutHit = ""
+      if (root.takeTimeout("vpn")) {
         root.lastError = "список серверов не получен за 60 с"
         return
       }
@@ -612,8 +655,7 @@ Panel {
     onExited: function(code) {
       var was = root.healthRunning
       root.healthRunning = ""
-      var timedOut = root.timeoutHit === "health"
-      if (timedOut) root.timeoutHit = ""
+      var timedOut = root.takeTimeout("health")
       if (timedOut) {
         root.lastError = "проверка не ответила за 5 минут — прервана"
       } else if (code !== 0) {
@@ -643,8 +685,7 @@ Panel {
     command: [root.scriptPath, "--rescan-request"]
     stdout: StdioCollector { id: rescanOut; waitForEnd: true }
     onExited: function(code) {
-      var timedOut = root.timeoutHit === "rescan"
-      if (timedOut) root.timeoutHit = ""
+      var timedOut = root.takeTimeout("rescan")
       root.busy = ""
       var msg = timedOut ? "запрос перебора не ответил — попробуй ещё раз" : "не удалось запросить перебор"
       if (code === 0 && !timedOut) {
@@ -666,8 +707,7 @@ Panel {
     command: [root.scriptPath, "--optimize"]
     stdout: StdioCollector { id: optimizeOut; waitForEnd: true }
     onExited: function(code) {
-      var timedOut = root.timeoutHit === "optimize"
-      if (timedOut) root.timeoutHit = ""
+      var timedOut = root.takeTimeout("optimize")
       root.busy = ""
       var msg = timedOut ? "подбор не ответил за 4 минуты — прерван" : "не удалось запустить подбор"
       if (code === 0 && !timedOut) {
@@ -693,8 +733,7 @@ Panel {
     command: [root.scriptPath, "--route-audit"]
     stdout: StdioCollector { id: auditOut; waitForEnd: true }
     onExited: function(code) {
-      var timedOut = root.timeoutHit === "audit"
-      if (timedOut) root.timeoutHit = ""
+      var timedOut = root.takeTimeout("audit")
       root.busy = ""
       var msg = timedOut ? "аудит маршрутов не ответил за 3 минуты" : "не удалось проверить маршруты"
       var d = null
@@ -719,8 +758,7 @@ Panel {
     command: [root.scriptPath, "--update-components"]
     stdout: StdioCollector { id: updOut; waitForEnd: true }
     onExited: function(code) {
-      var timedOut = root.timeoutHit === "upd"
-      if (timedOut) root.timeoutHit = ""
+      var timedOut = root.takeTimeout("upd")
       root.busy = ""
       var msg = timedOut ? "обновление не ответило за 4 минуты" : "не удалось обновить"
       if (code === 0 && !timedOut) {
@@ -742,8 +780,7 @@ Panel {
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function(code) {
       var label = root.busy
-      var timedOut = root.timeoutHit === "action"
-      if (timedOut) root.timeoutHit = ""
+      var timedOut = root.takeTimeout("action")
       root.busy = ""
       if (timedOut) {
         root.lastError = "действие «" + (label || "?") + "» не ответило за 3 минуты"
@@ -1621,10 +1658,15 @@ Panel {
           ActionButton {
             text: root.vtRunning ? ("подбор " + root.vtDone + "/" + root.vtTotal) : "Подобрать лучший"
             accent: Color.accent
-            tooltipText: "Прогнать все регионы и серверы и подключить лучший (туннель перезапустится)"
+            // Пока идёт health-проверка, подбор недоступен: обе операции трогают
+            // туннель и мешают друг другу — результаты были бы мусорными.
+            tooltipText: root.healthBusy
+              ? "Идёт проверка — дождись её окончания"
+              : "Прогнать все регионы и серверы и подключить лучший (туннель перезапустится)"
             enabled: root.cliPath !== "" && root.busy === "" && !root.vtRunning
+              && !root.healthBusy
             onClicked: {
-              if (root.vtRunning || optimizeProc.running) return
+              if (root.vtRunning || optimizeProc.running || root.healthBusy) return
               root.busy = "vtest"
               root.vpnExpanded = true
               optimizeProc.running = true
@@ -1633,10 +1675,14 @@ Panel {
 
           ActionButton {
             text: root.busy === "rescan" ? "…" : "Тест стратегий"
-            // Фоновая проверка не должна гасить действия — только своё занятие.
-            enabled: root.scriptPath !== "" && root.busy === ""
+            tooltipText: root.healthBusy
+              ? "Идёт проверка — дождись её окончания"
+              : "Перебрать стратегии zapret и выбрать рабочую"
+            // busy гасит все действия, health-проверка — только те, что сами
+            // трогают маршруты и zapret; открытая панель при проверке остаётся живой.
+            enabled: root.scriptPath !== "" && root.busy === "" && !root.healthBusy
             onClicked: {
-              if (root.busy !== "" || rescanProc.running) return
+              if (root.busy !== "" || rescanProc.running || root.healthBusy) return
               root.busy = "rescan"
               rescanProc.running = true
             }
@@ -1644,10 +1690,12 @@ Panel {
 
           ActionButton {
             text: root.busy === "audit" ? "… маршруты" : "Проверить маршруты"
-            tooltipText: "Аудит доменов: может перевести домен на другой путь и перезапустить туннель (~1 минута)"
+            tooltipText: root.healthBusy
+              ? "Идёт проверка — дождись её окончания"
+              : "Аудит доменов: может перевести домен на другой путь и перезапустить туннель (~1 минута)"
             // Аудит запускает scriptPath (bypass-status), а не cliPath (omavpn):
             // проверять надо именно его, иначе кнопка мертва без CLI.
-            enabled: root.scriptPath !== "" && root.busy === ""
+            enabled: root.scriptPath !== "" && root.busy === "" && !root.healthBusy
             onClicked: root.askConfirm("audit",
               "Проверить маршруты доменов?\nАудит может перевести домены на другой путь и перезапустить туннель — трафик прервётся примерно на минуту.")
           }
@@ -1732,10 +1780,29 @@ Panel {
             hoverEnabled: true
           }
 
+          // Подсказка показывается вручную (у неё свой contentItem и фон), а
+          // ToolTip.delay действует только на авто-показ: при ручной привязке
+          // visible он не выдерживается, и подсказка выскакивала мгновенно.
+          // Поэтому паузу перед появлением держит свой таймер.
+          readonly property bool tipWanted: raHover.containsMouse && raLine.visible
+          property bool tipShown: false
+          onTipWantedChanged: {
+            if (tipWanted) tipDelay.restart()
+            else {
+              tipDelay.stop()
+              tipShown = false
+            }
+          }
+
+          Timer {
+            id: tipDelay
+            interval: 500
+            onTriggered: raLine.tipShown = true
+          }
+
           ToolTip {
             id: raTip
-            visible: raHover.containsMouse && raLine.visible
-            delay: 500
+            visible: raLine.tipShown
             padding: Style.space(8)
             text: root.raLineText
             contentItem: Text {

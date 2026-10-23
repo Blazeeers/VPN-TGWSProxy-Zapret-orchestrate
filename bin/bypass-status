@@ -63,6 +63,7 @@ ROUTE_AUDIT_REASON_BACK = "аудит: proxy не отвечает"
 # По этому префиксу аудит узнаёт собственные оверрайды: ручные (`omavpn route
 # set`) не снимаются перепроверкой и не перебиваются аудитом никогда.
 ROUTE_REASON_PREFIX = "аудит"
+ROUTE_PATHS = ("proxy", "direct")  # допустимые пути оверрайда (как в bin/omavpn)
 ROUTE_RECHECK_AGE = 24 * 3600      # оверрайд proxy старше суток перепроверяем
 ROUTE_RECHECK_GAP = 20 * 3600      # но сам перепроверочный прогон — не чаще раза в 20 ч
 ROUTE_PROBE_TIMEOUT = 10           # больше 10 с на пробу не ждём
@@ -279,6 +280,11 @@ def vpn_status(cli: str) -> dict:
         "rx": int(_num(d.get("rx"))),
         "tx": int(_num(d.get("tx"))),
         "error": d.get("last_error", ""),
+        # Ошибка чтения settings.json от CLI (`omavpn`). Может отсутствовать
+        # (старые версии) или быть пустой строкой — виджету это полезно, чтобы
+        # показать «настройки битые», а не молчать. str() обязателен: CLI может
+        # положить сюда что угодно, а падать из-за нового поля нельзя.
+        "settings_error": str(d.get("settings_error") or ""),
     }
 
 
@@ -1209,6 +1215,15 @@ def route_audit_path(app: str) -> str:
 
 
 def read_route_overrides(app: str) -> dict:
+    """Оверрайды маршрутов в том же виде, в каком их читает `bin/omavpn`.
+
+    Файл допускает две формы записи: полную `{"домен": {"path": "proxy",
+    "reason": "...", "ts": ...}}` и короткую `{"домен": "proxy"}` (её понимает
+    `route_overrides()` в omavpn). Короткая форма раньше отбрасывалась как «не
+    словарь», и `_own_override` не видел ручного закрепления — аудит мог
+    перебить решение человека. Теперь оба вида приводятся к канону, а мусор
+    (неизвестный путь, не строка и не объект) пропускается.
+    """
     path = route_audit_path(app)
     try:
         data = json.load(open(path, encoding="utf-8"))
@@ -1216,7 +1231,26 @@ def read_route_overrides(app: str) -> dict:
         return {}
     if not isinstance(data, dict):
         return {}
-    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+    clean: dict = {}
+    for key, value in data.items():
+        dom = str(key).strip().strip(".").lower()
+        if not dom:
+            continue
+        if isinstance(value, str):        # короткая форма: {"домен": "proxy"}
+            value = {"path": value}
+        if not isinstance(value, dict):
+            continue
+        out = str(value.get("path") or "").strip().lower()
+        if out not in ROUTE_PATHS:
+            continue
+        try:
+            ts = int(value.get("ts") or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        clean[dom] = {"path": out,
+                      "reason": str(value.get("reason") or "").strip(),
+                      "ts": ts}
+    return clean
 
 
 def _audit_summary(probes: list, actions: list) -> str:
@@ -1414,8 +1448,9 @@ def _route_restore(cli: str, dom: str, previous: dict) -> dict:
 def _restart_vpn(cli: str) -> tuple[bool, str]:
     """Один перезапуск VPN на весь пакет уже записанных правил.
 
-    Таймаут 150 с, а не 240: за прогон рестартов бывает до трёх, и юнит
-    (`TimeoutStartSec=1200`) не должен убивать аудит между переключением и
+    Таймаут 150 с, а не 240: за прогон рестартов бывает до четырёх (снятие
+    залипших видео-оверрайдов в фазе 0, прямой путь, обратный путь и откат), и
+    юнит (`TimeoutStartSec=1200`) не должен убивать аудит между переключением и
     откатом — иначе домен останется на пути, который не проверен.
     """
     res = cli_json_slow(cli, "restart", timeout=150)
@@ -1621,8 +1656,9 @@ def run_route_audit() -> dict:
                 })
                 if not restarted:
                     # вердикта нет: правило не применилось. Это не повод считать
-                    # попытку неудачной — иначе сломавшийся один раз рестарт
-                    # отложил бы лечение домена на 12 часов.
+                    # попытку неудачной — иначе один сломавшийся рестарт отложил
+                    # бы лечение домена на 6 ч × 2^fails (т.е. на 12 ч после
+                    # первой неудачи, затем 24 и 48).
                     continue
                 route_state_mark(state, dom, "proxy", after_ok)
                 if after_ok:
@@ -1679,7 +1715,8 @@ def run_route_audit() -> dict:
                         dom = job["probe"]["domain"]
                         _route_restore(cli, dom, job["previous"])
                         # откат = неудачная попытка в direct: следующий раз не
-                        # раньше 12 ч, потом 24 и 48 — трафик не рвём зря
+                        # раньше 6 ч × 2^fails (12 ч после первой неудачи, потом
+                        # 24 и 48) — трафик не рвём зря
                         route_state_mark(state, dom, "direct", False)
                         job["item"].update({
                             "path": job["from"], "action": "rollback",
@@ -1879,20 +1916,21 @@ def run_route_recheck(force: bool = False) -> dict:
                                     "ok": bool(restore.get("ok")) and proxy_ok})
                 if restored and socks:
                     _restart_vpn(cli)  # вернуть правила в силу
-            # действия фазы 0 (снятые залипшие видео-оверрайды) сохраняем
-            pre_actions = [a for a in (result.get("actions") or []) if a.get("ok")]
-            all_actions = pre_actions + actions
+            # Действий «до» в перепроверке не бывает: фазы 0 (снятие залипших
+            # видео-оверрайдов) здесь нет, а оверрайды снимаются в этом же
+            # прогоне и попадают в `actions`. Раньше тут лежал склеенный список
+            # pre_actions + actions — мёртвый код из копипаста аудита.
             ok = all(p["after"] for p in probes if not p.get("advisory"))
             result = {
                 "ok": ok,
                 "checked": time.time(),
-                "verdict": "fixed" if any(a.get("ok") for a in all_actions)
+                "verdict": "fixed" if any(a.get("ok") for a in actions)
                            else ("ok" if ok else "bad"),
-                "summary": _audit_summary(probes, all_actions),
+                "summary": _audit_summary(probes, actions),
                 "count": len(probes),
-                "fixed": len([a for a in all_actions if a.get("ok")]),
+                "fixed": len([a for a in actions if a.get("ok")]),
                 "probes": probes,
-                "actions": all_actions,
+                "actions": actions,
                 "secs": round(time.time() - started, 1),
             }
     except Exception as exc:  # noqa: BLE001

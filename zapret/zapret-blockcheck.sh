@@ -18,6 +18,17 @@ LEVEL="${1:-standard}"
 export ZAPRET_AUTOTUNE_SOURCE=1
 . /usr/local/bin/zapret-autotune
 
+# Тот же лок, что у автотюна ($LOCK). main() автотюна при ZAPRET_AUTOTUNE_SOURCE=1
+# выходит раньше и лок не берёт, поэтому blockcheck мог идти параллельно с
+# прогоном таймера: тот поднимал zapret и VPN посреди «честного» теста, а после
+# завершения blockcheck оставлял систему в состоянии, выставленном не им.
+# Лок снимается сам при выходе процесса (fd закрывается), отдельного unlock нет.
+exec 9>"$LOCK" || { echo "Не удалось открыть лок $LOCK"; exit 1; }
+if ! flock -n 9; then
+  echo "==> Автотюн сейчас занят ($LOCK) — жду, пока закончит (до 15 минут)"
+  flock -w 900 9 || { echo "Лок так и не освободился — прерываю, ничего не менял"; exit 1; }
+fi
+
 mkdir -p "$CACHE"
 LOG=/var/log/zapret-blockcheck.log
 BCDOMAIN="www.youtube.com"
