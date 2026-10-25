@@ -813,7 +813,9 @@ def health_items(app: str, cli: str) -> tuple[list, dict]:
     z = zapret_status(wan_iface())
     data["zapret"] = z
     if z.get("testing"):
-        items.append({"id": "zapret", "name": "zapret", "state": "warn",
+        # Не warn: подбор стратегии — штатная работа, а не поломка. Отдельное
+        # состояние не красит бар тревожным цветом и не включает лечение.
+        items.append({"id": "zapret", "name": "zapret", "state": "tuning",
                       "detail": "идёт подбор стратегии"})
     elif z.get("mode") == "off":
         items.append({"id": "zapret", "name": "zapret", "state": "ok",
@@ -982,14 +984,18 @@ def run_health(heal_vpn: bool = True) -> dict:
                     item["detail"] += " · VPN выключен — не в счёт"
         bad = [i["name"] for i in items if i["state"] == "bad"]
         warn = [i["name"] for i in items if i["state"] == "warn"]
-        # state "idle" — не поломка (VPN намеренно выключен), в вердикт не идёт
-        verdict = "bad" if bad else ("warn" if warn else "ok")
+        tuning = [i["name"] for i in items if i["state"] == "tuning"]
+        # state "idle" — не поломка (VPN намеренно выключен), в вердикт не идёт.
+        # tuning — штатный подбор стратегии: не warn и не повод лечить.
+        verdict = "bad" if bad else ("warn" if warn else ("tuning" if tuning else "ok"))
         if verdict == "ok":
             summary = "всё работает: " + ", ".join(i["name"] for i in items)
         elif verdict == "warn":
             summary = "работает, но есть замечания · " + ", ".join(warn)
             if vpn_idle:
                 summary = "VPN выключен · " + summary
+        elif verdict == "tuning":
+            summary = "идёт подбор стратегии: " + ", ".join(tuning)
         else:
             summary = "не работает: " + ", ".join(bad)
         result = {

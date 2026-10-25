@@ -175,6 +175,9 @@ Panel {
   readonly property bool vpnOn: !!root.vpn.running
   readonly property bool capsOk: root.vpn.caps_ok !== false
   readonly property bool zapTesting: !!root.zap.testing || root.zap.autotune === "activating"
+  // Штатный подбор стратегии — отдельное нейтральное состояние, а не тревога:
+  // его показывает и свежий status, и уже записанный health.json.
+  readonly property bool zapTuning: root.zapTesting || root.hState("zapret", "") === "tuning"
 
   // Разделы, которые бэкенд не смог собрать (битый файл, исключение). Вместо
   // «всё хорошо» показываем это отдельной строкой.
@@ -321,6 +324,7 @@ Panel {
     if (state === "ok") return root.okColor
     if (state === "warn") return root.warn
     if (state === "bad") return root.urgent
+    if (state === "tuning") return Color.accent
     return root.dim
   }
   function stateWord(state) {
@@ -328,6 +332,7 @@ Panel {
     if (state === "warn") return "внимание"
     if (state === "bad") return "сбой"
     if (state === "idle") return "выкл"
+    if (state === "tuning") return "подбор"
     return ""
   }
 
@@ -450,14 +455,18 @@ Panel {
     root.statusError !== "" ? "warning"
     : root.verdict === "bad" ? "warning"
     : root.verdict === "warn" ? "warning"
-    : (root.vtRunning || root.zapTesting || root.healthBusy) ? "refresh"
+    : (root.verdict === "tuning" || root.zapTuning) ? "refresh"
+    : (root.vtRunning || root.healthBusy) ? "refresh"
     : root.verdict === "ok" ? "check"
     : "vpn"
   readonly property color healthColorBase:
     root.statusError !== "" ? root.urgent
     : root.verdict === "bad" ? root.urgent
     : root.verdict === "warn" ? root.warn
-    : (root.vtRunning || root.zapTesting || root.healthBusy) ? root.warn
+    // Подбор стратегии — нейтральная активность, не ошибка: акцентный цвет,
+    // а не warning. Так иконка не выглядит красной, пока autotune работает.
+    : (root.verdict === "tuning" || root.zapTuning) ? Color.accent
+    : (root.vtRunning || root.healthBusy) ? root.warn
     : root.verdict === "ok" ? root.okColor
     : (root.vpnOn ? root.okColor : root.dim)
 
@@ -467,7 +476,7 @@ Panel {
   // апдейтер, нет сети) бар НЕ красят — это не авария VPN, и подсвечивать их
   // в баре значило бы держать иконку цветной из-за недоступного GitHub.
   readonly property bool allCalm: root.verdict === "ok" && !root.upAny
-    && !root.vtRunning && !root.zapTesting && !root.healthBusy
+    && !root.vtRunning && !root.zapTuning && !root.healthBusy
     && root.busy === "" && root.statusError === ""
   readonly property color healthColor:
     (root.quietBar && root.allCalm) ? root.dim : root.healthColorBase
@@ -504,7 +513,7 @@ Panel {
   // Короткая подпись для шапки панели (PanelHero пишет её капсом).
   readonly property string heroMeta: {
     if (root.vtRunning) return "подбор серверов"
-    if (root.zapTesting) return "подбор стратегии zapret"
+    if (root.zapTuning || root.verdict === "tuning") return "подбор стратегии zapret"
     if (root.healthBusy) return "идёт проверка"
     if (!root.hl.checked) return root.vpnOn ? "VPN включён · проверки ещё не было" : "VPN выключен"
     // Считаем по состояниям пунктов, а не по полю verdict: старый кэш
@@ -526,7 +535,7 @@ Panel {
     if (root.statusError !== "") return "нет данных: " + root.statusError
     if (root.healthBusy) return "идёт проверка · " + root.healthElapsed + " с"
     if (root.vtRunning) return "идёт подбор серверов"
-    if (root.zapTesting) return "идёт подбор стратегии zapret"
+    if (root.zapTuning || root.verdict === "tuning") return "идёт подбор стратегии zapret"
     if (!root.hl.checked) return root.vpnOn ? "VPN подключён, проверка не запускалась" : "VPN выключен"
     return root.hl.summary || ""
   }
@@ -2507,7 +2516,7 @@ Panel {
 
               Pictogram {
                 name: "zapret"
-                tint: root.zapTesting ? root.warn : root.stateColor(root.hState("zapret", ""))
+                tint: root.zapTuning ? Color.accent : root.stateColor(root.hState("zapret", ""))
                 px: Style.space(18)
                 anchors.verticalCenter: parent.verticalCenter
               }
@@ -2524,7 +2533,7 @@ Panel {
                 Text {
                   width: parent.width
                   textFormat: Text.PlainText
-                  text: root.zapTesting ? "идёт подбор стратегии…" : root.hDetail("zapret", "", "")
+                  text: root.zapTuning ? "идёт подбор стратегии…" : root.hDetail("zapret", "", "")
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -2533,8 +2542,8 @@ Panel {
               }
               Text {
                 textFormat: Text.PlainText
-                text: root.zapTesting ? "…" : root.stateWord(root.hState("zapret", ""))
-                color: root.zapTesting ? root.warn : root.stateColor(root.hState("zapret", ""))
+                text: root.zapTuning ? "подбор" : root.stateWord(root.hState("zapret", ""))
+                color: root.zapTuning ? Color.accent : root.stateColor(root.hState("zapret", ""))
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
