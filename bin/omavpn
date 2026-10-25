@@ -562,18 +562,58 @@ def _restart_after_route_change() -> tuple[bool, str]:
 MAX_ROUTE_REASON = 200
 
 
+def _route_domain_input(domain: str) -> str:
+    """Достаёт домен из того, что человек скопировал в браузере.
+
+    Принимается и чистый домен, и ссылка: `https://x.com/path?q=1`,
+    `//user:pass@sub.example.co.uk:8080/a`, `яндекс.рф`. Отбрасываем схему,
+    путь/запрос/якорь, логин-пароль и порт — дальше строка проверяется теми же
+    `valid_domain()`/`norm_domain()`, поэтому мусор по-прежнему отвергается.
+    IPv6 (`[::1]`) намеренно не разбираем: двоеточий больше одного, и до
+    валидации он дойдёт как есть — с понятной ошибкой.
+    """
+    text = str(domain or "").strip()
+    # Схема: http://, https:// и protocol-relative //x.com
+    text = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", "", text)
+    if text.startswith("//"):
+        text = text[2:]
+    # Путь, query и якорь — всё после первого такого символа не домен.
+    text = re.split(r"[/?#]", text, maxsplit=1)[0]
+    # user:pass@host — берём хост после последнего «@».
+    if "@" in text:
+        text = text.rsplit("@", 1)[1]
+    # Порт: только цифры после одного двоеточия. `example.com:abc` — не порт,
+    # такую опечатку лучше показать ошибкой, а не молча превратить в домен.
+    text = re.sub(r":\d{1,5}$", "", text)
+    # Кириллический домен → punycode: sing-box понимает только ASCII. Если
+    # кодирование не удалось, строку не трогаем — валидация ниже скажет, что
+    # именно не так.
+    if text and not text.isascii():
+        try:
+            text = text.encode("idna").decode("ascii")
+        except (UnicodeError, ValueError):
+            pass
+    return text
+
+
 def _route_domain(domain: str) -> str:
     """Проверенный домен для `route set`/`route unset` — одно поведение у обеих.
 
     Раньше `route set` домен отвергал, а `route unset` молча нормализовал
     (`..Example.COM ` снимал оверрайд `example.com`), то есть на невалидный ввод
     две команды отвечали по-разному.
+
+    Ссылку из адресной строки браузера тоже принимаем (`_route_domain_input`):
+    человек копирует `https://x.com/страница`, а не отдельный хост. Проверка
+    после разбора та же, поэтому аудит со своими чистыми доменами ничего не
+    замечает.
     """
-    if not valid_domain(domain):
+    text = _route_domain_input(domain)
+    if not valid_domain(text):
         raise RuntimeError(
-            f"некорректный домен: {domain!r} — нужно обычное DNS-имя (например example.com): "
-            "без «*», IP, «#», пробелов, пустых меток (`a..b`), ведущей точки и кириллицы")
-    return norm_domain(domain)
+            f"некорректный домен: {str(domain or '').strip()!r} — вставь ссылку или домен, "
+            "например https://x.com или x.com")
+    return norm_domain(text)
 
 
 def _route_reason(reason: str) -> str:

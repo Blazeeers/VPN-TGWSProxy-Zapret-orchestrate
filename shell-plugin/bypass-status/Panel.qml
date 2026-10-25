@@ -132,6 +132,24 @@ Panel {
   property string confirmKind: ""
   property string confirmMessage: ""
 
+  // ---- экран настроек и маршруты сайтов ------------------------------------
+  // Действия, тумблеры и правила маршрутов живут за шестернёй в шапке: основная
+  // панель показывает состояние, настройки — то, что его меняет.
+  property bool settingsOpen: false
+  // Путь для нового правила: "direct" — напрямую, "proxy" — через VPN.
+  property string routePath: "direct"
+  // Свои правила из `omavpn route list`: [{domain, path, reason, ts}].
+  property var routeOverrides: []
+  // Список правил прочитан хотя бы раз: до этого «правил нет» было бы выдумкой.
+  property bool routeLoaded: false
+  property string routeError: ""
+  // «Список маршрутов в пути». FailedToStart не эмитит exited, и без этой метки
+  // ошибка о недоступном omavpn не появилась бы вовсе.
+  property bool routeListAwait: false
+  // Список просили обновить, пока он уже читался: повторим после ответа, иначе
+  // правило, добавленное в этот момент, осталось бы вне списка до переоткрытия.
+  property bool routeListDirty: false
+
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color warn: "#ff9f0a"
@@ -704,6 +722,57 @@ Panel {
     vpnProc.running = true
   }
 
+  // ---- экран настроек -------------------------------------------------------
+  // Переключение экранов сбрасывает прокрутку: иначе «Настройки» открывались бы
+  // на середине, где остался contentY основной панели.
+  function openSettings() {
+    root.settingsOpen = true
+    root.keyIndex = -1
+    root.routeError = ""
+    panelFlick.contentY = 0
+    root.refreshRoutes()
+  }
+  function closeSettings() {
+    root.settingsOpen = false
+    root.keyIndex = -1
+    root.routeError = ""
+    panelFlick.contentY = 0
+  }
+
+  // ---- маршруты сайтов ------------------------------------------------------
+  function refreshRoutes() {
+    if (root.cliPath === "") return
+    if (routeListProc.running) { root.routeListDirty = true; return }
+    // Команду ставим явно: привязка к cliPath в момент onCliPathChanged ещё не
+    // пересчитана, и Process с пустым argv уходил в FailedToStart.
+    routeListProc.command = [root.cliPath, "--json", "route", "list"]
+    root.routeListAwait = true
+    routeListProc.running = true
+  }
+  // Одно место для set и unset: busy="route" гасит кнопки, а команда собирается
+  // здесь же, чтобы набор аргументов не разъезжался между вызовами.
+  function changeRoute(action, domain, path) {
+    if (root.cliPath === "" || root.busy !== "" || root.healthBusy || root.vtRunning) return false
+    root.routeError = ""
+    root.busy = "route"
+    routeChangeProc.action = action
+    routeChangeProc.command = action === "unset"
+      ? [root.cliPath, "--json", "route", "unset", domain]
+      : [root.cliPath, "--json", "route", "set", domain, path, "--reason", "виджет: настройки"]
+    routeChangeProc.running = true
+    return true
+  }
+  // Ввод принимает и домен, и ссылку из браузера — разбирает бэкенд.
+  function addRoute() {
+    var text = String(routeInput.text || "").trim()
+    if (text === "") return
+    root.changeRoute("set", text, root.routePath)
+  }
+  function confirmUnsetRoute(domain) {
+    root.askConfirm("route-unset:" + domain,
+      "Снять правило для " + domain + "? VPN перезапустится на несколько секунд.")
+  }
+
   function run(args, label) {
     if (actionProc.running || root.cliPath === "" || root.busy !== "") return false
     root.opError = ""
@@ -747,6 +816,8 @@ Panel {
     else if (which === "upall") updateAllProc.running = false
     else if (which === "note") noteProc.running = false
     else if (which === "action") actionProc.running = false
+    else if (which === "route") routeChangeProc.running = false
+    else if (which === "route-list") routeListProc.running = false
   }
 
   // Забрать метку «не ответил» у своего процесса (и только у него).
@@ -932,19 +1003,57 @@ Panel {
   // Функция, а не property: при инициализации соседние id ещё могут быть null,
   // а к моменту нажатия клавиши они уже существуют.
   function actionButtons() {
-    return [checkAllBtn, bestBtn, rescanBtn, auditBtn, updateBtn, updateAllBtn]
+    return [checkAllBtn, bestBtn, rescanBtn, auditBtn, updateBtn, updateAllBtn,
+            mainHeader.gearButton, settingsHeader.backButton,
+            routeDirectBtn, routeProxyBtn, routeAddBtn, routeInput]
+  }
+  // Эффективная видимость: у ребёнка скрытого Column собственный visible остаётся
+  // true, поэтому проверяем всю цепочку родителей — иначе Tab заходил бы в
+  // кнопки другого экрана.
+  function isShown(item) {
+    var o = item
+    while (o) {
+      if (o.visible === false) return false
+      o = o.parent
+    }
+    return true
+  }
+  // Видимые кнопки в порядке keyIndex. keyTab/keyActivate ищут кнопку по её
+  // собственному номеру, а не по позиции в массиве: номера идут с пропусками,
+  // и подсветка не съезжает, когда часть кнопок скрыта.
+  function keyButtons() {
+    var all = root.actionButtons()
+    var out = []
+    for (var i = 0; i < all.length; i++) {
+      var b = all[i]
+      if (!b || b.keyIndex === undefined || b.keyIndex < 0) continue
+      if (!root.isShown(b)) continue
+      out.push(b)
+    }
+    // По возрастанию номера: Tab идёт в визуальном порядке, а не в порядке
+    // объявления — кнопки маршрута стоят в форме раньше «Добавить».
+    out.sort(function(a, b) { return a.keyIndex - b.keyIndex })
+    return out
   }
   function keyTab(dir) {
     if (confirmDlg.opened) { root.confirmToggle(); return }
-    var n = root.actionButtons().length
-    root.keyIndex = root.keyIndex < 0 ? (dir < 0 ? n - 1 : 0)
-      : (root.keyIndex + dir + n) % n
+    var list = root.keyButtons()
+    if (list.length === 0) { root.keyIndex = -1; return }
+    var pos = -1
+    for (var i = 0; i < list.length; i++) if (list[i].keyIndex === root.keyIndex) pos = i
+    if (pos < 0) root.keyIndex = dir < 0 ? list[list.length - 1].keyIndex : list[0].keyIndex
+    else root.keyIndex = list[(pos + dir + list.length) % list.length].keyIndex
   }
   function keyActivate() {
     if (confirmDlg.opened) { root.confirmAccept(); return }
-    var list = root.actionButtons()
-    var b = (root.keyIndex >= 0 && root.keyIndex < list.length) ? list[root.keyIndex] : null
-    if (b && b.enabled && b.keyIndex >= 0) b.clicked()
+    if (root.keyIndex < 0) return
+    var list = root.keyButtons()
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].keyIndex !== root.keyIndex) continue
+      if (list[i] === routeInput) { routeInput.forceActiveFocus(); return }
+      if (list[i].enabled) list[i].clicked()
+      return
+    }
   }
   function keyScroll(dx, dy) {
     if (confirmDlg.opened) {
@@ -968,6 +1077,13 @@ Panel {
       noticeTimer.restart()
     }
     var blocked = root.busy !== "" || root.healthBusy || root.vtRunning
+    // Снятие правила: префикс разбираем до остальных ветвей, занятость учитываем
+    // ту же — route set/unset поднимает туннель заново.
+    if (kind.indexOf("route-unset:") === 0) {
+      if (blocked || routeChangeProc.running) { refuse(); return }
+      root.changeRoute("unset", kind.slice("route-unset:".length), "")
+      return
+    }
     if (kind === "audit") {
       // Идущая health-проверка тоже трогает маршруты: перекрывать их нельзя,
       // иначе результаты обеих проверок будут мусорными. Пока идёт подбор
@@ -1030,6 +1146,12 @@ Panel {
     // следующего открытия (иначе Enter случайно подтвердит старое действие).
     if (!opened) {
       if (confirmDlg.opened) root.cancelConfirm()
+      // Панель закрыли из настроек — следующее открытие начинается с основной
+      // и сверху: иначе основная панель открылась бы на прокрутке настроек.
+      root.settingsOpen = false
+      root.routeError = ""
+      root.keyIndex = -1
+      panelFlick.contentY = 0
       return
     }
     // Клавиатурный курсор не переносим между открытиями: иначе первый же Enter
@@ -1045,6 +1167,12 @@ Panel {
     // только чтение готового health.json, лечение — по кнопке. Перезапускаем
     // проверку, если результата нет или он старше 10 минут (по отметке checked).
     if (!root.healthBusy && root.healthDue(root.healthMaxAge())) root.startHealth(false)
+  }
+
+  // Настройки могли открыть раньше первого снимка --json: тогда cliPath ещё
+  // пуст и список правил не читался вовсе. Догружаем, как только путь появился.
+  onCliPathChanged: {
+    if (root.settingsOpen && !root.routeLoaded && root.cliPath !== "") root.refreshRoutes()
   }
 
   implicitWidth: button.implicitWidth
@@ -1112,6 +1240,20 @@ Panel {
     foreground: root.foreground
     fontFamily: root.fontFamily
     fontSize: Style.font.bodySmall
+    hasCursor: keyIndex >= 0 && root.keyIndex === keyIndex
+    opacity: enabled ? 1 : 0.5
+  }
+
+  // Маленькая кнопка-глиф без рамки — шестерёнка в шапке. У Ui/Button нет
+  // своего keyIndex, а клавиатурный обход ищет именно его, поэтому добавляем.
+  component IconButton: Button {
+    property int keyIndex: -1
+    foreground: root.foreground
+    fontFamily: root.fontFamily
+    fontSize: Style.font.bodySmall
+    iconSize: Style.font.subtitle
+    horizontalPadding: Style.space(6)
+    verticalPadding: Style.space(2)
     hasCursor: keyIndex >= 0 && root.keyIndex === keyIndex
     opacity: enabled ? 1 : 0.5
   }
@@ -1549,6 +1691,95 @@ Panel {
     }
   }
 
+  // ---- маршруты сайтов: чтение и изменение правил --------------------------
+  // Список правил — только чтение файла оверрайдов, поэтому его можно звать и
+  // при открытии настроек, и после каждого изменения.
+  Process {
+    id: routeListProc
+    // Команда ставится в refreshRoutes() перед запуском: привязка к cliPath здесь
+    // в момент первого вызова ещё пустая.
+    stdout: StdioCollector { id: routeListOut; waitForEnd: true }
+    onRunningChanged: {
+      if (running || !root.routeListAwait) return
+      root.routeListAwait = false
+      root.routeError = "маршруты: omavpn не запускается — проверь " + root.cliPath
+    }
+    onExited: function(code) {
+      root.routeListAwait = false
+      // За время чтения список могли попросить обновить ещё раз (например,
+      // правило добавили сразу после открытия настроек): повторяем один раз.
+      function finish() {
+        if (root.routeListDirty) {
+          root.routeListDirty = false
+          root.refreshRoutes()
+        }
+      }
+      if (root.takeTimeout("route-list")) {
+        root.routeError = "список маршрутов не ответил за 30 с"
+        finish()
+        return
+      }
+      var d = null
+      try { d = JSON.parse(routeListOut.text) } catch (e) { d = null }
+      if (code !== 0 || !d || typeof d !== "object" || d.ok !== true) {
+        root.routeError = "маршруты: " + ((d && d.error)
+          ? d.error : ("список не получен, код " + code))
+        finish()
+        return
+      }
+      root.routeError = ""
+      root.routeOverrides = (d.overrides instanceof Array) ? d.overrides : []
+      root.routeLoaded = true
+      finish()
+    }
+  }
+
+  // Изменение правила. Один процесс на set и unset: команда собирается в
+  // changeRoute(), чтобы набор аргументов был ровно один.
+  Process {
+    id: routeChangeProc
+    property string action: ""
+    stdout: StdioCollector { id: routeOut; waitForEnd: true }
+    stderr: StdioCollector { id: routeErr; waitForEnd: true }
+    onRunningChanged: {
+      if (running || root.busy !== "route") return
+      root.busy = ""
+      root.routeError = "omavpn не запускается — проверь " + root.cliPath
+    }
+    onExited: function(code) {
+      var timedOut = root.takeTimeout("route")
+      var action = routeChangeProc.action
+      root.busy = ""
+      var d = null
+      try { d = JSON.parse(routeOut.text) } catch (e) { d = null }
+      if (timedOut) {
+        root.routeError = "маршрут не изменён: omavpn не ответил за 3 минуты"
+      } else if (code !== 0 || !d || d.ok !== true) {
+        var msg = (d && d.error) ? String(d.error) : ""
+        if (msg === "") msg = (routeErr.text || routeOut.text || "").trim()
+        root.routeError = msg || ("маршрут не изменён, код " + code)
+      } else if (action === "unset") {
+        root.notice = d.removed === false
+          ? ("правила для " + d.domain + " не было") : ("правило снято: " + d.domain)
+        noticeTimer.restart()
+        root.routeError = ""
+      } else if (d.changed === false) {
+        root.notice = "уже так и было"
+        noticeTimer.restart()
+        root.routeError = ""
+      } else {
+        root.notice = d.domain + " → " + (d.path === "proxy" ? "через VPN" : "напрямую")
+          + (d.restarted ? " · VPN перезапущен" : "")
+        noticeTimer.restart()
+        root.routeError = ""
+        routeInput.text = ""
+      }
+      // Перечитываем в любом исходе: частичное изменение тоже меняет список.
+      root.refreshRoutes()
+      root.refreshStatus()
+    }
+  }
+
   Process {
     id: notifyProc
     // notify-send есть на этой машине (libnotify); если его нет — уведомление
@@ -1650,6 +1881,12 @@ Panel {
   Timer { id: updateAllWatch; interval: 3600000; running: updateAllProc.running; onTriggered: root.killProc("upall") }
   Timer { id: noteWatch; interval: 20000; running: noteProc.running; onTriggered: root.killProc("note") }
   Timer { id: actionWatch; interval: 180000; running: actionProc.running; onTriggered: root.killProc("action") }
+  // 3 минуты: сам set/unset короткий (перезапуск туннеля ~20 с), но на плохой
+  // сети лок ctrl.lock ждётся дольше — ранний SIGTERM оставил бы полуприменённое
+  // правило.
+  Timer { id: routeWatch; interval: 180000; running: routeChangeProc.running; onTriggered: root.killProc("route") }
+  // Чтение списка — секунды; 30 с достаточно и не держит метку вечно.
+  Timer { id: routeListWatch; interval: 30000; running: routeListProc.running; onTriggered: root.killProc("route-list") }
 
   // ---- кнопка в панели -----------------------------------------------------
   BarIconButton {
@@ -1689,13 +1926,19 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(430))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(620))
+    contentHeight: panel.fittedContentHeight(
+      root.settingsOpen ? settingsColumn.implicitHeight : column.implicitHeight, Style.space(620))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // Поле ввода маршрута забирает клавиши себе: иначе стрелки и пробел
+      // уходили бы в обход кнопок и мешали печатать домен.
+      blocked: root.settingsOpen && routeInput.activeFocus
       onCloseRequested: {
         if (confirmDlg.opened) root.cancelConfirm()
+        // Escape в настройках возвращает в основную панель, а не закрывает её.
+        else if (root.settingsOpen) root.closeSettings()
         else root.close()
       }
       // Enter/Space: в открытом диалоге подтверждают выбранную кнопку, иначе
@@ -1711,7 +1954,7 @@ Panel {
       id: panelFlick
       anchors.fill: parent
       contentWidth: width
-      contentHeight: column.implicitHeight
+      contentHeight: root.settingsOpen ? settingsColumn.implicitHeight : column.implicitHeight
       clip: true
       boundsBehavior: Flickable.StopAtBounds
       flickableDirection: Flickable.VerticalFlick
@@ -1720,21 +1963,49 @@ Panel {
 
       Column {
         id: column
+        visible: !root.settingsOpen
         width: panelFlick.width
         spacing: Style.space(10)
 
-        PanelHero {
+        // Обёртка нужна из-за PanelHero.trailingControl: внутри Component `root`
+        // резолвится в сам PanelHero, поэтому к состоянию панели обращаемся
+        // через mainHeader.panel (тот же приём, что в плагине tailscale).
+        Item {
+          id: mainHeader
           width: parent.width
-          title: "Обходы"
-          meta: root.heroMeta
-          foreground: root.foreground
-          fontFamily: root.fontFamily
+          implicitHeight: mainHero.implicitHeight
+          readonly property var panel: root
+          // Шестерёнка объявлена внутри Component — её id снаружи не виден,
+          // поэтому клавиатурный обход берёт её отсюда.
+          property var gearButton: null
 
-          iconComponent: Component {
-            Pictogram {
-              name: root.healthIcon
-              tint: root.healthColor
-              px: Style.font.display * 1.1
+          PanelHero {
+            id: mainHero
+            width: parent.width
+            title: "Обходы"
+            meta: root.heroMeta
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+
+            iconComponent: Component {
+              Pictogram {
+                name: root.healthIcon
+                tint: root.healthColor
+                px: Style.font.display * 1.1
+              }
+            }
+
+            // Шестерёнка: единственный вход в настройки — на правом краю шапки,
+            // чтобы не занимать строку в теле панели.
+            trailingControl: Component {
+              IconButton {
+                id: settingsBtn
+                keyIndex: 6
+                iconText: "⚙"
+                tooltipText: "Настройки"
+                onClicked: mainHeader.panel.openSettings()
+                Component.onCompleted: mainHeader.gearButton = settingsBtn
+              }
             }
           }
         }
@@ -2479,7 +2750,136 @@ Panel {
           }
         }
 
-        // ---------- настройка ----------
+        Text {
+          width: parent.width
+          visible: root.notice !== ""
+          textFormat: Text.PlainText
+          text: root.notice
+          color: root.warn
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+
+          Text {
+            textFormat: Text.PlainText
+            text: root.hl.checked
+              ? ("проверено " + Qt.formatTime(new Date(root.hl.checked * 1000), "HH:mm")
+                 + (root.hl.secs ? " · " + root.hl.secs + " с" : "")
+                 + (root.healthStale ? " · устарело" : ""))
+              : "проверка не запускалась"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+          Text {
+            textFormat: Text.PlainText
+            visible: root.hItem("telegram") !== null
+            text: "· Telegram API: " + (root.hItem("telegram") ? root.hDetail("telegram", "", "") : "")
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+            width: parent.width * 0.5
+          }
+        }
+
+        // Возраст снимка --json: если бэкенд молчит, значения помечены как старые.
+        Text {
+          width: parent.width
+          visible: root.statusStamp !== ""
+          textFormat: Text.PlainText
+          text: "данные от " + root.statusStamp
+            + (root.statusStale ? " · устарели, обновление не отвечает" : "")
+          color: root.statusStale ? root.warn : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        // Аудит маршрутов: строку не обрезаем — переносим. Подсказка-дубль на
+        // весь текст (было ~50 строк) убрана: она показывала то же самое, что
+        // и так видно целиком.
+        Text {
+          width: parent.width
+          visible: root.raLineText !== ""
+          textFormat: Text.PlainText
+          text: root.raLineText
+          color: root.raColor
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+      }
+
+      // ---- экран настроек ----------------------------------------------------
+      // Второй экран той же панели, а не отдельное окно: сброс прокрутки,
+      // клавиатурный обход и закрытие по Escape работают как в основной.
+      Column {
+        id: settingsColumn
+        visible: root.settingsOpen
+        width: panelFlick.width
+        spacing: Style.space(10)
+
+        // Обёртка из-за trailingControl: внутри Component `root` резолвится в
+        // сам PanelHero, поэтому панель доступна только через settingsHeader.panel.
+        Item {
+          id: settingsHeader
+          width: parent.width
+          implicitHeight: settingsHero.implicitHeight
+          readonly property var panel: root
+          // Кнопка «Готово» объявлена внутри Component — её id снаружи не виден,
+          // поэтому клавиатурный обход берёт её отсюда.
+          property var backButton: null
+
+          PanelHero {
+            id: settingsHero
+            width: parent.width
+            title: "Настройки"
+            meta: "действия и маршруты"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+
+            iconComponent: Component {
+              Pictogram {
+                name: "settings"
+                tint: root.foreground
+                px: Style.font.display * 1.1
+              }
+            }
+
+            trailingControl: Component {
+              ActionButton {
+                id: settingsBackBtn
+                keyIndex: 7
+                text: "Готово"
+                // root в этом контексте может указывать на PanelHero — панель
+                // берём явно, чтобы подсветка клавиатуры не потерялась.
+                hasCursor: settingsHeader.panel !== null
+                  && settingsHeader.panel.keyIndex === 7
+                onClicked: settingsHeader.panel.closeSettings()
+                Component.onCompleted: settingsHeader.backButton = settingsBackBtn
+              }
+            }
+          }
+        }
+
+        // Ошибки действий показываются на том экране, где их нажали: без этого
+        // провал «Проверить всё» оставался бы за кадром.
+        Text {
+          width: parent.width
+          visible: root.errorText !== ""
+          textFormat: Text.PlainText
+          text: root.errorText
+          color: root.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+        // ---------- тумблеры ----------
         Rectangle {
           id: autoRowBox
           width: parent.width
@@ -2676,6 +3076,9 @@ Panel {
           }
         }
 
+
+        // Тот же notice, что и в основной панели: результат действия виден там,
+        // где человек нажал кнопку.
         Text {
           width: parent.width
           visible: root.notice !== ""
@@ -2687,57 +3090,251 @@ Panel {
           wrapMode: Text.WordWrap
         }
 
-        Row {
+        // ---------- маршруты сайтов ----------
+        // Своё правило поверх встроенных списков: человек решает, что идёт через
+        // туннель, не правя конфиги. Правило сильнее direct_domains.txt и аудита
+        // (первое совпадение в sing-box), поэтому подсказка про перезапуск VPN.
+        Rectangle {
           width: parent.width
-          spacing: Style.space(6)
+          radius: Style.cornerRadius > 0 ? Style.space(12) : 0
+          color: root.cardFill
+          border.width: 1
+          border.color: root.hairline
+          implicitHeight: routeBox.implicitHeight + Style.space(24)
 
-          Text {
-            textFormat: Text.PlainText
-            text: root.hl.checked
-              ? ("проверено " + Qt.formatTime(new Date(root.hl.checked * 1000), "HH:mm")
-                 + (root.hl.secs ? " · " + root.hl.secs + " с" : "")
-                 + (root.healthStale ? " · устарело" : ""))
-              : "проверка не запускалась"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+          Column {
+            id: routeBox
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: Style.space(12)
+            spacing: Style.space(8)
+
+            Row {
+              width: parent.width
+              spacing: Style.space(10)
+
+              Pictogram {
+                name: "settings"
+                tint: root.dim
+                px: Style.space(18)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: "МАРШРУТЫ САЙТОВ"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 0.8
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            // Без CLI правило некуда записать: форма была бы обманом.
+            Text {
+              width: parent.width
+              visible: root.cliPath === ""
+              textFormat: Text.PlainText
+              text: "omavpn не найден — маршруты недоступны"
+              color: root.warn
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              width: parent.width
+              visible: root.cliPath !== ""
+              textFormat: Text.PlainText
+              text: "Домен или ссылка. Твой выбор важнее встроенных правил; "
+                + "изменение перезапускает VPN на несколько секунд."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            TextField {
+              id: routeInput
+              // Поле входит в клавиатурный обход наравне с кнопками: Tab
+              // доводит до него, Enter открывает ввод, Escape возвращает панели.
+              property int keyIndex: 8
+              width: parent.width
+              visible: root.cliPath !== ""
+              foreground: root.foreground
+              font.family: root.fontFamily
+              placeholderText: "x.com или https://x.com/страница"
+              enabled: root.busy === ""
+              hasCursor: root.keyIndex === 8
+              onAccepted: root.addRoute()
+              // Escape из поля возвращает клавиатуру панели: иначе фокус
+              // оставался в скрытом поле и остальные клавиши терялись.
+              Keys.onEscapePressed: function(event) {
+                event.accepted = true
+                root.keyIndex = -1
+                keyCatcher.forceActiveFocus()
+              }
+              // Tab из заполненного поля продолжает обход кнопок, а не уводит
+              // фокус в никуда.
+              Keys.onTabPressed: function(event) {
+                event.accepted = true
+                root.keyTab((event.modifiers & Qt.ShiftModifier) ? -1 : 1)
+                keyCatcher.forceActiveFocus()
+              }
+              Keys.onBacktabPressed: function(event) {
+                event.accepted = true
+                root.keyTab(-1)
+                keyCatcher.forceActiveFocus()
+              }
+            }
+
+            Row {
+              width: parent.width
+              visible: root.cliPath !== ""
+              spacing: Style.space(8)
+
+              ActionButton {
+                id: routeDirectBtn
+                keyIndex: 9
+                text: "Напрямую"
+                selected: root.routePath === "direct"
+                onClicked: root.routePath = "direct"
+              }
+
+              ActionButton {
+                id: routeProxyBtn
+                keyIndex: 10
+                text: "Через VPN"
+                selected: root.routePath === "proxy"
+                onClicked: root.routePath = "proxy"
+              }
+
+              Item {
+                width: Math.max(0, parent.width - routeDirectBtn.width - routeProxyBtn.width
+                  - routeAddBtn.width - Style.space(24))
+                height: 1
+              }
+
+              ActionButton {
+                id: routeAddBtn
+                keyIndex: 11
+                text: root.busy === "route" ? "…" : "Добавить"
+                tooltipText: "Записать правило и перезапустить VPN, если он включён"
+                // Пустое поле или занятое действие — нечего отправлять.
+                enabled: root.cliPath !== "" && root.busy === "" && !root.healthBusy
+                  && !root.vtRunning && String(routeInput.text || "").trim() !== ""
+                onClicked: root.addRoute()
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.routeError !== ""
+              textFormat: Text.PlainText
+              text: root.routeError
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            // Свои правила: домен, путь и (для авто-правил аудита) пометка.
+            Column {
+              width: parent.width
+              spacing: Style.space(2)
+              visible: root.cliPath !== ""
+
+              Repeater {
+                model: root.routeOverrides
+
+                Rectangle {
+                  id: rrow
+                  required property var modelData
+                  readonly property string dom: String(modelData.domain || "")
+                  // Аудит подписывает свои записи «аудит: …» — человек должен
+                  // отличать их от своих.
+                  readonly property bool fromAudit:
+                    String(modelData.reason || "").indexOf("аудит") === 0
+                  width: parent.width
+                  implicitHeight: rline.implicitHeight + Style.space(8)
+                  radius: Style.cornerRadius > 0 ? Style.space(8) : 0
+                  color: "transparent"
+
+                  Row {
+                    id: rline
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: Style.space(8)
+                    anchors.rightMargin: Style.space(2)
+                    spacing: Style.space(8)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: rrow.dom
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      // Запас под путь, пометку «аудит» и кнопку снятия: без
+                      // него строка с пометкой вылезала за край карточки.
+                      width: Math.max(0, parent.width - Style.space(190))
+                      elide: Text.ElideRight
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      text: rrow.modelData.path === "proxy" ? "через VPN" : "напрямую"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                    Text {
+                      visible: rrow.fromAudit
+                      textFormat: Text.PlainText
+                      text: "аудит"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      opacity: 0.7
+                    }
+                    PanelActionButton {
+                      iconText: "✕"
+                      tooltipText: "Снять правило"
+                      foreground: root.foreground
+                      hoverColor: root.urgent
+                      fontFamily: root.fontFamily
+                      enabled: root.busy === "" && !root.healthBusy && !root.vtRunning
+                      anchors.verticalCenter: parent.verticalCenter
+                      onClicked: root.confirmUnsetRoute(rrow.dom)
+                    }
+                  }
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.cliPath !== "" && !root.routeLoaded
+              textFormat: Text.PlainText
+              text: "читаю правила…"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              width: parent.width
+              visible: root.cliPath !== "" && root.routeLoaded
+                && root.routeOverrides.length === 0
+              textFormat: Text.PlainText
+              text: "Пока своих правил нет — трафик идёт по общим правилам."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
           }
-          Text {
-            textFormat: Text.PlainText
-            visible: root.hItem("telegram") !== null
-            text: "· Telegram API: " + (root.hItem("telegram") ? root.hDetail("telegram", "", "") : "")
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
-            width: parent.width * 0.5
-          }
-        }
-
-        // Возраст снимка --json: если бэкенд молчит, значения помечены как старые.
-        Text {
-          width: parent.width
-          visible: root.statusStamp !== ""
-          textFormat: Text.PlainText
-          text: "данные от " + root.statusStamp
-            + (root.statusStale ? " · устарели, обновление не отвечает" : "")
-          color: root.statusStale ? root.warn : root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-        }
-
-        // Аудит маршрутов: строку не обрезаем — переносим. Подсказка-дубль на
-        // весь текст (было ~50 строк) убрана: она показывала то же самое, что
-        // и так видно целиком.
-        Text {
-          width: parent.width
-          visible: root.raLineText !== ""
-          textFormat: Text.PlainText
-          text: root.raLineText
-          color: root.raColor
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.WordWrap
         }
       }
     }
