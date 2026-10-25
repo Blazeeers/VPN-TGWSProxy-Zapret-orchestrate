@@ -3311,6 +3311,12 @@ RESET_CACHE_FILES = (PROBE_FILE, PROBE_LOCK,
                      CACHE / "yt.json", CACHE / "updates.json",
                      # аудит маршрутов держит свой лок в каталоге bypass-status
                      HOME / ".cache" / "bypass-status" / "route-audit.lock")
+# Бэкофф надзирателя. После сброса он не должен сидеть в паузе до часа: человек
+# только что привёл систему в порядок и ждёт проверки. Трогаем ТОЛЬКО счётчики
+# неудач — intent (включён ли VPN по воле человека), журнал, история переключений
+# и выбор сети остаются.
+GUARD_STATE_FILES = (HOME / ".local" / "state" / "omavpn-guard" / "next_try",
+                     HOME / ".local" / "state" / "omavpn-guard" / "fail_streak")
 # Кого добивать по командной строке. Регулярки, а не подстроки: точки в $HOME
 # иначе стали бы «любым символом», и поиск задел бы чужие процессы с похожей
 # строкой. `--json` необязателен: виджет и bypass-status зовут CLI именно так
@@ -3319,8 +3325,14 @@ RESET_CACHE_FILES = (PROBE_FILE, PROBE_LOCK,
 # сами бинари.
 RESET_CLI_PATTERNS = (r"(^|/)omavpn (--json )?(probe|best)( |$)",
                       r"(^|/)omavpn (--json )?(on|off|restart|toggle|heal|route)( |$)",
-                      # надзиратель вне systemd: иначе он тут же поднимет VPN
-                      r"(^|/)omavpn-guard( |$)")
+                      # надзиратель вне systemd: иначе он тут же поднимет VPN.
+                      # Матчим именно ЗАПУСК скрипта: `bash /path/omavpn-guard`,
+                      # `bash -c omavpn-guard`. Слово после `-c` должно быть
+                      # ровно путём к guard — поэтому `bash -c "cd
+                      # ~/.local/state/omavpn-guard"` и `vim …/omavpn-guard/x`
+                      # не попадают (там после `-c` идёт «cd», а не наш скрипт).
+                      r"(^| )([^ ]*/)?(ba)?sh ([^ ]*omavpn-guard"
+                      r"|-c ([^ ]*/)?omavpn-guard)( |$)")
 # Кто держит ctrl.lock: только эти команды. `status`, `refilter`, `subscription`
 # лок не берут, поэтому ждать их (и опрос виджета) не нужно.
 RESET_BUSY_PATTERN = (r"(^|/)omavpn (--json )?"
@@ -3415,7 +3427,7 @@ def reset(restart: bool = True) -> dict:
     stop_proc(XRAY_PID, "xray", timeout=3.0)
 
     # 3. Транзиентные файлы и каталоги.
-    for path in (*RESET_STATE_FILES, *RESET_CACHE_FILES):
+    for path in (*RESET_STATE_FILES, *RESET_CACHE_FILES, *GUARD_STATE_FILES):
         try:
             if path.exists():
                 path.unlink()

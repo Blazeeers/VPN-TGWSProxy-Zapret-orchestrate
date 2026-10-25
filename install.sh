@@ -200,7 +200,14 @@ Description=Проверка и самовосстановление VPN/YouTube
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/omavpn-guard
-TimeoutStartSec=3600
+# 4200 с: худший законный прогон — autotune-перебор (1200 с), перебор нод
+# (до 750 с), heal (420 с) и несколько подъёмов VPN. При 3600 с systemd убивал
+# guard посреди лечения, и в лог не попадало состояние (бэкофф/итог). Внутри
+# скрипта свой дедлайн 3900 с: он заканчивает работу сам, с записью в лог.
+TimeoutStartSec=4200
+# 150 с на остановку: по SIGTERM guard восстанавливает исходную ноду (до 90 с на
+# `omavpn node` + ожидание туннеля), и systemd не должен добивать его раньше.
+TimeoutStopSec=150
 SuccessExitStatus=1
 Nice=10
 # KillMode=process обязателен: аудит/guard перезапускают VPN, а xray и sing-box
@@ -218,6 +225,9 @@ Description=Периодическая проверка обходов
 OnBootSec=120s
 OnUnitInactiveSec=10min
 AccuracySec=30s
+# Разброс, чтобы guard и аудит маршрутов не стартовали в одну секунду и не
+# перезапускали туннель одновременно (аудит — RandomizedDelaySec=180).
+RandomizedDelaySec=60
 Unit=omavpn-guard.service
 
 [Install]
@@ -293,7 +303,9 @@ Description=Periodic route audit (direct/proxy per domain)
 [Timer]
 OnBootSec=3min
 OnUnitActiveSec=10min
-RandomizedDelaySec=30
+# 180 с, а не 30: с 30 с аудит регулярно попадал в тот же момент, что и guard
+# (у него RandomizedDelaySec=60), и оба перезапускали VPN почти одновременно.
+RandomizedDelaySec=180
 Persistent=true
 Unit=omavpn-route-audit.service
 

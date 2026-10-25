@@ -36,6 +36,7 @@ LAST_SWITCH="$STATE_DIR/last_switch"
 SWITCH_HISTORY="$STATE_DIR/switch_history"
 LAST_NET_FILE="$STATE_DIR/last_net"
 VPN_STATE="$HOME_DIR/.local/state/omavpn/state.json"
+XRAY_PID_FILE="$HOME_DIR/.local/state/omavpn/xray.pid"
 VPN_SETTINGS="$HOME_DIR/.config/omavpn/settings.json"
 SINGBOX_CFG="$HOME_DIR/.local/state/omavpn/singbox.json"
 DIRECT_FILE="$HOME_DIR/.config/omavpn/direct_domains.txt"
@@ -110,6 +111,18 @@ notify() {
 
 now() { date +%s; }
 
+# Внутренний дедлайн прогона: юнит разрешает 4200 с (install.sh), но лучше
+# закончить самим и записать состояние (бэкофф/лог), чем быть убитым systemd на
+# середине лечения. Долгие циклы (перебор нод, ожидание rescan) сверяются с ним.
+GUARD_START=$(now)
+GUARD_DEADLINE=${GUARD_DEADLINE:-3900}
+# Переменную можно задать снаружи (тесты), но мусор («10m», пусто) не должен
+# превращать сравнение в ошибку арифметики: только цифры, иначе умолчание.
+case "${GUARD_DEADLINE:-}" in
+    ""|*[!0-9]*) GUARD_DEADLINE=3900 ;;
+esac
+guard_expired() { [ $(( $(now) - GUARD_START )) -ge "$GUARD_DEADLINE" ]; }
+
 # --- состояние -------------------------------------------------------------
 
 tun_up() { ip link show omavpn0 >/dev/null 2>&1; }
@@ -132,10 +145,21 @@ vpn_mode() {
     esac
 }
 
-# Живой ли xray. В режиме proxy VPN держится только на нём (sing-box не нужен).
+# Живой ли ИМЕННО туннельный xray. `pgrep -x xray` ловит и временный Xray из
+# `omavpn probe`, и чужой ручной запуск: тогда связка «TUN есть + чужой xray
+# жив» считалась консистентной, а настоящий туннельный xray мог быть мёртв.
+# Сверяем PID из xray.pid (его пишет сам omavpn при запуске): процесс есть и в
+# его командной строке есть "xray".
 xray_up() {
-    command -v pgrep >/dev/null 2>&1 || return 0
-    pgrep -x xray >/dev/null 2>&1
+    local pid
+    # Нет файла — нет и туннельного xray; без этой проверки `<file` печатает
+    # ошибку оболочки в journal (guard работает под systemd).
+    [ -r "$XRAY_PID_FILE" ] || return 1
+    pid=$(tr -d '[:space:]' <"$XRAY_PID_FILE" 2>/dev/null)
+    case "${pid:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ -d "/proc/$pid" ] || return 1
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'xray'
 }
 
 # Жив ли VPN. В режиме tun признак — интерфейс omavpn0 (флаг running в
@@ -334,11 +358,14 @@ autotune_mode() {
 }
 
 autotune_lastscan() {
-    local key f
+    local key f v
     key=$(net_key)
     [ -n "$key" ] || { echo 0; return; }
     f="$AUTOTUNE_DIR/$key.lastscan"
-    cat "$f" 2>/dev/null | tr -d '[:space:]' || echo 0
+    # Пустой файл (autotune ещё не писал отметку) давал пустую строку, и
+    # сравнение «изменился ли lastscan» срабатывало как «перебор завершился».
+    v=$(cat "$f" 2>/dev/null | tr -d '[:space:]')
+    echo "${v:-0}"
 }
 
 zapret_active() { systemctl is-active --quiet zapret.service 2>/dev/null; }
@@ -365,6 +392,12 @@ wait_rescan_result() {
     before=$(autotune_lastscan)
     deadline=$(( $(now) + RESCAN_WAIT ))
     while [ "$(now)" -lt "$deadline" ]; do
+        # Причина выхода важна для лога: «не завершился за 20 мин» при выходе по
+        # внутреннему дедлайну (например, после 5 минут) — прямая ложь.
+        if guard_expired; then
+            log "внутренний дедлайн прогона ($GUARD_DEADLINE с) — перебор не дождался, выхожу"
+            return 1
+        fi
         sleep 20
         if [ "$(autotune_lastscan)" != "$before" ] && [ "$(autotune_lastscan)" != "0" ]; then
             log "autotune закончил перебор (режим $(autotune_mode))"
@@ -402,7 +435,9 @@ http_body() { # $1 url, $2 лимит байт; 1 — тело не пришло
     local body="" i=0 tries=${HTTP_TRIES:-2}
     while [ "$i" -lt "$tries" ]; do
         i=$((i + 1))
-        body=$(curl -4 -s --max-time "$CURL_T" "$1" 2>/dev/null | head -c "${2:-150000}")
+        # -L: YouTube отвечает 302 на региональные/согласительные редиректы,
+        # без перехода по ним тело пустое и страница «не открывается».
+        body=$(curl -4 -s -L --max-time "$CURL_T" "$1" 2>/dev/null | head -c "${2:-150000}")
         [ -n "$body" ] && { printf '%s' "$body"; return 0; }
         [ "$i" -lt "$tries" ] && sleep 1
     done
@@ -413,7 +448,9 @@ http_meta() { # $1 url -> "код content-type размер"
     local out="" i=0 tries=${HTTP_TRIES:-2}
     while [ "$i" -lt "$tries" ]; do
         i=$((i + 1))
-        out=$(curl -4 -s -o /dev/null -w '%{http_code} %{content_type} %{size_download}' \
+        # -L: favicon YouTube отдаёт 302 на CDN; без перехода код был бы 302 и
+        # проверка «картинка отдаётся картинкой» ложно проваливалась.
+        out=$(curl -4 -s -L -o /dev/null -w '%{http_code} %{content_type} %{size_download}' \
             --max-time "$CURL_T" "$1" 2>/dev/null)
         case "${out%% *}" in 2??|3??) break ;; esac
         [ "$i" -lt "$tries" ] && sleep 1
@@ -424,7 +461,7 @@ http_meta() { # $1 url -> "код content-type размер"
 svc_youtube_ok() {
     local code ctype size body img rest
     code=$(http_code https://www.youtube.com/)
-    [ "$code" = "200" ] || return 1
+    { [ "$code" = "200" ] || [ "$code" = "302" ]; } || return 1
     body=$(http_body https://www.youtube.com/) || return 1
     grep -qiE 'ytimg|youtube' <<<"$body" || return 1
     # CDN превью — generate_204 на самом i.ytimg.com. Раньше здесь стоял жёсткий
@@ -547,33 +584,88 @@ vpn_status_load() {
     return 0
 }
 
+# Восстановление исходного выбора после перебора нод. Живёт отдельно от
+# try_nodes, потому что вызывается ещё и из trap: прогон могут убить по TERM
+# (таймаут юнита, reset) посреди теста ноды — и тогда в настройках останется
+# случайная нода, с которой guard продолжил бы работу.
+TRY_NODES_ORIG=""
+TRY_NODES_ACTIVE=0
+
+restore_node() { # $1 — индекс (>=0) или -1 (авто)
+    local idx="$1"
+    case "${idx:-}" in ''|*[!0-9-]*) return 0 ;; esac
+    if [ "$idx" = "-1" ]; then
+        log "возвращаю авто-выбор сервера"
+    else
+        log "возвращаю прежнюю ноду $idx"
+    fi
+    timeout 90 "$OMAVPN" node "$idx" >/dev/null 2>&1
+    wait_vpn >/dev/null 2>&1 || vpn_up >/dev/null 2>&1
+}
+
+try_nodes_guard_exit() {
+    [ "$TRY_NODES_ACTIVE" = 1 ] || return 0
+    TRY_NODES_ACTIVE=0
+    local orig="$TRY_NODES_ORIG"
+    TRY_NODES_ORIG=""
+    log "перебор нод прерван — восстанавливаю исходный выбор ($orig)"
+    restore_node "$orig"
+}
+# По сигналу восстанавливаем выбор и выходим: без exit обработчик вернул бы
+# управление в середину перебора, и следующая же итерация снова сменила бы ноду
+# (уже после восстановления). EXIT-ловушка нужна для штатного выхода и для
+# `omavpn reset`/таймаута юнита (SIGTERM).
+trap 'try_nodes_guard_exit; exit 143' TERM
+trap 'try_nodes_guard_exit; exit 130' INT
+trap 'try_nodes_guard_exit; exit 129' HUP
+trap 'try_nodes_guard_exit' EXIT
+
 try_nodes() {
-    local orig node_count node tries=0
+    local orig node_count node tries=0 switched=0
     vpn_status_load
     orig=$(printf '%s' "$VPN_STATUS_JSON" | jq -r '.node_index // -1' 2>/dev/null)
     node_count=$(printf '%s' "$VPN_STATUS_JSON" | jq -r '.nodes | length' 2>/dev/null)
     [ -n "$orig" ] || orig=-1
     [ -n "$node_count" ] || node_count=0
     [ "$node_count" -gt 0 ] || return 1
+    # Одна нода: перебирать нечего, а `omavpn node 0` всё равно перезапустил бы
+    # туннель (choose() при включённом VPN делает on) — то есть лишний обрыв.
+    if [ "$node_count" -le 1 ]; then
+        log "в профиле одна нода — альтернатив для перебора нет"
+        return 1
+    fi
 
+    TRY_NODES_ORIG="$orig"
+    TRY_NODES_ACTIVE=1
     for node in $(seq 0 $(( node_count - 1 ))); do
         [ "$node" = "$orig" ] && continue
+        # Дедлайн проверяем ДО инкремента: иначе истёкший бюджет на первой же
+        # итерации всё равно приводил к «попытке» и лишнему восстановлению ноды
+        # (то есть к перезапуску туннеля, которого уже не на что тратить).
+        if guard_expired; then
+            log "внутренний дедлайн прогона — прекращаю перебор нод"
+            break
+        fi
+        [ "$tries" -ge "$MAX_NODES" ] && break
         tries=$((tries + 1))
-        [ "$tries" -gt "$MAX_NODES" ] && break
         log "пробую ноду $node"
         timeout 90 "$OMAVPN" node "$node" >/dev/null 2>&1
+        switched=1
         wait_vpn || vpn_up
         if health_ok_quiet; then
+            # Успех: выбранная нода и должна остаться — прежнюю не возвращаем.
+            TRY_NODES_ACTIVE=0
+            TRY_NODES_ORIG=""
             log "помогла нода $node"
             return 0
         fi
     done
-
-    if [ "${orig:--1}" != "-1" ] && [ "${orig:-0}" -ge 0 ] 2>/dev/null; then
-        timeout 90 "$OMAVPN" node "$orig" >/dev/null 2>&1
-        wait_vpn || vpn_up
-        log "вернул прежнюю ноду $orig"
-    fi
+    TRY_NODES_ACTIVE=0
+    TRY_NODES_ORIG=""          # восстановление уже сделано/не нужно — trap не должен повторять
+    # Восстанавливаем только если нода реально менялась: при истёкшем дедлайне
+    # (или MAX_NODES=0) перебора не было, и `omavpn node` — лишний обрыв.
+    [ "$switched" = 1 ] || return 1
+    restore_node "$orig"
     return 1
 }
 
@@ -654,13 +746,25 @@ restart_tg() {
 # не чаще раза в 10 минут), и при dead-ноде: guard шёл дальше по лечению,
 # считая, что мера применена и не сработала.
 heal_vpn() {
-    local out rc reason
-    out=$(timeout "$HEAL_TIMEOUT" "$OMAVPN" --json heal 2>/dev/null)
+    local out rc reason errf tail_out
+    errf="$STATE_DIR/heal.err"
+    out=$(timeout "$HEAL_TIMEOUT" "$OMAVPN" --json heal 2>"$errf")
     rc=$?
     if [ "$rc" -ne 0 ]; then
-        log "omavpn heal: код $rc (таймаут — $HEAL_TIMEOUT с)"
+        # Раньше любой ненулевой код назывался «таймаутом»: настоящая ошибка
+        # (например, не собрался конфиг) выглядела как исчерпанный бюджет, и по
+        # логу нельзя было понять, что чинить. 124 — единственный код timeout(1).
+        tail_out=$( { printf '%s' "$out"; tail -c 300 "$errf" 2>/dev/null; } \
+            | tr '\n' ' ' | tr -s ' ' | cut -c1-300 )
+        rm -f "$errf"
+        if [ "$rc" -eq 124 ]; then
+            log "omavpn heal: таймаут $HEAL_TIMEOUT с — не успел за бюджет"
+        else
+            log "omavpn heal: ошибка, код $rc${tail_out:+ — $tail_out}"
+        fi
         return 1
     fi
+    rm -f "$errf"
     reason=$(json_field "$out" reason)
     case "$reason" in
         "")        log "omavpn heal выполнен: $(json_actions "$out")" ;;
@@ -967,6 +1071,18 @@ cmd_check() {
         return 1
     fi
 
+    # Дедлайн проверяем ДО лога: `path_now` — это `omavpn route list` (до 20 с),
+    # и на исчерпанном бюджете он тратил бы время впустую. Путь всё равно
+    # напишет heal(); здесь достаточно режима.
+    if guard_expired; then
+        log "внутренний дедлайн прогона ($GUARD_DEADLINE с) — лечение откладываю (не работают:$broken)"
+        # Это не «всё хорошо»: иначе каждый тик снова упирался бы в дедлайн.
+        mark_fail
+        return 1
+    fi
+    # Диагностика: при want=on heal запускается сразу, и в логе раньше не было
+    # видно, что именно сломано — только «лечение не помогло» в конце.
+    log "не работают:$broken — запускаю лечение (режим $(vpn_mode))"
     if heal; then
         mark_ok
         return 0
