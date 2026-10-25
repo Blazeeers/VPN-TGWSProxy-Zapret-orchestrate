@@ -66,7 +66,11 @@ TUN_ADDR = "172.19.0.1/30"
 PROBE_FILE = CACHE / "probe.json"
 PROBE_LOCK = CACHE / "probe.lock"
 PROBE_DIR = CACHE / "probe"
-PROBE_URL = "https://discord.com/api/v9/gateway"
+# Проба обязана идти через ноду, а не напрямую. discord.com сюда не годится:
+# он лежит в BUILTIN_DIRECT_DOMAINS, и probe мерил прямой маршрут, объявляя
+# мёртвые ноды живыми (из-за этого heal выбирал недоступный сервер).
+# example.com в direct-списки не входит — трафик идёт в proxy.
+PROBE_URL = "https://example.com/"
 PROBE_PORT_BASE = 10990
 PROBE_DEFAULT_PROBES = 8
 PROBE_DEFAULT_TIMEOUT = 6.0
