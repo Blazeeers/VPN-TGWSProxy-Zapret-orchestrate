@@ -44,6 +44,8 @@ PROBE_STATE_MAX_AGE = 15 * 60
 # Big Buck Bunny (Blender, официальный, стабилен). Прежний dQw4w9WgXcQ
 # отдаётся с троттлингом (17 КБ/с) — проверка скорости ложно падала.
 YT_TEST_VIDEO = "aqz-KE-bpKQ"
+# Второй ролик — запасной CDN, если первый хост тормозит.
+YT_TEST_VIDEOS = (YT_TEST_VIDEO, "dQw4w9WgXcQ")
 # Файлы прогресса теста серверов (пишет omavpn probe) — читаем первый свежий.
 PROBE_APPS = ("omavpn", "wowvpn")
 PROBE_MAX_AGE = 12 * 3600
@@ -474,70 +476,87 @@ def _yt_reachability(note: str = "", timeout: int = 12) -> dict:
     return res
 
 
+def _yt_video_url(video_id: str, deadline: float) -> str:
+    """Ссылка на поток для одного ролика: android, затем клиент по умолчанию."""
+    if not YTDLP:
+        return ""
+    attempts = (
+        ["--extractor-args", "youtube:player_client=android"],
+        [],
+    )
+    for extra in attempts:
+        left = deadline - time.time()
+        if left < 3:
+            break          # бюджет пробы исчерпан — второй клиент не пробуем
+        try:
+            proc = subprocess.run(
+                [YTDLP, "-q", "--no-warnings", *extra, "-f", "worst", "-g",
+                 f"https://www.youtube.com/watch?v={video_id}"],
+                capture_output=True, text=True, errors="replace",
+                timeout=min(YTDLP_TIMEOUT, left))
+            lines = (proc.stdout or "").strip().splitlines()
+            if lines:
+                return lines[0]
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+    return ""
+
+
+def _yt_probe_one(video_id: str, deadline: float) -> dict:
+    """Один ролик: ссылка + выборка 256 КБ. Не трогает состояние здоровья."""
+    url = _yt_video_url(video_id, deadline)
+    if not url:
+        return {"ok": False, "error": "yt-dlp не вернул ссылку",
+                "method": "yt-dlp", "video": video_id}
+    left = int(max(5.0, min(YT_CURL_TIMEOUT, deadline - time.time())))
+    out = run(["curl", "-4", "-sL", "--max-time", str(left), "-o", "/dev/null",
+               "-r", f"0-{YT_SAMPLE_BYTES - 1}",
+               "-w", "%{http_code} %{size_download} %{time_total}",
+               url], timeout=left + 3)
+    parts = out.split()
+    if len(parts) != 3:
+        return {"ok": False, "error": "googlevideo не ответил",
+                "method": "yt-dlp", "video": video_id}
+    code, size, secs = parts
+    try:
+        size_i = int(float(size))
+        secs_f = float(secs) or 0.001
+    except ValueError:
+        return {"ok": False, "error": "googlevideo: непонятный ответ",
+                "method": "yt-dlp", "video": video_id}
+    kbps = round((size_i / 1024) / secs_f)
+    ok = code in ("200", "206") and size_i >= MIN_YT_BYTES and kbps >= MIN_YT_KBPS
+    return {"ok": ok, "code": code, "bytes": size_i, "secs": round(secs_f, 2),
+            "kbps": kbps, "sample": YT_SAMPLE_BYTES, "method": "yt-dlp",
+            "video": video_id}
+
+
 def youtube_video_check() -> dict:
     """Качает кусок видео с googlevideo.com и меряет скорость — ловит троттлинг.
 
-    Страница может открываться, а видео при этом не грузиться: тогда прямой
-    youtube работать «нормально» не считается.
+    Проверяем два ролика, а не один: YouTube раздаёт разные ролики с разных
+    CDN-хостов, и один медленный/недоступный хост (например, rr6... сегодня)
+    красил весь YouTube красным, хотя остальные качались на 10–25 МБ/с.
+    Достаточно одного быстрого ответа.
 
-    Важный размен: сбой самого инструмента (yt-dlp не дал ссылку) — это не
-    блокировка. 22.10.2026 клиент по умолчанию перестал отдавать форматы, и
-    health красил YouTube красным при полностью живой странице. Теперь такой
-    случай откатывается на проверку доступности (method="reachability").
+    Сбой самого инструмента (yt-dlp не дал ссылку) — это не блокировка:
+    тогда откатываемся на проверку доступности страницы и CDN.
     """
     deadline = time.time() + YT_BUDGET
-    if YTDLP:
-        # Клиент по умолчанию (visionos) с 22.10.2026 отдаёт только аудио и
-        # сториборды, и yt-dlp падает с «Requested format is not available» —
-        # проверка видео врала, а zapret-autotune из-за неё уходил в режим vpn.
-        # Рабочий клиент — android (проверено: ссылка с ip=<РФ IP>, качается 206).
-        url = ""
-        attempts = (
-            ["--extractor-args", "youtube:player_client=android"],
-            [],
-        )
-        for extra in attempts:
-            left = deadline - time.time()
-            if left < 3:
-                break          # бюджет пробы исчерпан — второй клиент не пробуем
-            try:
-                proc = subprocess.run(
-                    [YTDLP, "-q", "--no-warnings", *extra, "-f", "worst", "-g",
-                     f"https://www.youtube.com/watch?v={YT_TEST_VIDEO}"],
-                    capture_output=True, text=True, errors="replace",
-                    timeout=min(YTDLP_TIMEOUT, left))
-                lines = (proc.stdout or "").strip().splitlines()
-                url = lines[0] if lines else ""
-            except (OSError, subprocess.TimeoutExpired, ValueError):
-                url = ""
-            if url:
-                break
-        if not url:
-            # Фолбэк тоже в рамках бюджета: суммарно проба не должна выходить
-            # за YT_BUDGET, иначе --health-json ждёт десятки секунд.
-            left = int(max(4.0, min(12.0, deadline - time.time())))
-            return _yt_reachability("yt-dlp не вернул ссылку", timeout=left)
-        left = int(max(5.0, min(YT_CURL_TIMEOUT, deadline - time.time())))
-        out = run(["curl", "-4", "-sL", "--max-time", str(left), "-o", "/dev/null",
-                   "-r", f"0-{YT_SAMPLE_BYTES - 1}",
-                   "-w", "%{http_code} %{size_download} %{time_total}",
-                   url], timeout=left + 3)
-        parts = out.split()
-        if len(parts) != 3:
-            return {"ok": False, "error": "googlevideo не ответил", "method": "yt-dlp"}
-        code, size, secs = parts
-        try:
-            size_i = int(float(size))
-            secs_f = float(secs) or 0.001
-        except ValueError:
-            return {"ok": False, "error": "googlevideo: непонятный ответ",
-                    "method": "yt-dlp"}
-        kbps = round((size_i / 1024) / secs_f)
-        ok = code in ("200", "206") and size_i >= MIN_YT_BYTES and kbps >= MIN_YT_KBPS
-        return {"ok": ok, "code": code, "bytes": size_i, "secs": round(secs_f, 2),
-                "kbps": kbps, "sample": YT_SAMPLE_BYTES, "method": "yt-dlp"}
-    # без yt-dlp — грубая проверка доступности (без скорости)
-    return _yt_reachability()
+    if not YTDLP:
+        return _yt_reachability()
+    last = {}
+    for video_id in YT_TEST_VIDEOS:
+        if time.time() >= deadline - 3:
+            break
+        last = _yt_probe_one(video_id, deadline)
+        if last.get("ok"):
+            return last
+    if last and last.get("error") == "yt-dlp не вернул ссылку":
+        left = int(max(4.0, min(12.0, deadline - time.time())))
+        return _yt_reachability("yt-dlp не вернул ссылку", timeout=left)
+    return last or _yt_reachability("нет времени на проверку видео",
+                                    timeout=int(max(4.0, min(12.0, deadline - time.time()))))
 
 
 def youtube_status(check_video: bool = True) -> dict:

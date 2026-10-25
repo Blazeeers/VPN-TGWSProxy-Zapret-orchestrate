@@ -2756,10 +2756,35 @@ def main(argv: list) -> int:
 
     try:
         if args.cmd == "update":
+            # update_sub() меняет только кэш подписки. Если провайдер сменил
+            # ключи/адреса, работающий Xray остаётся со старым конфигом: SOCKS
+            # жив, но сервер отвергает рукопожатие — и вместе с ним умирает
+            # DNS, который sing-box гонит через SOCKS. Поэтому после реального
+            # изменения подписки перезапускаем туннель (если он был включён).
+            before = load_json(SUBFILE, {})
+            old_stamp = before.get("updated") if isinstance(before, dict) else None
             cfg = update_sub()
+            after = load_json(SUBFILE, {})
+            new_stamp = after.get("updated") if isinstance(after, dict) else None
+            changed = new_stamp != old_stamp
+            restarted = False
+            restart_error = ""
+            if changed and (is_on() or bool(_runtime_dict().get("running"))):
+                try:
+                    cmd_on(None, None, None, quiet=True)
+                    restarted = True
+                except Exception as exc:  # noqa: BLE001
+                    restart_error = str(exc)
             pro = [{"index": i, "name": str(c.get("remarks") or i).strip(),
                     "node_count": len(node_outbounds(c))} for i, c in enumerate(cfg)]
-            emit({"ok": True, "profiles": pro}, "\n".join(f"{x['index']}: {x['name']}" for x in pro))
+            payload = {"ok": True, "profiles": pro, "changed": changed,
+                       "restarted": restarted}
+            if restart_error:
+                payload["ok"] = False
+                payload["error"] = ("подписка обновлена, но VPN не перезапустился: "
+                                    + restart_error)
+            emit(payload, "\n".join(f"{x['index']}: {x['name']}" for x in pro)
+                 + (" · перезапущено" if restarted else ""))
         elif args.cmd == "profiles":
             pro = profiles()
             emit({"ok": True, "profiles": pro},
