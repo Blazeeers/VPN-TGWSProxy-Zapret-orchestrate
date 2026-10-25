@@ -1686,6 +1686,10 @@ def _balancer_covers_nodes(cfg: dict, node_tags: list[str]) -> bool:
     Если ни одна не попадает, xray считает набор пустым и уводит ВЕСЬ трафик в
     `fallbackTag` (в подписках это `direct`): VPN «включён», а трафик идёт
     напрямую. Селектора нет вовсе — судить не берёмся, пусть решает xray.
+
+    Сам `fallbackTag` проверяется отдельно (`_fix_balancer_fallback`): селектор
+    может покрывать ноды, но пустой/непрогретый набор всё равно ушёл бы в
+    fallback, и там не должно быть `direct`.
     """
     if not node_tags:
         return True
@@ -1701,6 +1705,51 @@ def _balancer_covers_nodes(cfg: dict, node_tags: list[str]) -> bool:
     if not selectors:
         return True
     return any(_selector_matches(tag, sel) for sel in selectors for tag in node_tags)
+
+
+def _balancer_selects_nodes(bal: dict, node_tags: list[str]) -> bool:
+    """Покрывает ли selector ЭТОГО балансировщика хотя бы одну реальную ноду."""
+    if not node_tags or not isinstance(bal, dict):
+        return False
+    selectors = _as_selectors(bal.get("selector"))
+    if not selectors:
+        return False        # без селектора ничего не утверждаем — не трогаем
+    return any(_selector_matches(tag, sel) for sel in selectors for tag in node_tags)
+
+
+def _fix_balancer_fallback(cfg: dict, node_tags: list[str]) -> list:
+    """Заменяет `fallbackTag`, который указывает НЕ на ноду (например `direct`).
+
+    В подписке (`🇪🇺 Автоматический выбор`) `fallbackTag` = `direct`, а
+    observatory прогревается не сразу: пока набор нод пуст, xray гонит ВЕСЬ
+    трафик напрямую, а статус показывает «VPN подключён». Подставляем первую
+    ноду: пусть лучше не отвечает конкретная нода, чем молча мимо туннеля.
+
+    Правим только балансировщики, чей selector покрывает реальные ноды: чужой
+    (не про наши outbounds) балансировщик — не наше дело, и подстановка тега
+    ноды в него может сломать конфиг.
+
+    Отсутствующий или пустой `fallbackTag` НЕ трогаем: xray такой конфиг
+    принимает, и трафик при пустом наборе просто не идёт (ошибка соединения),
+    то есть утечки нет. Подставлять туда ноду нельзя — у балансировщиков без
+    observatory (профили «Нидерланды»/«США») любой непустой `fallbackTag` ломает
+    конфиг: `xray -test` отвечает «not all dependencies are resolved»
+    (проверено на живой подписке).
+    """
+    if not node_tags:
+        return []
+    first = node_tags[0]
+    fixed: list[str] = []
+    routing = cfg.get("routing") if isinstance(cfg.get("routing"), dict) else {}
+    for bal in routing.get("balancers") or []:
+        if not _balancer_selects_nodes(bal, node_tags):
+            continue
+        current = bal.get("fallbackTag")
+        if not current or current in node_tags:
+            continue
+        bal["fallbackTag"] = first
+        fixed.append(str(current))
+    return fixed
 
 
 def build_xray(profile_index: int, node_index: int) -> dict:
@@ -1752,6 +1801,17 @@ def build_xray(profile_index: int, node_index: int) -> dict:
             rule.pop("balancerTag", None)
             rule["outboundTag"] = target
         _strip_balancers(cfg)
+    elif has_balancers and balancer_rules:
+        # «Авто»: балансировщик остаётся (выбор по задержке через observatory),
+        # но fallbackTag обязан указывать на ноду. В подписках там `direct`:
+        # пока observatory не прогрет, набор нод пуст, и xray молча пускал ВЕСЬ
+        # трафик напрямую — виджет при этом показывал «VPN подключён».
+        fixed = _fix_balancer_fallback(cfg, [n["tag"] for n in nd])
+        if fixed:
+            warn("fallbackTag балансировщика указывал не на ноду ("
+                 + ", ".join(fixed) + ") — заменяю на первую ноду «"
+                 + nd[0]["tag"] + "», иначе при пустом наборе трафик шёл бы "
+                 "мимо туннеля")
     # `node_index == -1` — «Авто»: конфиг подписки остаётся как есть, с
     # `balancers` + `observatory` и выбором лучшей ноды по задержке. Раньше
     # балансировщик вырезался всегда и «Авто» молча превращалось в первую ноду,
@@ -2450,6 +2510,34 @@ def iface_stats() -> tuple[int, int]:
         return 0, 0
 
 
+def _wan_iface() -> str:
+    """Интерфейс маршрута по умолчанию мимо туннеля ("" — не нашли).
+
+    Нужен, чтобы при поднятом TUN померять «прямой» IP: обычный curl ушёл бы
+    в туннель и показал тот же адрес. Читаем /proc/net/route — без ip/nmcli,
+    которые могут быть не установлены. Маршрут через TUN пропускаем: у него
+    нет шлюза (destination/gateway 00000000), плюс имя интерфейса совпадает.
+    """
+    try:
+        lines = Path("/proc/net/route").read_text().splitlines()[1:]
+    except OSError:
+        return ""
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        iface, dest, gateway, flags = parts[0], parts[1], parts[2], parts[3]
+        if iface == TUN_IFACE or dest != "00000000" or gateway == "00000000":
+            continue
+        try:
+            if not int(flags, 16) & 0x1:      # RTF_UP
+                continue
+        except ValueError:
+            continue
+        return iface
+    return ""
+
+
 def caps_ok() -> bool:
     """Есть ли у sing-box CAP_NET_ADMIN (иначе TUN потребует root/пароль)."""
     out = _run_out(["getcap", str(SB_BIN)], 5)
@@ -2590,24 +2678,58 @@ def status_text(st: dict) -> str:
     return " · ".join(part for part in parts if part)
 
 
+# Проверка выхода VPN. api.ipify.org через проверенные ноды отдаёт 000 (TLS
+# unexpected EOF), хотя обычные сайты через те же ноды отвечают 200 — из-за
+# этого `check` врал «через VPN ответа нет», и guard/виджет лечили здоровый
+# туннель. cdn-cgi/trace — тот же адрес, что у `_proxy_ok` и bypass-status.
+CHECK_TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
+
+
+def _trace_parse(text: str) -> tuple[str, str]:
+    """(ip, loc) из ответа cloudflare trace; пустые строки, если полей нет."""
+    ip = loc = ""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.startswith("ip="):
+            ip = line[3:].strip()
+        elif line.startswith("loc="):
+            loc = line[4:].strip()
+    return ip, loc
+
+
 def check() -> dict:
-    url = "https://api.ipify.org"
+    """Внешний IP через туннель (и, best-effort, напрямую — мимо TUN).
+
+    `ok` означает «trace прошёл через SOCKS», а не «IP отличается»: сравнение
+    с прямым адресом — приятный бонус, а не доказательство работы VPN. Прямой
+    IP при поднятом TUN обычным curl'ом измерить нельзя (он уйдёт в туннель),
+    поэтому пробуем только через WAN-интерфейс; не вышло — честно оставляем
+    поле пустым и не делаем вид, что «ответа нет».
+    """
     if shutil.which("curl") is None:
         return {"ok": False, "error": "curl не найден — внешний IP не проверить"}
     if not is_on():
-        # VPN выключен: прямой запрос ничего не доказывает, а стоит до 12 с —
-        # check зовут сторож и виджет, и они ждали впустую. Отвечаем сразу.
+        # VPN выключен: запрос через SOCKS ничего не докажет, а стоит до 20 с.
         return {"ok": False, "error": "не подключено", "direct_ip": "",
                 "note": "VPN выключен — прямой IP не запрашивался"}
-    direct = _run_out(["curl", "-s", "--max-time", "12", url], 15).strip()
-    proxied = _run_out(["curl", "-s", "--max-time", "20", "--socks5-hostname",
-                        f"127.0.0.1:{SOCKS_PORT}", url], 23).strip()
-    return {
-        "ok": bool(proxied),
-        "direct_ip": direct,
-        "proxy_ip": proxied,
-        "changed": bool(proxied) and proxied != direct,
-    }
+    out = _run_out(["curl", "-s", "--max-time", "20", "--socks5-hostname",
+                    f"127.0.0.1:{SOCKS_PORT}", CHECK_TRACE_URL], 23)
+    proxy_ip, loc = _trace_parse(out)
+    res = {"ok": bool(proxy_ip), "proxy_ip": proxy_ip, "loc": loc,
+           "endpoint": CHECK_TRACE_URL, "direct_ip": "", "changed": False}
+    if not proxy_ip:
+        res["error"] = "через VPN ответа нет"
+        res["note"] = "trace через SOCKS не получен"
+        return res
+    wan = _wan_iface()
+    if wan:
+        direct, _ = _trace_parse(_run_out(
+            ["curl", "-s", "--max-time", "8", "--interface", wan, CHECK_TRACE_URL], 12))
+        res["direct_ip"] = direct
+        res["changed"] = bool(direct) and direct != proxy_ip
+    else:
+        res["note"] = "прямой IP не измерен: WAN-интерфейс не найден"
+    return res
 
 
 def check_text(res: dict) -> str:
@@ -2615,10 +2737,16 @@ def check_text(res: dict) -> str:
     if res.get("error"):
         note = str(res.get("note") or "")
         return str(res["error"]) + (f" · {note}" if note else "")
-    if not res.get("ok"):
-        return f"через VPN ответа нет · прямой IP: {res.get('direct_ip') or '—'}"
-    return (f"прямой IP: {res.get('direct_ip') or '—'} · через VPN: {res.get('proxy_ip')}"
-            + (" · IP изменился" if res.get("changed") else " · IP не изменился"))
+    loc = f" ({res['loc']})" if res.get("loc") else ""
+    line = f"через VPN: {res.get('proxy_ip')}{loc}"
+    if res.get("direct_ip"):
+        line += (f" · прямой IP: {res['direct_ip']}"
+                 + (" · IP изменился" if res.get("changed") else " · IP не изменился"))
+    else:
+        line += " · прямой IP не измерен"
+    if res.get("note"):
+        line += f" · {res['note']}"
+    return line
 
 
 def on_text(res: dict) -> str:
@@ -2958,33 +3086,43 @@ def probe_state() -> dict:
 
 def probe_best(probes_quick: int = 2, timeout_quick: float = 3.5,
                probes_final: int = 6, timeout_final: float = 6.0,
-               url: str = PROBE_URL, apply: bool = False) -> dict:
+               url: str = PROBE_URL, apply: bool = False,
+               keep_profile: bool = False) -> dict:
     """Тест ВСЕХ регионов (профилей) и серверов: выбирает лучшую пару регион+сервер.
 
     Быстрый проход по всем нодам всех профилей, затем подтверждающая серия
     проб на лучшей ноде. Результат (и прогресс) — в CACHE/probe.json.
     С apply=True лучшая пара применяется в настройках и, если VPN включён,
     немедленно переподключается на неё.
+
+    `keep_profile=True` — автоматический подбор: регион не меняем (его выбирает
+    человек), тестируем только ноды текущего профиля и пишем только
+    `node_index`. Иначе фоновая «оптимизация» молча переносила бы на другой
+    регион, а на ПК это уже привело к смене Швейцарии на «лучший» чужой сервер.
     """
     pro = profiles()
     if not pro:
         raise RuntimeError("в подписке нет профилей")
     probes_quick = max(1, int(probes_quick))
     ensure_dirs()
+    cur_pi = _num(settings().get("profile_index"), 0)
+    targets = [p for p in pro if p["index"] == cur_pi] if keep_profile else pro
+    if not targets:
+        targets = pro      # профиль вне диапазона — ведём себя как раньше
     state = {
         "running": True, "pid": os.getpid(), "mode": "best", "phase": "quick",
-        "profile": settings().get("profile_index", 0), "profile_name": "",
-        "profiles_total": len(pro), "profiles_done": 0,
-        "nodes_total": sum(int(p["node_count"]) for p in pro), "nodes_done": 0,
+        "profile": cur_pi, "profile_name": "",
+        "profiles_total": len(targets), "profiles_done": 0,
+        "nodes_total": sum(int(p["node_count"]) for p in targets), "nodes_done": 0,
         "current": "", "current_index": -1, "current_profile": -1,
         "probes": probes_quick, "url": url, "started": time.time(), "finished": 0.0,
-        "results": [], "best": None, "error": "",
+        "results": [], "best": None, "error": "", "keep_profile": keep_profile,
     }
     if not _probe_claim(state):
         return {"ok": False, "error": "тест серверов уже идёт"}
     try:
         quick: list[dict] = []
-        for p in pro:
+        for p in targets:
             nd = nodes(p["index"])
             for n in nd:
                 state["current"] = p["name"].strip() + " · " + n["tag"]
@@ -3022,12 +3160,21 @@ def probe_best(probes_quick: int = 2, timeout_quick: float = 3.5,
                 "loss": best["loss"], "probes": best["probes"],
             }
             if apply:
-                set_settings(profile_index=best["profile"], node_index=best["index"])
-                state["applied"] = True
-                state["reconnected"] = False
-                if is_on():
-                    cmd_on(best["profile"], best["index"], None, quiet=True)
-                    state["reconnected"] = True
+                if keep_profile:
+                    # Авто-подбор: регион не трогаем, только сервер в нём.
+                    set_settings(node_index=best["index"])
+                    state["applied"] = True
+                    state["reconnected"] = False
+                    if is_on():
+                        cmd_on(best["profile"], best["index"], None, quiet=True)
+                        state["reconnected"] = True
+                else:
+                    set_settings(profile_index=best["profile"], node_index=best["index"])
+                    state["applied"] = True
+                    state["reconnected"] = False
+                    if is_on():
+                        cmd_on(best["profile"], best["index"], None, quiet=True)
+                        state["reconnected"] = True
         else:
             state["error"] = "ни одна нода не ответила"
     except Exception as exc:  # noqa: BLE001
@@ -3395,6 +3542,8 @@ def main(argv: list) -> int:
     sb = sub.add_parser("best", help="протестировать все регионы и серверы, выбрать лучшую пару")
     sb.add_argument("--apply", action="store_true",
                     help="применить лучшую пару (и переподключиться, если VPN включён)")
+    sb.add_argument("--keep-profile", action="store_true",
+                    help="не менять регион, только сервер в текущем (авто-подбор)")
     sb.add_argument("--probes-quick", type=int, default=2, help="проб на сервер в быстром проходе")
     sb.add_argument("--timeout-quick", type=float, default=3.5, help="таймаут быстрой пробы, с")
     sb.add_argument("--probes-final", type=int, default=6, help="проб на лучший сервер при подтверждении")
@@ -3633,7 +3782,7 @@ def main(argv: list) -> int:
                 return 0
         elif args.cmd == "best":
             res = probe_best(args.probes_quick, args.timeout_quick, args.probes_final,
-                             args.timeout_final, args.url, args.apply)
+                             args.timeout_final, args.url, args.apply, args.keep_profile)
             b = res.get("best") or {}
             if res.get("error") and not b:
                 lines = [str(res["error"])]

@@ -84,11 +84,17 @@ grep -m1 NFQWS_OPT /opt/zapret/config
 
 ```bash
 omavpn --json status | python3 -m json.tool
-omavpn check        # сравнить IP напрямую и через прокси
+omavpn check        # IP через туннель; прямой — best-effort
 tail -40 ~/.local/state/omavpn/xray.log
 tail -40 ~/.local/state/omavpn/singbox.log
 ```
 
+- `omavpn check` измеряет выход через туннель (SOCKS → `cdn-cgi/trace`) и
+  печатает `proxy_ip`/`loc`. Прямой IP — **best-effort**: при поднятом TUN обычный
+  запрос ушёл бы в туннель, поэтому он берётся через WAN-интерфейс
+  (`curl --interface`), а если интерфейс не определился — честно пишет «прямой
+  IP не измерен» и `changed: false`. Это не ошибка VPN: судить о работе туннеля
+  надо по `ok` (trace прошёл) и полю `proxy_ip`.
 - Мёртвый узел: посмотри `omavpn nodes`, проверь доступность адресов и смени
   профиль/ноду (`omavpn profile N`, `omavpn node M`).
 - Перезапуск: `omavpn restart`.

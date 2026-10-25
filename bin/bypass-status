@@ -656,15 +656,21 @@ def start_vpn_test(cli: str) -> dict:
                         "тест серверов запущен — пробы идут в фоне")
 
 
-def start_optimize(cli: str) -> dict:
-    """Тест всех регионов и серверов → применить лучшую пару (фоном)."""
+def start_optimize(cli: str, keep_profile: bool = False) -> dict:
+    """Тест всех регионов и серверов → применить лучшую пару (фоном).
+
+    `keep_profile=True` — авто-подбор из виджета: регион не меняется (его
+    выбирает человек), ищется лучший сервер в текущем профиле.
+    """
     if not cli:
         return {"ok": False, "error": "VPN CLI не найден"}
     state = read_vpn_test(os.path.basename(cli))
     if state.get("running"):
         return {"ok": False, "reason": "already_running", "message": "тест серверов уже идёт"}
-    return _spawn_probe(cli, ["best", "--apply"],
-                        "подбираю лучший регион и сервер — пробы идут в фоне")
+    args = ["best", "--apply"] + (["--keep-profile"] if keep_profile else [])
+    return _spawn_probe(cli, args,
+                        "подбираю лучший сервер — пробы идут в фоне" if keep_profile
+                        else "подбираю лучший регион и сервер — пробы идут в фоне")
 
 
 def _spawn_probe(cli: str, args: list, message: str) -> dict:
@@ -2471,6 +2477,8 @@ def main() -> int:
                     help="запустить тест серверов VPN (omavpn probe) фоном")
     ap.add_argument("--optimize", action="store_true",
                     help="подобрать лучший регион и сервер (omavpn best --apply) фоном")
+    ap.add_argument("--keep-profile", action="store_true",
+                    help="с --optimize: не менять регион, только сервер (авто-подбор)")
     ap.add_argument("--health", action="store_true",
                     help="комплексный тест текущей конфигурации (+ самовосстановление VPN)")
     ap.add_argument("--health-json", action="store_true",
@@ -2509,7 +2517,7 @@ def main() -> int:
         return 0
     if args.optimize:
         _, cli = resolve_cli()
-        print(json.dumps(start_optimize(cli), ensure_ascii=False))
+        print(json.dumps(start_optimize(cli, args.keep_profile), ensure_ascii=False))
         return 0
     if args.health or args.health_json:
         print(json.dumps(run_health(heal_vpn=not args.health_json), ensure_ascii=False))

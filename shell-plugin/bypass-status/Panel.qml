@@ -257,8 +257,12 @@ Panel {
   // --health-json поля age нет (его добавляет только чтение кэша health.json),
   // поэтому проверка «hl.age > 600» не срабатывала никогда.
   readonly property real healthChecked: Number(root.hl.checked || 0)
+  // Порог устаревания берём из политики проверок (healthMaxAge: 600 с без guard,
+  // 900/1200 с ним), а не из жёстких 600: иначе на здоровой системе с guard бар
+  // желтел каждые 5–10 минут между штатными проверками. +60 с — запас на тик.
   readonly property bool healthStale: root.hl.stale === true
-    || (root.healthChecked > 0 && (root.nowSec - root.healthChecked) > 600)
+    || (root.healthChecked > 0
+        && (root.nowSec - root.healthChecked) > root.healthMaxAge() + 60)
   // VPN выключен намеренно: плохой YouTube/Discord — не поломка.
   readonly property bool vpnIdle: root.hl.vpn_idle === true
   readonly property bool healthBusy: root.healthRunning !== ""
@@ -524,12 +528,16 @@ Panel {
     : root.verdict === "warn" ? "warning"
     : (root.verdict === "tuning" || root.zapTuning) ? "refresh"
     : (root.vtRunning || root.healthBusy) ? "refresh"
+    : (root.healthStale && !root.healthBusy) ? "refresh"
     : root.verdict === "ok" ? "check"
     : "vpn"
   readonly property color healthColorBase:
     root.statusError !== "" ? root.urgent
     : root.verdict === "bad" ? root.urgent
     : root.verdict === "warn" ? root.warn
+    // Устаревшая проверка — не «всё хорошо»: пока свежего ответа нет, зелёный
+    // цвет врал бы (последний вердикт мог быть «ок» час назад).
+    : (root.healthStale && !root.healthBusy) ? root.warn
     // Подбор стратегии — нейтральная активность, не ошибка: акцентный цвет,
     // а не warning. Так иконка не выглядит красной, пока autotune работает.
     : (root.verdict === "tuning" || root.zapTuning) ? Color.accent
@@ -544,6 +552,7 @@ Panel {
   // в баре значило бы держать иконку цветной из-за недоступного GitHub.
   readonly property bool allCalm: root.verdict === "ok" && !root.upAny
     && !root.vtRunning && !root.zapTuning && !root.healthBusy
+    && !root.healthStale
     && root.busy === "" && root.statusError === ""
   readonly property color healthColor:
     (root.quietBar && root.allCalm) ? root.dim : root.healthColorBase
@@ -594,6 +603,13 @@ Panel {
     if (firstBad !== "") return "не работает: " + firstBad
     if (firstWarn !== "") return "замечания: " + firstWarn
     if (root.verdict === "bad") return "не работает: проверка сорвалась"
+    if (root.healthStale) {
+      // «Идёт обновление» — только если оно правда идёт (healthBusy проверен
+      // раньше); иначе честно говорим, когда была последняя проверка.
+      var staleAt = root.healthChecked > 0
+        ? Qt.formatTime(new Date(root.healthChecked * 1000), "HH:mm") : ""
+      return "данные устарели" + (staleAt !== "" ? " · проверка была в " + staleAt : "")
+    }
     return (root.vpnOn ? "VPN включён · " : "") + "всё работает"
   }
 
@@ -604,6 +620,13 @@ Panel {
     if (root.vtRunning) return "идёт подбор серверов"
     if (root.zapTuning || root.verdict === "tuning") return "идёт подбор стратегии zapret"
     if (!root.hl.checked) return root.vpnOn ? "VPN подключён, проверка не запускалась" : "VPN выключен"
+    if (root.healthStale) {
+      // Зелёное «всё работает» из старого кэша — ложь: честно говорим, когда
+      // проверяли в последний раз.
+      var at = root.healthChecked > 0
+        ? Qt.formatTime(new Date(root.healthChecked * 1000), "HH:mm") : ""
+      return "данные устарели" + (at !== "" ? " · проверка была в " + at : "")
+    }
     return root.hl.summary || ""
   }
 
@@ -1075,6 +1098,22 @@ Panel {
     fetchProc.running = true
   }
 
+  // Единственный запуск подбора: команда собирается здесь, чтобы ни один путь
+  // не унаследовал флаг от предыдущего вызова. auto=true → --keep-profile
+  // (регион не меняем), ручная кнопка — полный подбор.
+  function startOptimize(auto) {
+    if (root.vtRunning || optimizeProc.running || root.healthBusy
+        || root.busy !== "" || root.sideBusy) return false
+    root.opError = ""
+    root.busy = "vtest"
+    root.optimizeAuto = auto === true
+    optimizeProc.command = auto === true
+      ? [root.scriptPath, "--optimize", "--keep-profile"]
+      : [root.scriptPath, "--optimize"]
+    optimizeProc.running = true
+    return true
+  }
+
   function startUpdateAll() {
     if (root.busy !== "" || updateAllProc.running || root.healthBusy || root.vtRunning) return false
     root.busy = "upall"
@@ -1116,14 +1155,13 @@ Panel {
 
   // Автоподбор сервера — фолбэк без guard: лечение уже пробовали, плохо две
   // проверки подряд. Туннель перезапускается, поэтому на батарее не трогаем.
-  // Триггер узкий — только VPN и YouTube: общий verdict "bad" мог означать
-  // zapret/tg-ws-proxy/DeepSeek/Telegram, и менять из-за них регион нельзя —
-  // это молчаливая смена сервера по чужой проблеме.
+  // Триггер — только пункт `vpn`: YouTube/Discord чинятся маршрутами и zapret,
+  // и менять из-за них сервер (то есть рвать туннель) нельзя.
   function maybeAutoOptimize() {
     if (root.guardActive || root.onBattery) return
     if (!root.vpnOn || root.vpn.installed === false) return
     if (root.badStreak < 2 || !root.healTried) return
-    if (root.hState("vpn", "") !== "bad" && root.hState("youtube", "") !== "bad") return
+    if (root.hState("vpn", "") !== "bad") return
     if (root.busy !== "" || root.healthBusy || root.vtRunning || optimizeProc.running) return
     var now = Date.now() / 1000
     // Ноль — берём время прошлого подбора из кэша: сразу после ручного подбора
@@ -1132,9 +1170,8 @@ Panel {
       : Number(root.vt.finished || root.vt.updated || 0)
     if (last > 0 && (now - last) < 3600) return
     root.autoOptimizeAt = now
-    root.optimizeAuto = true
-    root.busy = "vtest"
-    optimizeProc.running = true
+    // Автоподбор не меняет регион (его выбирает человек), только сервер.
+    if (!root.startOptimize(true)) return
     root.logNote("auto", "плохо две проверки подряд — подбираю другой сервер")
   }
 
@@ -1144,6 +1181,9 @@ Panel {
   function maybeAutoAudit() {
     if (root.auditTimerActive || root.onBattery || !root.vpnOn) return
     if (root.busy !== "" || root.healthBusy || root.vtRunning || auditProc.running) return
+    // Сломан сам туннель — его чинит лечение/подбор, а не маршруты: аудит лишь
+    // перезапустил бы sing-box и не помог.
+    if (root.hState("vpn", "") === "bad") return
     if (root.hState("youtube", "") !== "bad" && root.hState("discord", "") !== "bad") return
     if (root.badStreak < 2) return
     var now = Date.now() / 1000
@@ -1597,8 +1637,17 @@ Panel {
             root.notice = "VPN: " + h.actions.join("; ")
             noticeTimer.restart()
           }
-          // Серия плохих проверок: две подряд — повод менять сервер.
-          root.badStreak = d.verdict === "bad" ? root.badStreak + 1 : 0
+          // Серия плохих проверок ИМЕННО по VPN: общий verdict "bad" бывает и
+          // из-за YouTube/Discord/DeepSeek/zapret, и раньше любая такая проверка
+          // крутила badStreak, а тот запускал лечение и смену сервера — то есть
+          // перезапуск здорового туннеля по чужой проблеме. Берём пункт `vpn`
+          // прямо из ответа, а не через root.hState(): порядок обновления
+          // привязок тут не важен.
+          var vpnBad = false
+          var hItems = d.items || []
+          for (var vi = 0; vi < hItems.length; vi++)
+            if (hItems[vi] && hItems[vi].id === "vpn") vpnBad = hItems[vi].state === "bad"
+          root.badStreak = vpnBad ? root.badStreak + 1 : 0
           if (was === "heal") {
             // Лечение могло переключить профиль/сервер — список серверов устарел.
             root.refreshVpn()
@@ -1607,7 +1656,9 @@ Panel {
             if (!auto) root.notify("Обходы: проверка", d.summary || "готово")
           } else {
             // Плохо при включённом VPN — повод что-то делать; хорошо — сброс серии.
-            if (d.verdict === "bad" && root.vpnOn && root.vpn.installed !== false) {
+            // Туннель (лечение/подбор сервера) трогаем только при плохом пункте
+            // `vpn`; не-VPN проблемы лечатся аудитом маршрутов и zapret.
+            if (vpnBad && root.vpnOn && root.vpn.installed !== false) {
               if (root.guardActive) {
                 // Единый лечащий контур: туннель восстанавливает guard, виджет
                 // только показывает результат. Своё лечение здесь означало бы
@@ -1663,7 +1714,8 @@ Panel {
   // «Подобрать лучший»: тест всех регионов и серверов, применение победителя.
   Process {
     id: optimizeProc
-    command: [root.scriptPath, "--optimize"]
+    // Команду всегда ставит startOptimize(): статическая привязка была мёртвой
+    // и могла передать чужой флаг от предыдущего вызова.
     stdout: StdioCollector { id: optimizeOut; waitForEnd: true }
     onRunningChanged: {
       if (running || root.busy !== "vtest") return
@@ -3421,10 +3473,9 @@ Panel {
             onClicked: {
               if (root.vtRunning || optimizeProc.running || root.healthBusy || root.busy !== ""
                 || root.sideBusy) return
-              root.opError = ""
-              root.busy = "vtest"
               root.vpnExpanded = true
-              optimizeProc.running = true
+              // Ручной подбор — явный выбор человека: он вправе сменить регион.
+              root.startOptimize(false)
             }
           }
 
