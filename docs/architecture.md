@@ -51,9 +51,18 @@
    локальный MTProto-прокси и Telegram Desktop.
 9. `bypass` — адреса серверов подписки (`ip_cidr`/`domain`) → `direct`,
    чтобы туннель не зациклился.
-10. `port: 25,465,587` → `direct` — SMTP.
-11. `process_name: xray` → `direct` — соединения самого Xray.
-12. `ip_version: 6` → `block` — IPv6 выключен.
+10. `process_name: xray` → `direct` — соединения самого Xray (в том числе
+    временного, из `probe`).
+11. `port: 25,465,587` → `direct` — SMTP.
+12. **`rule_set: refilter-domain, refilter-ip` → `proxy`** — Re:filter: домены и
+    адреса, заблокированные в РФ, идут в туннель. Правило стоит **после** всех
+    direct-исключений (пункты 5–11), поэтому уже настроенные прямые маршруты и
+    почту не перебивает, и **после** `process_name: xray`, поэтому не
+    зацикливает соединение с сервером подписки. Наборы — локальные бинарные
+    `.srs` из `~/.local/state/omavpn/refilter/`; если функция выключена
+    (`omavpn refilter off`) или файлов нет, ни `rule_set`, ни правила в конфиге
+    не появляется.
+13. `ip_version: 6` → `block` — IPv6 выключен.
 
 Полный приоритет источников: **overrides → `ALWAYS_PROXY_DOMAINS` →
 `direct_domains.txt` → `final = proxy`**. Оверрайды правятся командой
@@ -118,6 +127,7 @@
 | `~/.local/state/omavpn/xray.json` | omavpn | конфиг из подписки + правки |
 | `~/.config/omavpn/route_overrides.json` | omavpn / аудит | ручные оверрайды маршрутов (сильнее `direct_domains.txt`) |
 | `~/.local/state/omavpn/ctrl.lock` | omavpn | `flock` на управление VPN: `on`, `off`, `restart`, `route set/unset` |
+| `~/.local/state/omavpn/refilter/*.srs` | omavpn | наборы Re:filter (домены, IP) и `meta.json`; качает `omavpn refilter update` |
 | `~/.cache/bypass-status/route-audit.lock` | bypass-status | `flock` аудита и перепроверки маршрутов |
 | `~/.cache/<cli>/route-audit.json` | bypass-status | результат последнего аудита маршрутов |
 | `~/.cache/<cli>/route-audit-state.json` | bypass-status | гистерезис: когда и сколько раз переключали домен (`ts`, `fails`) |

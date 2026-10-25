@@ -28,6 +28,18 @@
   клиента. Код Happ не копировался; `omavpn` лишь читает совместимые подписки.
 - Лицензия: см. репозиторий Happ.
 
+## Re:filter-lists — списки заблокированных в РФ доменов и IP
+
+- Автор: **1andrevich**
+- Репозиторий: <https://github.com/1andrevich/Re-filter-lists>
+- Лицензия: **MIT**
+- Что используется: готовые бинарные rule-set'ы sing-box
+  (`ruleset-domain-refilter_domains.srs` и `ruleset-ip-refilter_ipsum.srs`),
+  которые `omavpn refilter update` скачивает с GitHub Releases в
+  `~/.local/state/omavpn/refilter/`. Сами списки не входят в репозиторий и
+  распространяются по лицензии проекта Re:filter-lists; код списков не
+  изменялся.
+
 ## Прочие зависимости
 
 - **Xray-core** — <https://github.com/XTLS/Xray-core> (MPL-2.0): прокси-ядро.

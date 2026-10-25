@@ -373,6 +373,48 @@ EOF
   systemctl --user enable --now omavpn-updates.timer >/dev/null 2>&1 || true
 fi
 
+# --- Re:filter: списки заблокированного в РФ -------------------------------
+# Готовые бинарные rule-set'ы (домены + IP) обновляются раз в сутки. Отдельный
+# юнит, а не общий updates: наборы весят ~0,6 МБ, и их обновление при изменении
+# перезапускает туннель — это должно быть видно в журнале отдельной строкой.
+mkdir -p "$HOME_DIR/.config/systemd/user"
+write_unit "$HOME_DIR/.config/systemd/user/omavpn-refilter.service" <<EOF
+[Unit]
+Description=Re:filter: обновление списков заблокированных в РФ доменов и IP
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omavpn refilter update
+Nice=10
+# 400 с: два файла по 120 с на скачивание + до 60 с на разбор sing-box каждый,
+# плюс перезапуск туннеля при изменении списка. Меньший таймаут убивал законное
+# обновление на плохой сети.
+TimeoutStartSec=400
+# KillMode=process: при изменении списка omavpn перезапускает VPN, а xray и
+# sing-box живут в cgroup юнита — иначе systemd убил бы их вместе с собой.
+KillMode=process
+EOF
+
+write_unit "$HOME_DIR/.config/systemd/user/omavpn-refilter.timer" <<'EOF'
+[Unit]
+Description=Daily Re:filter list update
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=24h
+RandomizedDelaySec=2min
+Persistent=true
+Unit=omavpn-refilter.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl --user daemon-reload >/dev/null 2>&1 || true
+systemctl --user enable --now omavpn-refilter.timer >/dev/null 2>&1 || \
+  warn "Не удалось включить omavpn-refilter.timer — включи вручную: systemctl --user enable --now omavpn-refilter.timer"
+
 # --- Подписка ---------------------------------------------------------------
 SUB_FILE="$HOME_DIR/.config/omavpn/subscription"
 if [ ! -s "$SUB_FILE" ]; then
@@ -388,6 +430,13 @@ fi
 say "Загружаю подписку…"
 "$LOCAL_BIN/omavpn" --json update || warn "Не удалось загрузить подписку (проверьте сеть)"
 
+# Списки Re:filter — сразу, без ручных действий: иначе «Заблокированные в РФ —
+# через VPN» первые сутки работало бы без самих списков. Сбой сети установку не
+# рвёт: таймер подтянет наборы позже.
+say "Загружаю списки Re:filter (заблокированные в РФ домены и IP)…"
+"$LOCAL_BIN/omavpn" --json refilter update \
+  || warn "Списки Re:filter не загрузились — обновятся по таймеру omavpn-refilter.timer (systemctl --user start omavpn-refilter.service)"
+
 cat <<EOF
 
 Готово.
@@ -397,6 +446,9 @@ cat <<EOF
   Статус:          omavpn status
   Список:          omavpn profiles
   Проверить IP:    omavpn check
+  Re:filter:       omavpn refilter status | on | off | update
+  Подписка:        omavpn subscription get | set <url>
+  Полный сброс:    omavpn reset
 
 Виджет $PLUGIN_ID должен появиться в правой части панели Omarchy.
 Если его нет: omarchy plugin enable $PLUGIN_ID && omarchy bar move $PLUGIN_ID --section right

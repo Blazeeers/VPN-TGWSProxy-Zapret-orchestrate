@@ -17,6 +17,7 @@ import contextlib
 import copy
 import fcntl
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -74,6 +75,22 @@ PROBE_URL = "https://example.com/"
 PROBE_PORT_BASE = 10990
 PROBE_DEFAULT_PROBES = 8
 PROBE_DEFAULT_TIMEOUT = 6.0
+
+# Re:filter — список заблокированных в РФ доменов и IP. Готовые бинарные
+# rule-set'ы sing-box кладём локально: конфиг не зависит от доступности GitHub
+# в момент запуска, а обновление — отдельная команда/таймер.
+REFILTER_DIR = STATE / "refilter"
+REFILTER_DOMAIN = REFILTER_DIR / "refilter_domains.srs"
+REFILTER_IP = REFILTER_DIR / "refilter_ipsum.srs"
+REFILTER_META = REFILTER_DIR / "meta.json"
+REFILTER_URLS = {
+    "domain": ("https://github.com/1andrevich/Re-filter-lists/releases/latest/"
+               "download/ruleset-domain-refilter_domains.srs"),
+    "ip": ("https://github.com/1andrevich/Re-filter-lists/releases/latest/"
+           "download/ruleset-ip-refilter_ipsum.srs"),
+}
+REFILTER_MIN_BYTES = {"domain": 10_000, "ip": 2_000}
+SUBSCRIPTION_FILE = CONF / "subscription"
 
 PROXY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "wireguard"}
 
@@ -687,6 +704,9 @@ DEFAULT_SETTINGS = {
     "node_index": -1,
     "mode": "tun",
     "strict_route": False,
+    # Re:filter включён по умолчанию: список заблокированного в РФ и есть то,
+    # ради чего туннель держат. Файлы кэша качает `refilter update` (и установщик).
+    "refilter": True,
 }
 
 
@@ -763,6 +783,109 @@ def subscription_url() -> str:
         return (CONF / "subscription").read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+
+
+def subscription_get() -> dict:
+    """Текущий URL и его источник: переменная окружения важнее файла."""
+    env = os.environ.get("OMAVPN_SUB_URL", "").strip()
+    file_url = ""
+    try:
+        file_url = SUBSCRIPTION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        file_url = ""
+    return {"ok": True, "url": subscription_url(), "file": str(SUBSCRIPTION_FILE),
+            "file_url": file_url, "env": bool(env),
+            "source": "env" if env else ("file" if file_url else "")}
+
+
+def _valid_sub_url(url: str) -> str:
+    """Проверенный URL подписки: http(s) и непустой хост.
+
+    Мусор в этом файле ломает не только `update`, но и автозапуск: `on` падает
+    на разборе подписки, и VPN не поднимается вовсе. Поэтому проверяем до записи.
+    """
+    text = str(url or "").strip()
+    if not text:
+        raise RuntimeError("пустой URL подписки")
+    if any(ch.isspace() for ch in text):
+        raise RuntimeError("в URL подписки пробел — проверь строку")
+    try:
+        parts = urllib.parse.urlsplit(text)
+        host = parts.hostname
+    except ValueError as exc:
+        raise RuntimeError(f"URL подписки не разбирается: {exc}") from exc
+    if parts.scheme not in ("http", "https"):
+        raise RuntimeError("URL подписки должен начинаться с http:// или https:// "
+                           f"(сейчас: {parts.scheme or 'без схемы'})")
+    if not host:
+        raise RuntimeError("в URL подписки нет хоста")
+    return text
+
+
+def _write_subscription(text: str) -> None:
+    """Атомарная запись файла подписки (0600): права не должны зависеть от umask."""
+    SUBSCRIPTION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SUBSCRIPTION_FILE.with_name(SUBSCRIPTION_FILE.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, SUBSCRIPTION_FILE)
+    os.chmod(SUBSCRIPTION_FILE, 0o600)
+
+
+def subscription_set(url: str, restart: bool = True) -> dict:
+    """Меняет URL подписки, сразу проверяя его загрузкой.
+
+    Старый URL не теряется: сначала сохраняем новый и пробуем `update_sub()`,
+    а при ошибке (опечатка, 404, сеть) возвращаем прежний файл — иначе человек
+    остаётся и с нерабочим адресом, и без данных подписки.
+    """
+    if os.environ.get("OMAVPN_SUB_URL", "").strip():
+        raise RuntimeError(
+            "URL подписки переопределён переменной OMAVPN_SUB_URL — она важнее файла "
+            f"{SUBSCRIPTION_FILE}. Убери переменную и повтори")
+    new = _valid_sub_url(url)
+    old_exists = SUBSCRIPTION_FILE.exists()
+    old_text = ""
+    if old_exists:
+        try:
+            old_text = SUBSCRIPTION_FILE.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"не читается {SUBSCRIPTION_FILE}: {exc}") from exc
+    previous = old_text.strip()
+    if new == previous:
+        # Тот же адрес: ни сети, ни перезапуска — идемпотентно, как route set.
+        return {"ok": True, "url": new, "previous": previous, "changed": False,
+                "url_changed": False, "restarted": False}
+    _write_subscription(new + "\n")
+    try:
+        update_sub()
+    except Exception:  # noqa: BLE001 — откат при любой ошибке загрузки/разбора
+        try:
+            if old_exists:
+                _write_subscription(old_text if old_text.endswith("\n") or not old_text
+                                    else old_text + "\n")
+            else:
+                SUBSCRIPTION_FILE.unlink(missing_ok=True)
+        except OSError as exc:
+            warn(f"не удалось вернуть прежний URL подписки: {exc}")
+        raise
+    restarted = False
+    error = ""
+    if restart and is_on():
+        try:
+            cmd_on(None, None, None, quiet=True)
+            restarted = True
+        except Exception as exc:  # noqa: BLE001
+            # Откатывать URL здесь нельзя: новый адрес уже проверен загрузкой и
+            # sub.json перезаписан им — откат стёр бы рабочие данные. Проблема
+            # только в перезапуске, поэтому говорим о ней прямо.
+            error = "адрес сменён, но VPN не перезапустился: " + str(exc)
+    payload = {"ok": not error, "url": new, "previous": previous, "changed": True,
+               "url_changed": True, "restarted": restarted}
+    if error:
+        payload["error"] = error
+    return payload
 
 
 # --------------------------------------------------------------------------- #
@@ -1082,6 +1205,359 @@ def update_sub() -> list:
 
 
 # --------------------------------------------------------------------------- #
+# Re:filter — заблокированные в РФ домены и IP
+# --------------------------------------------------------------------------- #
+# Списки лежат локально бинарными rule-set'ами sing-box: конфиг собирается без
+# обращения к сети (иначе GitHub в момент запуска решает, поднимется ли VPN), а
+# обновление — отдельная команда и таймер.
+
+REFILTER_FETCH_TIMEOUT = 120        # с на файл: GitHub отдаёт ~0,6 МБ быстро
+REFILTER_TAG_DOMAIN = "refilter-domain"
+REFILTER_TAG_IP = "refilter-ip"
+# Бинурый rule-set sing-box (.srs) всегда начинается с этой сигнатуры. Размера
+# мало: обрезанный файл или HTML captive-портала тоже бывают больше 10 КБ, а
+# проверка «файл есть» пропускала бы их в конфиг — и VPN не поднимался вовсе.
+# Бинарный rule-set sing-box (.srs) начинается с b"SRS" + байт версии формата.
+# Проверяем версию «>= 1», а не «ровно 1»: жёсткая сигнатура b"SRS\x01" сломала
+# бы скачивание в день, когда формат обновят. Глубокую проверку всё равно делает
+# `sing-box rule-set decompile`.
+SRS_MAGIC = b"SRS"
+SRS_MIN_VERSION = 1
+# Какие поля обязаны найтись в наборе: домены — domain/domain_suffix, адреса — ip_cidr.
+SRS_KEYS = {"domain": ("domain", "domain_suffix"), "ip": ("ip_cidr",)}
+
+
+def refilter_enabled() -> bool:
+    return _truthy(settings().get("refilter", True))
+
+
+def _file_bytes(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _srs_magic_ok(path: Path) -> bool:
+    """Дешёвая проверка: это вообще бинарный rule-set, а не HTML/обрезок."""
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(len(SRS_MAGIC) + 1)
+    except OSError:
+        return False
+    if len(head) != len(SRS_MAGIC) + 1 or not head.startswith(SRS_MAGIC):
+        return False
+    return head[-1] >= SRS_MIN_VERSION
+
+
+def _srs_decompile_ok(path: Path, kind: str) -> tuple[bool, str]:
+    """Разбирает набор настоящим sing-box. → (годен, ошибка).
+
+    `rule-set decompile` — тот же разбор, которым sing-box читает набор при
+    старте, поэтому «decompile прошёл» и означает «VPN с этим файлом поднимется».
+    Если бинаря sing-box нет, проверку пропускаем: отсутствие инструмента не
+    повод считать скачанный список плохим.
+    """
+    sb = str(SB_BIN) if SB_BIN.is_file() else (shutil.which("sing-box") or "")
+    if not sb:
+        return True, ""
+    REFILTER_DIR.mkdir(parents=True, exist_ok=True)
+    out = REFILTER_DIR / f".check-{kind}.{os.getpid()}.json"
+    try:
+        proc = subprocess.run([sb, "rule-set", "decompile", str(path), "-o", str(out)],
+                              capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or f"код {proc.returncode}").strip()
+            # sing-box красит FATAL в ANSI-цвета — в панели они выглядели бы
+            # мусором вокруг текста ошибки.
+            err = re.sub(r"\x1b\[[0-9;]*m", "", err)
+            return False, "sing-box не разобрал набор: " + err.splitlines()[0][:140]
+        try:
+            data = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return False, f"разбор набора не удался: {exc}"
+        keys = SRS_KEYS[kind]
+        rules = data.get("rules") if isinstance(data, dict) else None
+        for rule in rules or []:
+            if not isinstance(rule, dict):
+                continue
+            for key in keys:
+                value = rule.get(key)
+                if isinstance(value, list) and value:
+                    return True, ""
+        return False, "в наборе нет " + "/".join(keys)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"проверка набора не удалась: {exc}"
+    finally:
+        with contextlib.suppress(OSError):
+            out.unlink(missing_ok=True)
+
+
+REFILTER_TMP_TTL = 3600     # брошенный `.tmp`/`.check-*` старше часа — мусор
+
+
+def _refilter_cleanup() -> None:
+    """Убирает временные файлы прошлых прогонов.
+
+    Имя содержит pid, поэтому после SIGKILL (таймаут юнита, `reset`) `.tmp` и
+    `.check-*.json` остаются навсегда. Свои файлы (текущего pid) не трогаем —
+    их держит идущий процесс, чужие удаляем, только если они старше TTL.
+    """
+    if not REFILTER_DIR.is_dir():
+        return
+    now = time.time()
+    mine = f".{os.getpid()}."
+    for path in REFILTER_DIR.iterdir():
+        name = path.name
+        if not name.startswith("."):
+            continue
+        if not (name.endswith(".tmp") or name.startswith(".check-")):
+            continue
+        if mine in name:
+            continue
+        try:
+            if now - path.stat().st_mtime < REFILTER_TMP_TTL:
+                continue
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _sha256(path: Path) -> str:
+    """sha256 файла; пустая строка, если его нет/не читается.
+
+    По хешу отличаем «файл перекачали» от «содержимое то же»: без этого каждый
+    прогон таймера считался бы изменением и перезапускал туннель зря.
+    """
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def refilter_files(deep: bool = False) -> dict:
+    """Что лежит в кэше: путь, размер, годность.
+
+    `ok` — это не только размер: сигнатура SRS проверяется всегда (дёшево), а
+    `deep=True` дополнительно разбирает набор настоящим sing-box (~0,4 с на оба
+    файла). Глубокий режим — только у `refilter status`: его зовут по открытию
+    настроек, а не в цикле, зато битый файл видно до перезапуска VPN.
+    """
+    out = {}
+    for kind, path in (("domain", REFILTER_DOMAIN), ("ip", REFILTER_IP)):
+        size = _file_bytes(path)
+        minimum = REFILTER_MIN_BYTES[kind]
+        ok, why = True, ""
+        if size < minimum:
+            ok, why = False, (f"нет файла" if size == 0
+                              else f"мал ({size} Б < {minimum} Б)")
+        elif not _srs_magic_ok(path):
+            ok, why = False, "не rule_set sing-box (нет сигнатуры SRS)"
+        elif deep:
+            ok, why = _srs_decompile_ok(path, kind)
+        out[kind] = {"path": str(path), "bytes": size, "ok": ok, "error": why}
+    return out
+
+
+def refilter_status() -> dict:
+    """Состояние для CLI/виджета. Не падает: битый meta.json — просто нет даты."""
+    files = refilter_files(deep=True)
+    meta = load_json(REFILTER_META, {})
+    meta = meta if isinstance(meta, dict) else {}
+    updated = _num(meta.get("updated"), 0)
+    sizes = {kind: info["bytes"] for kind, info in files.items()}
+    return {"ok": True,
+            "enabled": refilter_enabled(),
+            "loaded": all(info["ok"] for info in files.values()),
+            "files": files,
+            "bytes": sizes,
+            "total_bytes": sum(sizes.values()),
+            "updated": updated,
+            # Готовая строка: формат даты одинаков в панели и в CLI, а руками
+            # собирать «25.10 19:00» из timestamp в двух местах — расхождения.
+            "updated_text": (time.strftime("%d.%m %H:%M", time.localtime(updated))
+                             if updated > 0 else ""),
+            "source": dict(REFILTER_URLS),
+            "min_bytes": dict(REFILTER_MIN_BYTES),
+            "meta": str(REFILTER_META)}
+
+
+def _refilter_download(kind: str) -> tuple[bool, str]:
+    """Скачивает один набор во временный файл. → (изменился, ошибка).
+
+    curl пишет в `.<имя>.tmp` рядом, старый .srs подменяется через os.replace
+    только после трёх проверок: размер, сигнатура `SRS\\x01` и разбор настоящим
+    `sing-box rule-set decompile` с наличием ожидаемых полей. При обрыве сети,
+    404, HTML вместо набора или обрезке в кэше остаётся прежний рабочий файл.
+    """
+    url = REFILTER_URLS[kind]
+    target = REFILTER_DOMAIN if kind == "domain" else REFILTER_IP
+    minimum = REFILTER_MIN_BYTES[kind]
+    REFILTER_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        proc = subprocess.run(
+            ["curl", "-fsSL", "--retry", "2", "--connect-timeout", "20",
+             "--max-time", str(REFILTER_FETCH_TIMEOUT), "-o", str(tmp), url],
+            capture_output=True, text=True)
+    except OSError as exc:
+        return False, f"{kind}: curl не запустился — {exc}"
+    try:
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or f"код {proc.returncode}").strip()
+            return False, f"{kind}: {err.splitlines()[0][:160]}"
+        size = _file_bytes(tmp)
+        if size < minimum:
+            return False, (f"{kind}: файл подозрительно мал ({size} Б < {minimum} Б) — "
+                           "оставил прежний")
+        if not _srs_magic_ok(tmp):
+            return False, (f"{kind}: скачался не rule_set sing-box (нет сигнатуры SRS) — "
+                           "оставил прежний")
+        ok, why = _srs_decompile_ok(tmp, kind)
+        if not ok:
+            return False, f"{kind}: {why} — оставил прежний"
+        # Сравниваем только с ГОДНЫМ текущим файлом: битый не должен выдать
+        # «изменений нет» и остаться в кэше навсегда.
+        old_hash = _sha256(target) if refilter_files()[kind]["ok"] else ""
+        if old_hash and old_hash == _sha256(tmp):
+            return False, ""      # содержимое то же — файл не трогаем
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+        return True, ""
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
+def refilter_update(restart: bool = True) -> dict:
+    """Обновляет оба набора и (если что-то изменилось и VPN включён) перезапускает его.
+
+    При выключенной настройке ничего не качаем и туннель не трогаем: таймер не
+    должен рвать VPN каждый день ради списка, который в конфиг не попадает.
+
+    `restart=False` — для тестов: содержимое кэша меняется, работающий туннель
+    продолжает жить со старыми правилами до следующего `on`/перезапуска.
+    """
+    REFILTER_DIR.mkdir(parents=True, exist_ok=True)
+    _refilter_cleanup()
+    files = refilter_files()
+    bytes_map = {kind: info["bytes"] for kind, info in files.items()}
+    if not refilter_enabled():
+        return {"ok": True, "enabled": False, "skipped": True, "changed": False,
+                "changed_files": [], "restarted": False, "bytes": bytes_map,
+                "errors": [], "note": "Re:filter выключен — списки не обновляю"}
+    changed_files, errors = [], []
+    for kind in ("domain", "ip"):
+        changed, err = _refilter_download(kind)
+        if changed:
+            changed_files.append(kind)
+        if err:
+            errors.append(err)
+    files = refilter_files()
+    bytes_map = {kind: info["bytes"] for kind, info in files.items()}
+    changed = bool(changed_files)
+    old_meta = load_json(REFILTER_META, {})
+    old_meta = old_meta if isinstance(old_meta, dict) else {}
+    # `updated` — время последнего ИЗМЕНЕНИЯ набора, а не последней проверки:
+    # статус должен показывать свежесть списка, а не время запуска таймера.
+    updated = time.time() if changed else _num(old_meta.get("updated"), 0)
+    if not updated and any(info["ok"] for info in files.values()):
+        updated = time.time()     # файлы достались от прошлой версии, даты нет
+    try:
+        save_json(REFILTER_META, {"updated": updated, "checked": time.time(),
+                                  "sizes": bytes_map, "source": dict(REFILTER_URLS)})
+    except OSError as exc:
+        # Каталог может оказаться недоступным после сброса прав: это не повод
+        # терять отчёт о том, что скачалось, — просто предупреждаем.
+        warn(f"не удалось записать {REFILTER_META}: {exc}")
+    restarted = False
+    if changed and restart and is_on():
+        try:
+            cmd_on(None, None, None, quiet=True)
+            restarted = True
+        except Exception as exc:  # noqa: BLE001 — файлы уже обновлены, это не откат
+            errors.append("VPN не перезапустился: " + str(exc))
+    return {"ok": not errors, "enabled": True, "skipped": False, "changed": changed,
+            "changed_files": changed_files, "restarted": restarted,
+            "bytes": bytes_map, "errors": errors, "updated": updated,
+            # Готовая строка ошибки для потребителей: виджет показывает d.error,
+            # а не сырой JSON из stdout.
+            "error": "; ".join(errors) if errors else ""}
+
+
+def refilter_set(enabled: bool, restart: bool = True) -> dict:
+    """Включает/выключает Re:filter. Сохраняет настройку и перезапускает VPN.
+
+    При включении, если списков ещё нет (или они битые), сразу скачиваем их:
+    иначе «включил» означало бы «правила не работают до следующего таймера».
+    Сбой загрузки настройку не отменяет — о нём говорит `note`.
+    """
+    set_settings(refilter=bool(enabled))
+    fetched, fetch_errors = [], []
+    if enabled and not all(info["ok"] for info in refilter_files().values()):
+        for kind in ("domain", "ip"):
+            ok, err = _refilter_download(kind)
+            if ok:
+                fetched.append(kind)
+            if err:
+                fetch_errors.append(err)
+    files = refilter_files()
+    loaded = all(info["ok"] for info in files.values())
+    notes = []
+    if enabled and not loaded:
+        notes.append("список не загружен — нажми «Обновить»")
+    if fetch_errors:
+        notes.append("; ".join(fetch_errors))
+    restarted = False
+    restart_error = ""
+    if restart and is_on():
+        try:
+            cmd_on(None, None, None, quiet=True)
+            restarted = True
+        except Exception as exc:  # noqa: BLE001 — настройка уже записана, это отдельный итог
+            restart_error = "настройка сохранена, но VPN не перезапустился: " + str(exc)
+    elif not restart:
+        notes.append("без перезапуска — настройка применится при следующем подключении")
+    if restart_error:
+        notes.append(restart_error)
+    # `note` — человеческая строка для CLI, `error` — она же для потребителей
+    # (виджет показывает d.error, а не сырой JSON из stdout).
+    text = "; ".join(notes)
+    payload = {"ok": not fetch_errors and not restart_error, "enabled": bool(enabled),
+               "restarted": restarted, "loaded": loaded, "fetched": fetched,
+               "note": text}
+    if text:
+        payload["error"] = text
+    return payload
+
+
+def refilter_rules() -> tuple[list, list]:
+    """rule_set'ы и правило для build_singbox: ([], []) если выключено/нет файлов.
+
+    Берём только реально лежащие на диске наборы: правило со ссылкой на
+    отсутствующий тег sing-box отвергает, и VPN не поднимется вовсе. Поэтому
+    «включено, но не скачано» — это просто жизнь без правил, а не поломка.
+    """
+    if not refilter_enabled():
+        return [], []
+    files = refilter_files()
+    sets, tags = [], []
+    for kind, tag in (("domain", REFILTER_TAG_DOMAIN), ("ip", REFILTER_TAG_IP)):
+        if not files[kind]["ok"]:
+            continue
+        tags.append(tag)
+        sets.append({"tag": tag, "type": "local", "format": "binary",
+                     "path": files[kind]["path"]})
+    if not tags:
+        return [], []
+    return sets, [{"rule_set": tags, "outbound": "proxy"}]
+
+
+# --------------------------------------------------------------------------- #
 # разбор профилей и нод
 # --------------------------------------------------------------------------- #
 
@@ -1289,6 +1765,9 @@ def build_xray(profile_index: int, node_index: int) -> dict:
 
 def build_singbox(profile_index: int, strict: bool) -> dict:
     ips, domains = server_endpoints(profile_index)
+    # Re:filter: заблокированное в РФ добиваем в туннель. Наборы — только если
+    # функция включена и файлы уже скачаны (иначе правила просто нет).
+    rf_sets, rf_rules = refilter_rules()
     # Адреса серверов подписки и весь tailnet Tailscale не заводим в туннель.
     exclude = [*ips, *TAILSCALE_CIDRS]
     bypass = [{"ip_cidr": TAILSCALE_CIDRS, "outbound": "direct"}]
@@ -1364,6 +1843,7 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
             "auto_detect_interface": True,
             "final": "proxy",
             "default_domain_resolver": {"server": "remote"},
+            **({"rule_set": rf_sets} if rf_sets else {}),
             "rules": [
                 {"action": "sniff"},
                 {"protocol": "dns", "action": "hijack-dns"},
@@ -1380,8 +1860,19 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
                 {"domain_suffix": direct_domains(), "outbound": "direct"},
                 {"process_name": TELEGRAM_PROCESSES, "outbound": "direct"},
                 *bypass,
-                {"port": [25, 465, 587], "outbound": "direct"},
+                # Процесс Xray (в т.ч. временный из `probe`) ходит к серверам
+                # подписки напрямую. Ставим это правило ДО Re:filter: иначе
+                # соединение к ноде, чей адрес попал в список, ушло бы в TUN и
+                # зациклилось.
                 {"process_name": ["xray"], "outbound": "direct"},
+                # SMTP — напрямую всегда: почтовый сервер по IP из набора ещё не
+                # значит «заблокирован», а через туннель письма обычно не ходят.
+                {"port": [25, 465, 587], "outbound": "direct"},
+                # Re:filter — после всех direct-исключений: уже настроенные
+                # «напрямую» (российские сервисы, YouTube-видео, Discord,
+                # direct_domains.txt, оверрайды, SMTP) остаются прямыми, а
+                # остальное заблокированное добиваем в туннель.
+                *rf_rules,
                 {"ip_version": 6, "outbound": "block"},
             ],
         },
@@ -2657,6 +3148,170 @@ def _mark_heal(actions: list) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# полный сброс («жёсткий тупняк»)
+# --------------------------------------------------------------------------- #
+# Всё, что перечислено ниже, — транзиентное состояние: блокировки, pid-файлы и
+# кэши проверок. Подписка, настройки, маршруты, direct-списки и наборы Re:filter
+# не трогаются: после сброса человек возвращается к тем же правилам, а не к
+# чистой установке.
+RESET_UNITS = ("omavpn-guard.service", "omavpn-autostart.service",
+               "omavpn-route-audit.service", "omavpn-route-recheck.service",
+               "omavpn-updates.service")
+RESET_STATE_FILES = (CTRL_LOCK, XRAY_PID, SB_PID)
+RESET_CACHE_FILES = (PROBE_FILE, PROBE_LOCK,
+                     CACHE / "health.json", CACHE / "route-audit-state.json",
+                     CACHE / "route-audit-recheck.json", CACHE / "route-audit.lock",
+                     CACHE / "yt.json", CACHE / "updates.json",
+                     # аудит маршрутов держит свой лок в каталоге bypass-status
+                     HOME / ".cache" / "bypass-status" / "route-audit.lock")
+# Кого добивать по командной строке. Регулярки, а не подстроки: точки в $HOME
+# иначе стали бы «любым символом», и поиск задел бы чужие процессы с похожей
+# строкой. `--json` необязателен: виджет и bypass-status зовут CLI именно так
+# (`omavpn --json on`), и без этой ветки такие прогоны переживали сброс.
+# Сначала CLI-прогоны (иначе убитый `on` успеет поднять процесс заново), потом
+# сами бинари.
+RESET_CLI_PATTERNS = (r"(^|/)omavpn (--json )?(probe|best)( |$)",
+                      r"(^|/)omavpn (--json )?(on|off|restart|toggle|heal|route)( |$)",
+                      # надзиратель вне systemd: иначе он тут же поднимет VPN
+                      r"(^|/)omavpn-guard( |$)")
+# Кто держит ctrl.lock: только эти команды. `status`, `refilter`, `subscription`
+# лок не берут, поэтому ждать их (и опрос виджета) не нужно.
+RESET_BUSY_PATTERN = (r"(^|/)omavpn (--json )?"
+                      r"(on|off|restart|toggle|heal|route|best)( |$)")
+
+
+def _run_quiet(cmd: list, timeout: float = 20.0) -> None:
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _pgrep(pattern: str) -> list:
+    """PID'ы по regexp командной строки — всегда без собственного pid."""
+    try:
+        proc = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True,
+                              timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    me = os.getpid()
+    pids = {int(x) for x in (proc.stdout or "").split() if x.isdigit()}
+    pids.discard(me)      # pgrep себя не находит, но полагаться на это не будем
+    return sorted(pids)
+
+
+def _kill_matching(pattern: str) -> list:
+    """SIGKILL всем, чья командная строка подходит под regexp. → список PID."""
+    killed = []
+    for pid in _pgrep(pattern):
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed.append(pid)
+        except OSError:
+            pass
+    return killed
+
+
+def _wait_no_foreign(timeout: float) -> bool:
+    """Ждёт, пока не останется чужих `omavpn`, держащих ctrl.lock."""
+    deadline = time.time() + timeout
+    while True:
+        if not _pgrep(RESET_BUSY_PATTERN):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+def reset(restart: bool = True) -> dict:
+    """Сбрасывает всё, что могло зависнуть, и поднимает VPN заново.
+
+    Работает даже когда управление заблокировано: `ctrl.lock` не берём вовсе
+    (иначе сброс упирался бы в тот самый зависший процесс, из-за которого его и
+    запустили), а файл лока просто удаляем — flock живёт на inode, поэтому новый
+    захват после этого проходит.
+    """
+    ensure_dirs()
+    was_on = is_on() or bool(_runtime_dict().get("running"))
+    errors: list[str] = []
+    removed: list[str] = []
+
+    # 1. Службы, которые могут поднять VPN обратно после наших kill. У всех
+    # KillMode=process: `stop` убивает только главный процесс юнита, а дочерние
+    # `omavpn on/heal/route` остаются жить в его cgroup — добиваем cgroup целиком
+    # (best-effort: юнит мог быть не запущен вовсе).
+    for unit in RESET_UNITS:
+        try:
+            proc = subprocess.run(["systemctl", "--user", "stop", "--no-block", unit],
+                                  capture_output=True, text=True, timeout=20)
+            if proc.returncode != 0:
+                msg = (proc.stderr or proc.stdout or "").strip().splitlines()
+                # Не установленный юнит — не ошибка: сброс работает и без служб.
+                if msg and "not loaded" not in msg[0] and "not found" not in msg[0]:
+                    errors.append(f"{unit}: {msg[0][:160]}")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"{unit}: {exc}")
+        _run_quiet(["systemctl", "--user", "kill", "-s", "KILL", "--kill-whom=all",
+                    unit], timeout=15)
+
+    # 2. Процессы: сначала CLI-прогоны по регуляркам, затем сами бинари (у
+    # временных Xray из probe своих pid-файлов нет), затем штатное завершение.
+    for pattern in RESET_CLI_PATTERNS:
+        _kill_matching(pattern)
+    # Бинари запускаются по абсолютному пути, поэтому анкор ^ и хвост (|$)
+    # обязательны: иначе шаблон «…/xray» совпал бы с `less ~/.local/share/
+    # omavpn/bin/xray.log` и убил бы чужой редактор.
+    for pattern in (rf"^{re.escape(str(BIN / 'sing-box'))}( |$)",
+                    rf"^{re.escape(str(BIN / 'xray'))}( |$)"):
+        _kill_matching(pattern)
+    stop_proc(SB_PID, "sing-box", timeout=3.0)
+    stop_proc(XRAY_PID, "xray", timeout=3.0)
+
+    # 3. Транзиентные файлы и каталоги.
+    for path in (*RESET_STATE_FILES, *RESET_CACHE_FILES):
+        try:
+            if path.exists():
+                path.unlink()
+                removed.append(str(path))
+        except OSError as exc:
+            errors.append(f"{path}: {exc.strerror or exc}")
+    if PROBE_DIR.exists():
+        shutil.rmtree(PROBE_DIR, ignore_errors=True)
+        removed.append(str(PROBE_DIR))
+
+    # 4. Подъём заново — только если VPN был включён и об этом не просили молчать.
+    # Перед этим ждём, чтобы чужие omavpn отпустили лок: иначе `on` сразу получит
+    # «другой процесс управляет VPN» и вернёт ложную ошибку.
+    restarted = False
+    if was_on and restart:
+        last = ""
+        for attempt in range(3):
+            if not _wait_no_foreign(6.0):
+                last = "другие процессы omavpn не завершились"
+                continue
+            try:
+                cmd_on(None, None, None, quiet=True)
+                restarted = True
+                break
+            except Exception as exc:  # noqa: BLE001 — сброс уже сделан, это отдельный итог
+                last = str(exc)
+                time.sleep(1.0 + attempt)
+        if not restarted:
+            errors.append("VPN не поднялся после сброса: " + (last or "неизвестная ошибка"))
+    if not restarted:
+        # Процессов нет, а в state.json осталось running=true — иначе сторож
+        # решит, что VPN упал сам, и начнёт лечить только что сброшенное.
+        st = _runtime_dict()
+        st["running"] = False
+        if errors:
+            st["last_error"] = errors[-1]
+        save_json(RUNTIME, st)
+
+    return {"ok": not errors, "was_on": was_on, "restarted": restarted,
+            "removed": removed, "errors": errors}
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -2671,6 +3326,25 @@ def emit(data, human: str = "") -> None:
         print(json.dumps(data, ensure_ascii=False))
     elif human:
         print(human)
+
+
+def refilter_text(res: dict) -> str:
+    """Строка для человека: состояние, объём и дата списка."""
+    state = "включён" if res.get("enabled") else "выключен"
+    if res.get("loaded"):
+        mb = res.get("total_bytes", 0) / 1048576
+        load = (f"список загружен ({mb:.1f} МБ)".replace(".", ",")
+                + (f" · обновлён {res['updated_text']}" if res.get("updated_text") else ""))
+    else:
+        load = "список не загружен — `omavpn refilter update`"
+    return f"Re:filter: {state} · {load}"
+
+
+def _add_json(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """`--json` после подкоманды — как у `route list`: omavpn refilter status --json."""
+    parser.add_argument("--json", dest="sub_json", action="store_true",
+                        help="вывод в JSON (то же, что omavpn --json ...)")
+    return parser
 
 
 class _JsonParser(argparse.ArgumentParser):
@@ -2737,6 +3411,30 @@ def main(argv: list) -> int:
     ss = sub.add_parser("strict", help="strict_route вкл/выкл")
     ss.add_argument("value", choices=["on", "off"])
 
+    # Re:filter — списки заблокированных в РФ доменов/IP, которые идут в туннель.
+    srf = sub.add_parser("refilter", help="Re:filter: заблокированное в РФ — через VPN")
+    rfsub = srf.add_subparsers(dest="refilter_cmd")
+    _add_json(rfsub.add_parser("status", help="состояние списка и настройки"))
+    _add_json(rfsub.add_parser("on", help="включить (заблокированное — через VPN)"))
+    _add_json(rfsub.add_parser("off", help="выключить (как до Re:filter)"))
+    rfu = _add_json(rfsub.add_parser("update", help="скачать свежие списки"))
+    rfu.add_argument("--no-restart", action="store_true",
+                     help="не перезапускать VPN после обновления (таймер, тесты)")
+
+    # URL подписки: посмотреть и заменить (старый не теряется при ошибке).
+    ssub = sub.add_parser("subscription", help="URL подписки: get | set <url>")
+    ssubsub = ssub.add_subparsers(dest="sub_cmd")
+    _add_json(ssubsub.add_parser("get", help="текущий URL подписки"))
+    sset = _add_json(ssubsub.add_parser("set", help="заменить URL подписки"))
+    sset.add_argument("url")
+    sset.add_argument("--no-restart", action="store_true",
+                      help="не перезапускать VPN (URL применится при следующем on)")
+
+    # Полный сброс: снять блокировки и кэши, поднять VPN заново.
+    sreset = _add_json(sub.add_parser("reset", help="полный сброс: остановить всё и поднять VPN"))
+    sreset.add_argument("--no-restart", action="store_true",
+                        help="не поднимать VPN после сброса")
+
     # Маршруты доменов: ручные оверрайды direct/proxy поверх direct_domains.txt.
     srt = sub.add_parser("route", help="маршрут домена: оверрайды proxy/direct")
     rsub = srt.add_subparsers(dest="route_cmd")
@@ -2756,7 +3454,8 @@ def main(argv: list) -> int:
                         help="не перезапускать VPN")
 
     args = p.parse_args(argv)
-    JSON_OUT = args.json or getattr(args, "route_json", False)
+    JSON_OUT = args.json or getattr(args, "route_json", False) \
+        or getattr(args, "sub_json", False)
 
     try:
         if args.cmd == "update":
@@ -2839,6 +3538,69 @@ def main(argv: list) -> int:
         elif args.cmd == "logs":
             tail = {"xray": log_tail(XRAY_LOG, 40), "sing-box": log_tail(SB_LOG, 40)}
             emit({"ok": True, **tail}, f"xray: {tail['xray']}\n\nsing-box: {tail['sing-box']}")
+        elif args.cmd == "refilter":
+            if args.refilter_cmd == "status":
+                st = refilter_status()
+                emit(st, refilter_text(st))
+            elif args.refilter_cmd in ("on", "off"):
+                on = args.refilter_cmd == "on"
+                res = refilter_set(on)
+                note = " · перезапущено" if res["restarted"] else \
+                    (" · " + res["note"] if res["note"] else "")
+                emit(res, f"Re:filter: {'включён' if res['enabled'] else 'выключен'}{note}")
+                # Сбой загрузки списка или перезапуска — ненулевой код, как у
+                # update/subscription: настройка записана, но не всё сработало.
+                return 0 if res["ok"] else 1
+            elif args.refilter_cmd == "update":
+                res = refilter_update(not args.no_restart)
+                if res.get("skipped"):
+                    # Выключено — не качали и туннель не трогали. Это не ошибка.
+                    text = res.get("note") or "Re:filter выключен — списки не обновляю"
+                elif res["changed"]:
+                    text = "список обновлён" + (" · перезапущено" if res["restarted"] else "")
+                elif res["ok"]:
+                    text = "изменений нет"
+                else:
+                    text = "не обновилось"
+                if res["errors"]:
+                    text += ": " + "; ".join(res["errors"])
+                emit(res, text)
+                # Ненулевой код — чтобы таймер и установщик видели сбой сети.
+                return 0 if res["ok"] else 1
+            else:
+                if JSON_OUT:
+                    fail("refilter: не указана подкоманда (status | on | off | update)", 2)
+                srf.print_help()
+                return 0
+        elif args.cmd == "subscription":
+            if args.sub_cmd == "get":
+                res = subscription_get()
+                emit(res, res["url"] or "(URL подписки не задан)")
+            elif args.sub_cmd == "set":
+                res = subscription_set(args.url, not args.no_restart)
+                if not res["changed"]:
+                    text = f"URL подписки не изменился: {res['url']}"
+                elif not res["ok"]:
+                    # Адрес уже новый и рабочий — не выдаём это за полный успех.
+                    text = res.get("error") or "адрес сменён, VPN не перезапустился"
+                else:
+                    text = "URL подписки сохранён" + (" · VPN перезапущен" if res["restarted"] else "")
+                emit(res, text)
+                return 0 if res["ok"] else 1
+            else:
+                if JSON_OUT:
+                    fail("subscription: не указана подкоманда (get | set <url>)", 2)
+                ssub.print_help()
+                return 0
+        elif args.cmd == "reset":
+            res = reset(not args.no_restart)
+            parts = ["VPN был включён" if res["was_on"] else "VPN был выключен"]
+            parts.append("поднят заново" if res["restarted"] else "без подъёма")
+            parts.append(f"удалено файлов: {len(res['removed'])}")
+            if res["errors"]:
+                parts.append("ошибки: " + "; ".join(res["errors"]))
+            emit(res, "Сброс: " + " · ".join(parts))
+            return 0 if res["ok"] else 1
         elif args.cmd == "route":
             if args.route_cmd == "list":
                 rows = route_entries()

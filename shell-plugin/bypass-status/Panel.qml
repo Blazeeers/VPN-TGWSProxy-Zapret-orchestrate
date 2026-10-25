@@ -150,6 +150,61 @@ Panel {
   // правило, добавленное в этот момент, осталось бы вне списка до переоткрытия.
   property bool routeListDirty: false
 
+  // ---- Re:filter (заблокированное в РФ) и подписка -------------------------
+  // Состояние списка читаем отдельной командой, а не из общего снимка статуса:
+  // размеры файлов и дата обновления нужны только на экране настроек. Сами
+  // 80 тысяч доменов в QML не попадают никогда — только сводка.
+  property var rf: ({})
+  property bool rfLoadedOnce: false
+  property bool rfAwait: false      // статус в пути, ответа ещё нет
+  property bool rfBusy: false       // идёт on/off/update
+  property string rfError: ""
+  // Ошибку поставило действие (on/off/update), а не чтение статуса: успешный
+  // перезапрос статуса не должен стирать её с экрана.
+  property bool rfActionError: false
+  // Поле подписки: пустое значение — ещё не читали. dirty не даёт ответу
+  // `subscription get` затереть то, что человек уже начал печатать.
+  property string subUrl: ""
+  property bool subLoaded: false
+  property bool subDirty: false
+  property bool subBusy: false
+  property string subError: ""
+  property bool subAwait: false
+  // Ответ на служебную перечитку URL не должен стирать текст ошибки сохранения.
+  property bool subQuiet: false
+  property bool resetBusy: false
+  property string resetError: ""
+  // URL задан переменной OMAVPN_SUB_URL: файл в этом случае ничего не решает,
+  // и «Сохранить» было бы обманом.
+  property bool subEnv: false
+
+  readonly property bool rfEnabled: root.rf.enabled === true
+  readonly property bool rfReady: root.rf.loaded === true
+  readonly property string rfUpdated: String(root.rf.updated_text || "")
+  // Причина, по которой набор не годится (битый файл, нет файла): `status`
+  // проверяет сигнатуру и разбирает набор sing-box'ом, поэтому текст конкретный.
+  readonly property string rfProblem: {
+    if (!root.rfLoadedOnce || root.rfReady) return ""
+    var f = root.rf.files || {}
+    var parts = []
+    for (var k in f) {
+      if (f[k] && f[k].ok !== true && f[k].error) parts.push(String(f[k].error))
+    }
+    return parts.join("; ")
+  }
+  // Сводка для строки состояния. Объём — в мегабайтах с запятой: список весит
+  // ~0,6 МБ, и «0.6» в русской подписи выглядит опечаткой.
+  readonly property string rfSummary: {
+    if (root.cliPath === "") return "omavpn не найден — списки недоступны"
+    if (!root.rfLoadedOnce) return "читаю состояние…"
+    var head = root.rfEnabled ? "Re:filter" : "Re:filter · выключено"
+    if (!root.rfReady) return head + " · список не загружен — нажми «Обновить»"
+    var mb = (Number(root.rf.total_bytes || 0) / 1048576).toFixed(1).replace(".", ",")
+    var s = head + " · загружен · " + mb + " МБ"
+    if (root.rfUpdated !== "") s += " · обновлён " + root.rfUpdated
+    return s
+  }
+
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color warn: "#ff9f0a"
@@ -378,6 +433,18 @@ Panel {
   // Обычная (read-only) проверка сюда не входит — она короткая и ничего не
   // перезапускает, поэтому не должна отбирать у человека кнопку VPN.
   readonly property bool tunnelBusy: root.vtRunning || root.healthRunning === "heal"
+  // Занятость «боковых» операций: обновление списков Re:filter, смена подписки,
+  // полный сброс. Все три трогают туннель и/или ctrl.lock, поэтому остальные
+  // действия (проверка, подбор, маршруты) на это время гасятся — иначе человек
+  // получит ложное «другой процесс управляет VPN».
+  readonly property bool sideBusy: root.rfBusy || root.subBusy || root.resetBusy
+  // Бюджеты «боковых» операций: один источник и для таймера-сторожа, и для
+  // текста ошибки — раньше сторожа уже подняли, а в сообщении остались минуты.
+  readonly property int rfStatusTimeout: 120000
+  readonly property int rfActionTimeout: 360000
+  readonly property int subGetTimeout: 120000
+  readonly property int subSetTimeout: 240000
+  readonly property int resetTimeout: 480000
 
   readonly property string vtSummary: {
     if (root.vtRunning) {
@@ -738,13 +805,25 @@ Panel {
     root.settingsOpen = true
     root.keyIndex = -1
     root.routeError = ""
+    root.rfError = ""
+    root.rfActionError = false
+    root.subError = ""
+    root.resetError = ""
     panelFlick.contentY = 0
     root.refreshRoutes()
+    // Список Re:filter и URL подписки нужны только здесь, поэтому читаем их при
+    // открытии настроек, а не в общем четырёхсекундном опросе.
+    root.refreshRefilter()
+    root.refreshSubscription()
   }
   function closeSettings() {
     root.settingsOpen = false
     root.keyIndex = -1
     root.routeError = ""
+    root.rfError = ""
+    root.rfActionError = false
+    root.subError = ""
+    root.resetError = ""
     panelFlick.contentY = 0
   }
 
@@ -782,8 +861,91 @@ Panel {
       "Снять правило для " + domain + "? VPN перезапустится на несколько секунд.")
   }
 
+  // ---- Re:filter ------------------------------------------------------------
+  // «Свободно ли управление»: те же условия, что у остальных действий, плюс свои
+  // флаги — иначе сброс и «Обновить список» пошли бы одновременно.
+  // «6 минут» / «2 минуты» / «1 минуту» — по числу, без расхождений с таймером.
+  function timeoutText(ms) {
+    var mins = Math.max(1, Math.round(Number(ms) / 60000))
+    var word = "минут"
+    var tail = mins % 100
+    if (tail < 11 || tail > 14) {
+      var last = mins % 10
+      if (last === 1) word = "минуту"
+      else if (last >= 2 && last <= 4) word = "минуты"
+    }
+    return "за " + mins + " " + word
+  }
+  function refilterFree() {
+    return root.cliPath !== "" && !root.sideBusy
+      && root.busy === "" && !root.healthBusy && !root.vtRunning && !root.tunnelBusy
+  }
+  function refreshRefilter() {
+    if (root.cliPath === "" || rfStatusProc.running) return
+    // Команду ставим явно: привязка к cliPath в первый момент ещё пустая.
+    rfStatusProc.command = [root.cliPath, "--json", "refilter", "status"]
+    root.rfAwait = true
+    rfStatusProc.running = true
+  }
+  // on / off / update — один процесс: набор аргументов собирается здесь же.
+  function refilterAction(action) {
+    if (!root.refilterFree()) return false
+    root.rfError = ""
+    root.rfActionError = false
+    root.rfBusy = true
+    rfActionProc.action = action
+    rfActionProc.command = [root.cliPath, "--json", "refilter", action]
+    rfActionProc.running = true
+    return true
+  }
+  function refilterToggle() {
+    root.refilterAction(root.rfEnabled ? "off" : "on")
+  }
+
+  // ---- подписка -------------------------------------------------------------
+  // quiet=true — только перечитать фактический URL, не трогая текст ошибки
+  // (после неудачного сохранения ошибка должна остаться на экране).
+  function refreshSubscription(quiet) {
+    if (root.cliPath === "" || subGetProc.running) return
+    subGetProc.command = [root.cliPath, "--json", "subscription", "get"]
+    root.subQuiet = quiet === true
+    root.subAwait = true
+    subGetProc.running = true
+  }
+  function applySubUrl(url) {
+    root.subUrl = String(url || "")
+    // Начатый ввод не затираем: ответ мог прийти, пока человек печатал.
+    if (!root.subDirty) subInput.text = root.subUrl
+  }
+  function subscriptionSave() {
+    if (!root.refilterFree()) return false
+    var url = String(subInput.text || "").trim()
+    if (url === "") { root.subError = "введите URL подписки"; return false }
+    root.subError = ""
+    root.subBusy = true
+    subSetProc.command = [root.cliPath, "--json", "subscription", "set", url]
+    subSetProc.running = true
+    return true
+  }
+
+  // ---- полный сброс ---------------------------------------------------------
+  // Специально не ждём «свободно»: сброс запускают именно тогда, когда всё
+  // зависло и обычные действия не отвечают. Защищает только собственный флаг.
+  function runReset() {
+    if (root.cliPath === "" || root.resetBusy) return false
+    root.resetError = ""
+    root.resetBusy = true
+    resetProc.command = [root.cliPath, "--json", "reset"]
+    resetProc.running = true
+    return true
+  }
+
   function run(args, label) {
-    if (actionProc.running || root.cliPath === "" || root.busy !== "") return false
+    // sideBusy: пока идёт обновление списков Re:filter, смена подписки или
+    // сброс, туннель и ctrl.lock заняты — иначе действие вернёт ложное
+    // «другой процесс управляет VPN».
+    if (actionProc.running || root.cliPath === "" || root.busy !== ""
+        || root.sideBusy) return false
     root.opError = ""
     root.busy = label || "…"
     actionProc.command = [root.cliPath, "--json"].concat(args)
@@ -796,7 +958,8 @@ Panel {
   // Пока идёт подбор серверов или другое действие, проверку не начинаем:
   // heal перезапускает туннель и испортит результаты подбора.
   function startHealth(heal, auto) {
-    if (healthProc.running || root.vtRunning || root.busy !== "") return false
+    if (healthProc.running || root.vtRunning || root.busy !== "" || root.sideBusy)
+      return false
     root.healthAuto = auto === true
     // Лечение пробовали (кнопкой или сами): это условие автоподбора сервера.
     if (heal) root.healTried = true
@@ -827,6 +990,11 @@ Panel {
     else if (which === "action") actionProc.running = false
     else if (which === "route") routeChangeProc.running = false
     else if (which === "route-list") routeListProc.running = false
+    else if (which === "refilter") rfStatusProc.running = false
+    else if (which === "refilter-act") rfActionProc.running = false
+    else if (which === "sub") subGetProc.running = false
+    else if (which === "sub-set") subSetProc.running = false
+    else if (which === "reset") resetProc.running = false
   }
 
   // Забрать метку «не ответил» у своего процесса (и только у него).
@@ -1014,7 +1182,8 @@ Panel {
   function actionButtons() {
     return [checkAllBtn, bestBtn, rescanBtn, auditBtn, updateBtn, updateAllBtn,
             mainHeader.gearButton, settingsHeader.backButton,
-            routeDirectBtn, routeProxyBtn, routeAddBtn, routeInput]
+            routeDirectBtn, routeProxyBtn, routeAddBtn, routeInput,
+            subInput, subSaveBtn, rfUpdateBtn, resetBtn]
   }
   // Эффективная видимость: у ребёнка скрытого Column собственный visible остаётся
   // true, поэтому проверяем всю цепочку родителей — иначе Tab заходил бы в
@@ -1060,6 +1229,7 @@ Panel {
     for (var i = 0; i < list.length; i++) {
       if (list[i].keyIndex !== root.keyIndex) continue
       if (list[i] === routeInput) { routeInput.forceActiveFocus(); return }
+      if (list[i] === subInput) { subInput.forceActiveFocus(); return }
       if (list[i].enabled) list[i].clicked()
       return
     }
@@ -1086,6 +1256,13 @@ Panel {
       noticeTimer.restart()
     }
     var blocked = root.busy !== "" || root.healthBusy || root.vtRunning
+    // Сброс стоит первым: он специально игнорирует занятость — его запускают,
+    // когда всё зависло именно поэтому.
+    if (kind === "reset") {
+      if (root.resetBusy) { refuse(); return }
+      if (!root.runReset()) root.notice = "omavpn не найден — сброс недоступен"
+      return
+    }
     // Снятие правила: префикс разбираем до остальных ветвей, занятость учитываем
     // ту же — route set/unset поднимает туннель заново.
     if (kind.indexOf("route-unset:") === 0) {
@@ -1182,6 +1359,11 @@ Panel {
   // пуст и список правил не читался вовсе. Догружаем, как только путь появился.
   onCliPathChanged: {
     if (root.settingsOpen && !root.routeLoaded && root.cliPath !== "") root.refreshRoutes()
+    // То же для Re:filter и подписки: настройки могли открыть до первого снимка.
+    if (root.settingsOpen && root.cliPath !== "") {
+      if (!root.rfLoadedOnce) root.refreshRefilter()
+      if (!root.subLoaded) root.refreshSubscription()
+    }
   }
 
   implicitWidth: button.implicitWidth
@@ -1797,6 +1979,198 @@ Panel {
     onExited: function(code) { /* код не важен: уведомление — необязательный бонус */ }
   }
 
+  // ---- Re:filter: состояние, переключение, обновление списков ---------------
+  Process {
+    id: rfStatusProc
+    stdout: StdioCollector { id: rfStatusOut; waitForEnd: true }
+    onRunningChanged: {
+      if (running || !root.rfAwait) return
+      root.rfAwait = false
+      root.rfError = "Re:filter: omavpn не запускается — проверь " + root.cliPath
+    }
+    onExited: function(code) {
+      root.rfAwait = false
+      if (root.takeTimeout("refilter")) {
+        root.rfError = "Re:filter: состояние не получено " + root.timeoutText(root.rfStatusTimeout)
+        return
+      }
+      var d = null
+      try { d = JSON.parse(rfStatusOut.text) } catch (e) { d = null }
+      if (code !== 0 || !d || typeof d !== "object" || d.ok !== true) {
+        root.rfError = "Re:filter: " + ((d && d.error)
+          ? d.error : ("состояние не получено, код " + code))
+        return
+      }
+      // Успешный статус не повод стирать ошибку только что упавшего действия.
+      if (!root.rfActionError) root.rfError = ""
+      root.rf = d
+      root.rfLoadedOnce = true
+    }
+  }
+
+  // on / off / update — один процесс: аргументы собирает refilterAction().
+  Process {
+    id: rfActionProc
+    property string action: ""
+    stdout: StdioCollector { id: rfActionOut; waitForEnd: true }
+    stderr: StdioCollector { id: rfActionErr; waitForEnd: true }
+    onRunningChanged: {
+      if (running || !root.rfBusy) return
+      root.rfBusy = false
+      root.rfActionError = true
+      root.rfError = "Re:filter: omavpn не запускается — проверь " + root.cliPath
+    }
+    onExited: function(code) {
+      var action = rfActionProc.action
+      var timedOut = root.takeTimeout("refilter-act")
+      root.rfBusy = false
+      var d = null
+      try { d = JSON.parse(rfActionOut.text) } catch (e) { d = null }
+      root.rfActionError = false
+      if (timedOut) {
+        root.rfActionError = true
+        root.rfError = "Re:filter: «" + action + "» не ответило " + root.timeoutText(root.rfActionTimeout)
+      } else if (code !== 0 || !d || d.ok !== true) {
+        root.rfActionError = true
+        var msg = (d && d.error) ? String(d.error)
+          : (rfActionErr.text || rfActionOut.text || "").trim()
+        root.rfError = "Re:filter: " + (msg || ("код " + code))
+      } else {
+        root.rfError = ""
+        if (action === "update") {
+          root.notice = d.changed
+            ? ("список Re:filter обновлён" + (d.restarted ? " · VPN перезапущен" : ""))
+            : "список Re:filter без изменений"
+        } else {
+          root.notice = "Re:filter: " + (d.enabled ? "включён" : "выключен")
+            + (d.restarted ? " · VPN перезапущен" : "")
+            + (d.note ? " · " + d.note : "")
+        }
+        noticeTimer.restart()
+      }
+      // Размеры и дата меняются после обновления, настройка — после переключения:
+      // в обоих случаях сводку надо перечитать, а не показывать старую.
+      root.refreshRefilter()
+      root.refreshStatus()
+    }
+  }
+
+  // ---- подписка: чтение и замена URL ---------------------------------------
+  Process {
+    id: subGetProc
+    stdout: StdioCollector { id: subGetOut; waitForEnd: true }
+    onRunningChanged: {
+      if (running || !root.subAwait) return
+      root.subAwait = false
+      if (!root.subQuiet)
+        root.subError = "подписка: omavpn не запускается — проверь " + root.cliPath
+    }
+    onExited: function(code) {
+      var quiet = root.subQuiet
+      root.subQuiet = false
+      root.subAwait = false
+      if (root.takeTimeout("sub")) {
+        if (!quiet) root.subError = "подписка: URL не получен " + root.timeoutText(root.subGetTimeout)
+        return
+      }
+      var d = null
+      try { d = JSON.parse(subGetOut.text) } catch (e) { d = null }
+      if (code !== 0 || !d || typeof d !== "object" || d.ok !== true) {
+        if (!quiet) root.subError = "подписка: " + ((d && d.error)
+          ? d.error : ("URL не получен, код " + code))
+        return
+      }
+      if (!quiet) root.subError = ""
+      root.subLoaded = true
+      root.subEnv = d.env === true
+      root.applySubUrl(d.url)
+    }
+  }
+
+  Process {
+    id: subSetProc
+    stdout: StdioCollector { id: subSetOut; waitForEnd: true }
+    stderr: StdioCollector { id: subSetErr; waitForEnd: true }
+    onRunningChanged: {
+      if (running || !root.subBusy) return
+      root.subBusy = false
+      root.subError = "подписка: omavpn не запускается — проверь " + root.cliPath
+    }
+    onExited: function(code) {
+      var timedOut = root.takeTimeout("sub-set")
+      root.subBusy = false
+      var d = null
+      try { d = JSON.parse(subSetOut.text) } catch (e) { d = null }
+      if (timedOut) {
+        root.subError = "подписка не изменена: omavpn не ответил " + root.timeoutText(root.subSetTimeout)
+      } else if (code !== 0 || !d || d.ok !== true) {
+        var msg = (d && d.error) ? String(d.error)
+          : (subSetErr.text || subSetOut.text || "").trim()
+        // Поле не чистим: человек должен видеть, что вводил, и поправить сам.
+        root.subError = msg || ("подписка не изменена, код " + code)
+        if (d && d.url_changed === true) {
+          // Адрес уже сменён и проверен — не сработал только перезапуск VPN.
+          // Показываем это предупреждением, но поле и состояние ведём за новым
+          // URL: иначе человек решит, что сохранение провалилось, и введёт заново.
+          root.subDirty = false
+          root.subUrl = String(d.url || "")
+          subInput.text = root.subUrl
+        } else {
+          // Новый адрес не принят, файл откатился — перечитываем фактический URL.
+          // Ввод при этом не затирается: applySubUrl уважает subDirty, а тихая
+          // перечитка не стирает только что показанную ошибку.
+          root.refreshSubscription(true)
+        }
+      } else {
+        root.subError = ""
+        root.subDirty = false
+        root.subUrl = String(d.url || "")
+        subInput.text = root.subUrl
+        root.notice = (d.changed === false ? "URL подписки не изменился" : "подписка обновлена")
+          + (d.restarted ? " · VPN перезапущен" : "")
+        noticeTimer.restart()
+        // Подписка могла принести другие регионы и серверы — список перечитываем.
+        root.refreshRoutes()
+        root.refreshVpn()
+      }
+      root.refreshStatus()
+    }
+  }
+
+  // ---- полный сброс --------------------------------------------------------
+  Process {
+    id: resetProc
+    stdout: StdioCollector { id: resetOut; waitForEnd: true }
+    stderr: StdioCollector { id: resetErr; waitForEnd: true }
+    onRunningChanged: {
+      if (running || !root.resetBusy) return
+      root.resetBusy = false
+      root.resetError = "сброс: omavpn не запускается — проверь " + root.cliPath
+    }
+    onExited: function(code) {
+      var timedOut = root.takeTimeout("reset")
+      root.resetBusy = false
+      var d = null
+      try { d = JSON.parse(resetOut.text) } catch (e) { d = null }
+      if (timedOut) {
+        root.resetError = "сброс не ответил " + root.timeoutText(root.resetTimeout)
+      } else if (code !== 0 || !d || d.ok !== true) {
+        var msg = (d && d.errors && d.errors.length) ? d.errors.join("; ")
+          : ((d && d.error) ? String(d.error) : (resetErr.text || resetOut.text || "").trim())
+        root.resetError = "сброс: " + (msg || ("код " + code))
+      }
+      if (!timedOut && code === 0 && d && d.ok === true) {
+        // Процессы убиты и подняты заново — оболочка перечитает конфиги и
+        // плагины сама. Отдельная сессия (setsid) нужна, чтобы перезапуск
+        // пережил закрытие quickshell, который убивает своих потомков.
+        restartShellProc.running = true
+      } else {
+        root.refreshStatus()
+        root.refreshVpn()
+      }
+    }
+  }
+
   Timer {
     id: noticeTimer
     interval: 9000
@@ -1896,6 +2270,18 @@ Panel {
   Timer { id: routeWatch; interval: 180000; running: routeChangeProc.running; onTriggered: root.killProc("route") }
   // Чтение списка — секунды; 30 с достаточно и не держит метку вечно.
   Timer { id: routeListWatch; interval: 30000; running: routeListProc.running; onTriggered: root.killProc("route-list") }
+  // Re:filter: чтение состояния — секунды; обновление качает ~0,6 МБ с GitHub
+  // (юнит разрешает 300 с: два файла по 120 с + перезапуск), поэтому сторож
+  // действия должен быть не меньше бюджета сервиса.
+  Timer { id: rfWatch; interval: root.rfStatusTimeout; running: rfStatusProc.running; onTriggered: root.killProc("refilter") }
+  Timer { id: rfActionWatch; interval: root.rfActionTimeout; running: rfActionProc.running; onTriggered: root.killProc("refilter-act") }
+  // Подписка: чтение — секунды; замена качает новую подписку (HTTP_TIMEOUT 40 с)
+  // и перезапускает туннель.
+  Timer { id: subWatch; interval: root.subGetTimeout; running: subGetProc.running; onTriggered: root.killProc("sub") }
+  Timer { id: subSetWatch; interval: root.subSetTimeout; running: subSetProc.running; onTriggered: root.killProc("sub-set") }
+  // Сброс: остановка служб + ожидание чужих omavpn + до трёх попыток поднять VPN.
+  // Ранний SIGTERM оставил бы туннель выключенным.
+  Timer { id: resetWatch; interval: root.resetTimeout; running: resetProc.running; onTriggered: root.killProc("reset") }
 
   // ---- кнопка в панели -----------------------------------------------------
   BarIconButton {
@@ -1943,7 +2329,7 @@ Panel {
       anchors.fill: parent
       // Поле ввода маршрута забирает клавиши себе: иначе стрелки и пробел
       // уходили бы в обход кнопок и мешали печатать домен.
-      blocked: root.settingsOpen && routeInput.activeFocus
+      blocked: root.settingsOpen && (routeInput.activeFocus || subInput.activeFocus)
       onCloseRequested: {
         if (confirmDlg.opened) root.cancelConfirm()
         // Escape в настройках возвращает в основную панель, а не закрывает её.
@@ -3003,9 +3389,9 @@ Panel {
             // vtRunning тоже блокирует: heal перезапускает туннель и испортит
             // результаты идущего подбора серверов.
             enabled: root.scriptOk && !root.healthBusy && root.busy === ""
-              && !root.vtRunning
+              && !root.vtRunning && !root.sideBusy
             onClicked: {
-              if (root.vtRunning || root.busy !== "" || root.healthBusy) return
+              if (root.vtRunning || root.busy !== "" || root.healthBusy || root.sideBusy) return
               root.startHealth(true)
             }
           }
@@ -3021,9 +3407,10 @@ Panel {
               ? "Идёт проверка — дождись её окончания"
               : "Прогнать все регионы и серверы и подключить лучший (туннель перезапустится)"
             enabled: root.cliPath !== "" && root.busy === "" && !root.vtRunning
-              && !root.healthBusy
+              && !root.healthBusy && !root.sideBusy
             onClicked: {
-              if (root.vtRunning || optimizeProc.running || root.healthBusy || root.busy !== "") return
+              if (root.vtRunning || optimizeProc.running || root.healthBusy || root.busy !== ""
+                || root.sideBusy) return
               root.opError = ""
               root.busy = "vtest"
               root.vpnExpanded = true
@@ -3043,9 +3430,10 @@ Panel {
             // busy гасит все действия, health-проверка и подбор серверов — те,
             // что сами трогают маршруты и zapret; открытая панель остаётся живой.
             enabled: root.scriptOk && root.busy === "" && !root.healthBusy
-              && !root.vtRunning
+              && !root.vtRunning && !root.sideBusy
             onClicked: {
-              if (root.busy !== "" || rescanProc.running || root.healthBusy || root.vtRunning) return
+              if (root.busy !== "" || rescanProc.running || root.healthBusy || root.vtRunning
+                || root.sideBusy) return
               root.opError = ""
               root.busy = "rescan"
               rescanProc.running = true
@@ -3064,7 +3452,7 @@ Panel {
             // Аудит запускает scriptPath (bypass-status), а не cliPath (omavpn):
             // проверять надо именно его, иначе кнопка мертва без CLI.
             enabled: root.scriptOk && root.busy === "" && !root.healthBusy
-              && !root.vtRunning
+              && !root.vtRunning && !root.sideBusy
             onClicked: root.askConfirm("audit",
               "Проверить маршруты доменов?\nАудит может перевести домены на другой путь и перезапустить туннель — трафик прервётся примерно на минуту.")
           }
@@ -3079,7 +3467,7 @@ Panel {
                 ? "Идёт подбор серверов — дождись его окончания"
                 : "Перечитать подписку (туннель перезапустится)")
             enabled: root.cliPath !== "" && root.busy === "" && !root.tunnelBusy
-              && !root.healthBusy
+              && !root.healthBusy && !root.sideBusy
             onClicked: root.askConfirm("update",
               "Обновить подписку?\nТуннель перезапустится, трафик прервётся на несколько секунд.")
           }
@@ -3339,6 +3727,374 @@ Panel {
               textFormat: Text.PlainText
               text: "Пока своих правил нет — трафик идёт по общим правилам."
               color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+        }
+
+        // ---------- Re:filter: заблокированное в РФ ----------
+        // Сами списки (80 тыс. доменов и 25 тыс. адресов) в QML не попадают:
+        // здесь только сводка, размер и дата, их отдаёт `omavpn refilter status`.
+        Rectangle {
+          width: parent.width
+          radius: Style.cornerRadius > 0 ? Style.space(12) : 0
+          color: root.cardFill
+          border.width: 1
+          border.color: root.hairline
+          implicitHeight: rfBox.implicitHeight + Style.space(24)
+
+          Column {
+            id: rfBox
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: Style.space(12)
+            spacing: Style.space(8)
+
+            Row {
+              width: parent.width
+              spacing: Style.space(10)
+
+              Pictogram {
+                name: "vpn"
+                tint: root.dim
+                px: Style.space(18)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: "БЛОКИРОВКИ РФ"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 0.8
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            // Переключатель — строка, как тумблеры выше: кнопкой в обходе
+            // клавиатуры он бы мешал, а состояние читается так же.
+            Rectangle {
+              width: parent.width
+              implicitHeight: rfToggleRow.implicitHeight + Style.space(10)
+              radius: Style.cornerRadius > 0 ? Style.space(8) : 0
+              color: rfToggleMouse.containsMouse ? root.hoverFill : "transparent"
+              opacity: root.cliPath !== "" && !root.rfBusy ? 1 : 0.5
+
+              Row {
+                id: rfToggleRow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.space(8)
+                anchors.rightMargin: Style.space(8)
+                spacing: Style.space(10)
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "Заблокированные в РФ — через VPN"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  width: parent.width - Style.space(50)
+                  wrapMode: Text.WordWrap
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  // До первого ответа состояние неизвестно: «выкл» было бы враньём.
+                  text: !root.rfLoadedOnce || root.rfBusy
+                    ? "…" : (root.rfEnabled ? "вкл" : "выкл")
+                  color: root.rfEnabled ? root.okColor : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              MouseArea {
+                id: rfToggleMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                // Сброс и чужие операции блокируют переключение: все они трогают
+                // туннель, а молчаливое «нажал и ничего» — худший вариант.
+                enabled: root.cliPath !== "" && !root.sideBusy && root.busy === ""
+                  && !root.healthBusy && !root.vtRunning
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.refilterToggle()
+              }
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.rfSummary
+              color: root.rfReady ? root.dim : root.warn
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            // Почему список не годится — словами бэкенда, а не «ошибка».
+            Text {
+              width: parent.width
+              visible: root.rfProblem !== ""
+              textFormat: Text.PlainText
+              text: root.rfProblem
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              ActionButton {
+                id: rfUpdateBtn
+                keyIndex: 12
+                text: root.rfBusy ? "…" : "Обновить список"
+                tooltipText: "Скачать свежие списки Re:filter; если они изменились, VPN перезапустится"
+                enabled: root.cliPath !== "" && !root.rfBusy && root.busy === ""
+                  && !root.resetBusy && !root.subBusy && !root.healthBusy
+                  && !root.vtRunning && !root.tunnelBusy
+                onClicked: root.refilterAction("update")
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.rfError !== ""
+              textFormat: Text.PlainText
+              text: root.rfError
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+        }
+
+        // ---------- подписка ----------
+        // Замена URL без редактора: новый адрес сразу проверяется загрузкой, а
+        // при ошибке остаётся прежний (бэкенд откатывает файл сам).
+        Rectangle {
+          width: parent.width
+          radius: Style.cornerRadius > 0 ? Style.space(12) : 0
+          color: root.cardFill
+          border.width: 1
+          border.color: root.hairline
+          implicitHeight: subBox.implicitHeight + Style.space(24)
+
+          Column {
+            id: subBox
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: Style.space(12)
+            spacing: Style.space(8)
+
+            Row {
+              width: parent.width
+              spacing: Style.space(10)
+
+              Pictogram {
+                name: "region"
+                tint: root.dim
+                px: Style.space(18)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: "ПОДПИСКА"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 0.8
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.cliPath === ""
+              textFormat: Text.PlainText
+              text: "omavpn не найден — адрес подписки менять нечем"
+              color: root.warn
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              width: parent.width
+              visible: root.cliPath !== ""
+              textFormat: Text.PlainText
+              text: "Адрес подписки (файл ~/.config/omavpn/subscription). После "
+                + "сохранения туннель перезапустится, если VPN включён; если новый "
+                + "адрес не загрузится, останется прежний."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            TextField {
+              id: subInput
+              // Как и поле маршрута: Tab доводит до него, Escape возвращает панели.
+              property int keyIndex: 13
+              width: parent.width
+              visible: root.cliPath !== ""
+              foreground: root.foreground
+              font.family: root.fontFamily
+              placeholderText: "https://…"
+              enabled: root.cliPath !== "" && !root.subBusy && !root.subEnv
+              hasCursor: root.keyIndex === 13
+              // Ввод помечаем «грязным»: ответ subscription get не должен
+              // затирать то, что человек уже напечатал.
+              onTextEdited: root.subDirty = true
+              onAccepted: root.subscriptionSave()
+              Keys.onEscapePressed: function(event) {
+                event.accepted = true
+                root.keyIndex = -1
+                keyCatcher.forceActiveFocus()
+              }
+              Keys.onTabPressed: function(event) {
+                event.accepted = true
+                root.keyTab((event.modifiers & Qt.ShiftModifier) ? -1 : 1)
+                keyCatcher.forceActiveFocus()
+              }
+              Keys.onBacktabPressed: function(event) {
+                event.accepted = true
+                root.keyTab(-1)
+                keyCatcher.forceActiveFocus()
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.subEnv
+              textFormat: Text.PlainText
+              text: "URL задан переменной OMAVPN_SUB_URL — это поле и файл на него "
+                + "не влияют. Убери переменную и открой настройки заново."
+              color: root.warn
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              ActionButton {
+                id: subSaveBtn
+                keyIndex: 14
+                text: root.subBusy ? "…" : "Сохранить"
+                tooltipText: "Записать адрес и перезапустить VPN, если он включён"
+                enabled: root.cliPath !== "" && !root.subBusy && !root.subEnv
+                  && root.busy === "" && !root.resetBusy && !root.healthBusy
+                  && !root.vtRunning && !root.tunnelBusy
+                  && String(subInput.text || "").trim() !== ""
+                  && String(subInput.text || "").trim() !== root.subUrl
+                onClicked: root.subscriptionSave()
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.subError !== ""
+              textFormat: Text.PlainText
+              text: root.subError
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+        }
+
+        // ---------- полный сброс ----------
+        // Крайняя мера на случай, когда всё зависло. Данные человека (подписка,
+        // маршруты, настройки, списки Re:filter) остаются — удаляется только
+        // транзиентное состояние и блокировки.
+        Rectangle {
+          width: parent.width
+          radius: Style.cornerRadius > 0 ? Style.space(12) : 0
+          color: root.cardFill
+          border.width: 1
+          border.color: root.hairline
+          implicitHeight: resetBox.implicitHeight + Style.space(24)
+
+          Column {
+            id: resetBox
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: Style.space(12)
+            spacing: Style.space(8)
+
+            Row {
+              width: parent.width
+              spacing: Style.space(10)
+
+              Pictogram {
+                name: "warning"
+                tint: root.urgent
+                px: Style.space(18)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: "СБРОС"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 0.8
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.cliPath !== ""
+              textFormat: Text.PlainText
+              text: "Если всё зависло: остановит VPN и службы, удалит кэш и "
+                + "блокировки, поднимет VPN заново и перезапустит оболочку. "
+                + "Подписка, маршруты и настройки сохранятся."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              ActionButton {
+                id: resetBtn
+                keyIndex: 15
+                text: root.resetBusy ? "… сброс" : "Полный сброс"
+                // Красный текст — предупреждение до нажатия, а не после.
+                foreground: root.urgent
+                tooltipText: "Остановить VPN и службы, удалить кэш и блокировки, поднять VPN и перезапустить оболочку"
+                enabled: root.cliPath !== "" && !root.resetBusy
+                onClicked: root.askConfirm("reset",
+                  "Полный сброс?\nОстановит VPN и службы, удалит кэш и блокировки, перезапустит VPN и оболочку. Подписка, маршруты и настройки сохранятся.")
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.resetError !== ""
+              textFormat: Text.PlainText
+              text: root.resetError
+              color: root.urgent
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap

@@ -14,7 +14,7 @@ PURGE="${1:-}"
 systemctl --user disable --now \
   omavpn-guard.timer omavpn-autostart.service \
   omavpn-route-audit.timer omavpn-route-recheck.timer \
-  omavpn-updates.timer >/dev/null 2>&1 || true
+  omavpn-updates.timer omavpn-refilter.timer >/dev/null 2>&1 || true
 # Именно stop: уже запущенный прогон guard (Type=oneshot) может идти до
 # 20 минут перебора и всё это время вправе поднять VPN.
 systemctl --user stop omavpn-guard.service >/dev/null 2>&1 || true
@@ -44,6 +44,14 @@ rm -f "$HOME_DIR/.config/systemd/user/omavpn-updates.service" \
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 rm -f "$HOME_DIR/.local/bin/bypass-status"
 rm -f "$HOME_DIR/.local/bin/omavpn-updater"
+
+# Re:filter: юнит обновления списков. Сам кэш наборов (0,6 МБ состояния) — это
+# данные, а не мусор установки: в обычном режиме оставляем (как прочие каталоги
+# состояния), удаляем только с --purge — иначе сообщение «данные сохранены»
+# было бы неправдой.
+rm -f "$HOME_DIR/.config/systemd/user/omavpn-refilter.service" \
+      "$HOME_DIR/.config/systemd/user/omavpn-refilter.timer"
+systemctl --user daemon-reload >/dev/null 2>&1 || true
 
 # Аудит маршрутов: те же правила — сначала таймеры (погашены выше), потом файлы.
 rm -f "$HOME_DIR/.config/systemd/user/omavpn-route-audit.service" \
