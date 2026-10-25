@@ -769,16 +769,26 @@ Panel {
     return lines.join("\n")
   }
 
-  // Последние 5 записей журнала — новые сверху.
+  // Последние 5 записей журнала — новые сверху, только за последние 2 часа.
+  // Бэкенд уже чистит файл и отдаёт свежее, но панель не должна показывать
+  // вчерашнее, если файл успел накопить старое до обновления. Окно считаем от
+  // наблюдаемого `root.nowSec` (тик при открытой панели), иначе привязка не
+  // пересчитывалась бы между обновлениями `root.up` (раз в 5 минут) и после
+  // сбоя updater показывала бы записи старше двух часов. Панель закрыта — список
+  // не виден; при открытии тик подставит свежее время и всё пересчитает.
   readonly property var upActions: {
     var a = (root.up && root.up.actions instanceof Array) ? root.up.actions : []
+    var now = root.nowSec > 0 ? root.nowSec : Date.now() / 1000
+    var cutoff = now - 7200
     var out = []
-    var from = Math.max(0, a.length - 5)
-    for (var i = a.length - 1; i >= from; i--) {
+    for (var i = a.length - 1; i >= 0 && out.length < 5; i--) {
       var it = a[i]
       if (!it || !it.text) continue
+      var ts = Number(it.ts)
+      // Без валидного ts запись не фильтруется по времени — не показываем.
+      if (!(ts > 0) || ts < cutoff) continue
       out.push({
-        when: Number(it.ts) > 0 ? Qt.formatTime(new Date(Number(it.ts) * 1000), "HH:mm") : "",
+        when: Qt.formatTime(new Date(ts * 1000), "HH:mm"),
         text: String(it.text),
         kind: String(it.kind || "")
       })

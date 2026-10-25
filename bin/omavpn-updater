@@ -56,6 +56,10 @@ CHECK_TTL = 24 * 3600      # как часто ходим в сеть за пр�
 PARTIAL_TTL = 600          # сбойная проверка (нет сети) — кэш на 10 минут
 ACTIONS_MAX = 200          # журнал действий не растёт бесконечно
 ACTIONS_SHOW = 10          # сколько последних действий отдаём в состоянии
+# Журнал «что виджет сделал сам» нужен только для недавних событий: за сутки он
+# превращается в свалку, где вчерашние автошаги выглядят как сегодняшние. Всё
+# старше двух часов не показываем и вычищаем из файла.
+ACTIONS_WINDOW = 2 * 3600
 CURL_TIMEOUT = 15          # обычный запрос (манифест, API)
 TARBALL_TIMEOUT = 300      # архив репозитория
 SYSTEMCTL_TIMEOUT = 5
@@ -397,23 +401,48 @@ def _power() -> dict:
     return {"on_battery": on_battery, "percent": percent}
 
 
+def _action_entry(line: str):
+    """(ts, запись, строка без переводов) для годной записи; None — иначе.
+
+    Битая строка, пустая и запись без валидного `ts` в журнал не идут: время —
+    единственное, по чему журнал фильтруется, и запись без него осталась бы
+    навсегда. Формат строки (JSON-объект на строку) сохраняем как есть.
+    """
+    text = line.strip()
+    if not text:
+        return None
+    try:
+        record = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(record, dict):
+        return None
+    raw_ts = record.get("ts")
+    # bool — не время: `float(True) == 1.0` прошёл бы проверку `ts > 0`, и
+    # запись с `"ts": true` считалась бы свежей (1 января 1970). Отсекаем.
+    if isinstance(raw_ts, bool):
+        return None
+    ts = _num(raw_ts)
+    if ts <= 0:
+        return None
+    return ts, record, text
+
+
 def _read_actions(limit: int = ACTIONS_SHOW) -> list[dict]:
-    """Последние записи журнала; битые строки пропускаем."""
+    """Последние записи журнала за окно ACTIONS_WINDOW; битые/без ts — мимо."""
+    cutoff = time.time() - ACTIONS_WINDOW
     items: list[dict] = []
     try:
         with open(ACTIONS_FILE, encoding="utf-8", errors="replace") as handle:
             for line in handle:
-                line = line.strip()
-                if not line:
+                entry = _action_entry(line)
+                if entry is None:
                     continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(record, dict):
+                ts, record, _text = entry
+                if ts < cutoff:      # старше окна — в панели ему не место
                     continue
                 items.append({
-                    "ts": _num(record.get("ts")),
+                    "ts": ts,
                     "kind": str(record.get("kind") or ""),
                     "text": str(record.get("text") or ""),
                 })
@@ -438,18 +467,44 @@ def _ends_with_newline() -> bool:
 
 
 def _trim_locked(handle) -> None:
-    """Обрезка журнала под уже взятой блокировкой: строки читаем через тот же fd.
+    """Обрезка журнала под уже взятой блокировкой: читаем и пишем через тот же fd.
 
     Файл открыт в режиме "a+": запись всегда уходит в конец, чтение — с текущей
     позиции, поэтому перед чтением делаем seek(0).
+
+    Убираем не только лишнее сверх ACTIONS_MAX, но и всё старше ACTIONS_WINDOW:
+    иначе «за последние 2 часа» держалось бы лишь в выводе, а файл продолжал бы
+    копить вчерашние записи. Заодно выбрасываются битые строки и записи без
+    валидного `ts` — по времени они не фильтруются и остались бы навсегда.
+    Последняя строка завершается переводом строки: следующий append не склеится
+    с ней (иначе получилась бы нечитаемая строка).
     """
+    cutoff = time.time() - ACTIONS_WINDOW
     handle.seek(0)
     lines = handle.readlines()
-    if len(lines) <= ACTIONS_MAX:
+    keep: list[str] = []
+    dropped = False
+    for line in lines:
+        entry = _action_entry(line)
+        if entry is None:
+            dropped = True
+            continue
+        ts, _record, text = entry
+        if ts < cutoff:
+            dropped = True
+            continue
+        keep.append(text)
+    if len(keep) > ACTIONS_MAX:
+        keep = keep[-ACTIONS_MAX:]
+        dropped = True
+    # Нечего чистить — файл не трогаем: лишняя перезапись каждый раз меняла бы
+    # mtime и будила наблюдателей.
+    if not dropped:
         return
     handle.seek(0)
     handle.truncate()
-    handle.writelines(lines[-ACTIONS_MAX:])
+    if keep:
+        handle.write("\n".join(keep) + "\n")
     handle.flush()
 
 
