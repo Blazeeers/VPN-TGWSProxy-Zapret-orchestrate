@@ -193,7 +193,7 @@ if [ -f "$HERE/bin/omavpn-guard" ]; then
   install -m 0755 "$HERE/bin/omavpn-guard" "$LOCAL_BIN/omavpn-guard"
   mkdir -p "$HOME_DIR/.config/systemd/user"
 
-  write_unit "$HOME_DIR/.config/systemd/user/omavpn-guard.service" <<EOF
+  write_unit "$HOME_DIR/.config/systemd/user/omavpn-guard.service" <<'EOF'
 [Unit]
 Description=Проверка и самовосстановление VPN/YouTube/Discord/Telegram (omavpn-guard)
 
@@ -302,6 +302,10 @@ Description=Periodic route audit (direct/proxy per domain)
 
 [Timer]
 OnBootSec=3min
+# OnActiveSec — от запуска самого таймера: без него на только что включённом
+# таймере OnBootSec уже в прошлом, а OnUnitActiveSec ссылается на последний
+# запуск сервиса, которого не было, и таймер висит в active (elapsed) с Trigger: n/a.
+OnActiveSec=3min
 OnUnitActiveSec=10min
 # 180 с, а не 30: с 30 с аудит регулярно попадал в тот же момент, что и guard
 # (у него RandomizedDelaySec=60), и оба перезапускали VPN почти одновременно.
@@ -338,6 +342,8 @@ Description=Daily route override recheck
 
 [Timer]
 OnBootSec=12min
+# OnActiveSec — от запуска таймера, иначе на свежевключённом таймере NEXT пуст
+OnActiveSec=12min
 OnUnitActiveSec=24h
 RandomizedDelaySec=5min
 Persistent=true
@@ -352,6 +358,11 @@ EOF
       warn "Не удалось включить omavpn-route-audit.timer — включи вручную: systemctl --user enable --now omavpn-route-audit.timer"
     systemctl --user enable --now omavpn-route-recheck.timer >/dev/null 2>&1 || \
       warn "Не удалось включить omavpn-route-recheck.timer — включи вручную: systemctl --user enable --now omavpn-route-recheck.timer"
+    # Однократный запуск без блокировки: OnUnitActiveSec отсчитывается от
+    # последнего запуска сервиса, и первый прогон должен случиться сразу, а не
+    # ждать OnActiveSec/OnBootSec.
+    systemctl --user start --no-block omavpn-route-audit.service >/dev/null 2>&1 || true
+    systemctl --user start --no-block omavpn-route-recheck.service >/dev/null 2>&1 || true
   else
     warn "systemctl не найден — таймеры аудита маршрутов не поставлены (bypass-status --route-audit можно запускать вручную)"
   fi

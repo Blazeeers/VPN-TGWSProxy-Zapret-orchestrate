@@ -351,14 +351,36 @@ def vpn_status(cli: str) -> dict:
     }
 
 
-def autotune_retry_seconds() -> int:
+def autotune_conf_int(name: str, default: int) -> int:
+    """Число из /etc/zapret-autotune.conf; мусор и отсутствие — default."""
     try:
         for line in _read_text("/etc/zapret-autotune.conf").splitlines():
-            if line.strip().startswith("RETRY_SECONDS="):
-                return int((line.split("=", 1)[1].strip() or "1800"))
+            if line.strip().startswith(f"{name}="):
+                return int((line.split("=", 1)[1].strip() or default))
     except ValueError:
         pass
-    return 1800
+    return default
+
+
+def autotune_retry_seconds() -> int:
+    return autotune_conf_int("RETRY_SECONDS", 1800)
+
+
+def autotune_retry_interval(key: str) -> int:
+    """Фактический интервал перепроверки: база × 2^неудач, но не больше потолка.
+
+    Автотюн в режиме vpn затухает: чем больше переборов подряд не нашли обход,
+    тем реже он повторяется. `retry_in` без этого врал бы и показывал «пора»
+    раньше времени.
+    """
+    base = autotune_retry_seconds()
+    cap = autotune_conf_int("RETRY_CAP_SECONDS", 21600)
+    try:
+        fails = int(_cache_text(key, "fails") or "0")
+    except ValueError:
+        fails = 0
+    fails = max(0, min(fails, 5))
+    return min(base * (2 ** fails), cap)
 
 
 def _cache_text(key: str, suffix: str) -> str:
@@ -406,7 +428,7 @@ def zapret_status(iface: str) -> dict:
         st["strategy"] = ps.get("strategy", "")
         st["isolated"] = bool(ps.get("isolated"))
 
-    retry = autotune_retry_seconds()
+    retry = autotune_retry_interval(key)
     last = 0
     try:
         last = int(_read_text(os.path.join(AUTOTUNE_DIR, f"{key}.lastscan")).strip() or "0")

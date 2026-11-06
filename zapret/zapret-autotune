@@ -45,6 +45,17 @@ CURL_BIN="$(command -v curl 2>/dev/null || echo /usr/bin/curl)"
 PROBE_STATE="$CACHE/probe.json"
 # Как часто в режиме vpn перепроверять, не появился ли рабочий обход (сек).
 RETRY_SECONDS="${RETRY_SECONDS:-1800}"
+# Если сеть не менялась и обход так и не нашёлся, полный перебор 28 стратегий
+# (5-8 минут + возможные перезапуски VPN) каждые полчаса — бессмысленная
+# нагрузка. Поэтому интервал растёт вдвое за каждую подряд неудачу
+# (1800 -> 3600 -> 7200 -> 14400), но не больше потолка. Счётчик сбрасывается,
+# как только перебор дал рабочую стратегию (или сеть сменилась — ключ другой).
+RETRY_CAP_SECONDS="${RETRY_CAP_SECONDS:-21600}"   # 6 часов
+FAILS_MAX="${FAILS_MAX:-5}"
+# Значения могут прийти из /etc/zapret-autotune.conf: мусор не должен ронять
+# арифметику в retry_interval (с ним перепроверка перестала бы работать вовсе).
+case "$RETRY_CAP_SECONDS" in ''|*[!0-9]*|0) RETRY_CAP_SECONDS=21600 ;; esac
+case "$FAILS_MAX" in ''|*[!0-9]*) FAILS_MAX=5 ;; esac
 
 # Глубокая проверка YouTube: страница + реальная скорость видео с googlevideo
 # (иначе «страница открывается, а видео не грузится»). yt-dlp — опционально.
@@ -298,16 +309,68 @@ PY
 probe_state_clear() { rm -f "$PROBE_STATE" 2>/dev/null || true; }
 
 # Периодическая перепроверка обхода в режиме vpn.
-scan_due() { # $1 ключ сети; 0 = пора перепроверять
-  local f="$CACHE/$1.lastscan" now last
+
+# Счётчик подряд неудачных переборов в режиме vpn: <кэш>/<сеть>.fails.
+# Битый или отсутствующий файл — 0 (иначе одна опечатка в кэше навсегда
+# отодвинула бы перепроверку на сутки).
+fails_get() { # $1 ключ сети -> число 0..FAILS_MAX
+  local n
+  n="$(cat "$CACHE/$1.fails" 2>/dev/null || true)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  [ "$n" -le "$FAILS_MAX" ] || n="$FAILS_MAX"
+  printf '%s' "$n"
+}
+fails_set() { # $1 ключ сети, $2 значение; атомарная запись, как у .lastscan
+  local tmp
+  tmp="$(mktemp "$CACHE/.$1.fails.XXXXXX" 2>/dev/null)" || return 0
+  if printf '%s\n' "$2" > "$tmp" 2>/dev/null && chmod 644 "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$CACHE/$1.fails" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+  return 0
+}
+
+# Интервал перепроверки: RETRY_SECONDS * 2^fails, не больше RETRY_CAP_SECONDS.
+retry_interval() { # $1 = fails
+  local n="${1:-0}" iv retry i=0
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  [ "$n" -le "$FAILS_MAX" ] || n="$FAILS_MAX"
+  case "$RETRY_SECONDS" in ''|*[!0-9]*|0) retry=1800 ;; *) retry="$RETRY_SECONDS" ;; esac
+  iv="$retry"
+  while [ "$i" -lt "$n" ] && [ "$iv" -lt "$RETRY_CAP_SECONDS" ]; do
+    iv=$(( iv * 2 ))
+    i=$(( i + 1 ))
+  done
+  [ "$iv" -gt "$RETRY_CAP_SECONDS" ] && iv="$RETRY_CAP_SECONDS"
+  printf '%s' "$iv"
+}
+
+# Сколько минут осталось до перепроверки (0 — пора).
+scan_wait_min() { # $1 ключ сети
+  local f="$CACHE/$1.lastscan" now last left
   now="$(date +%s)"
   last="$(cat "$f" 2>/dev/null || echo 0)"
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
-  [ $((now - last)) -ge "$RETRY_SECONDS" ]
+  left=$(( last + $(retry_interval "$(fails_get "$1")") - now ))
+  [ "$left" -gt 0 ] || left=0
+  printf '%s' $(( (left + 59) / 60 ))
+}
+
+scan_due() { # $1 ключ сети; 0 = пора перепроверять
+  [ "$(scan_wait_min "$1")" = 0 ]
 }
 mark_scan() { # $1 ключ сети
-  date +%s > "$CACHE/$1.lastscan" 2>/dev/null || true
-  chmod 644 "$CACHE/$1.lastscan" 2>/dev/null || true
+  local tmp
+  # Атомарно, как и счётчик: иначе оборванная запись оставила бы пустой файл,
+  # и следующая проверка увидела бы «сканов не было» (last=0 -> сразу пора).
+  tmp="$(mktemp "$CACHE/.$1.lastscan.XXXXXX" 2>/dev/null)" || return 0
+  if date +%s > "$tmp" 2>/dev/null && chmod 644 "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$CACHE/$1.lastscan" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+  return 0
 }
 
 # --- zapret -----------------------------------------------------------------
@@ -521,6 +584,39 @@ cache_direct() {
   else echo "youtube discord"; fi
 }
 
+# Класс режима по значению кэша: vpn (обход не тянет, всё в туннель) |
+# bypass (число: обход подобран) | other (off/custom/пусто — перезапуск не нужен).
+strategy_class() {
+  case "${1:-}" in
+    "") echo other ;;
+    vpn) echo vpn ;;
+    *[!0-9]*) echo other ;;
+    *) echo bypass ;;
+  esac
+}
+
+# Смена режима между vpn и числом (в любую сторону) — единственный случай, когда
+# конфиг VPN обязан пересобраться сам по себе: в режиме vpn видео-домены уходят в
+# туннель, а с рабочим обходом — напрямую (так решает zapret_active() в omavpn).
+# Без перезапуска VPN конфиг остаётся от прежнего режима.
+mode_switch_needs_restart() { # $1 прежняя стратегия, $2 новая
+  local a b
+  a="$(strategy_class "${1:-}")"; b="$(strategy_class "${2:-}")"
+  { [ "$a" = vpn ] && [ "$b" = bypass ]; } || { [ "$a" = bypass ] && [ "$b" = vpn ]; }
+}
+
+# Применение direct-списка + пересборка конфига VPN при смене режима vpn <-> число
+# (в этот момент новая стратегия уже записана в кэш, см. cache_set). Один
+# перезапуск на вызов: если direct-список уже изменился, apply_direct_change
+# перезапустит сам, и второй раз дёргать нечего.
+apply_direct_or_mode() { # $1 прежняя стратегия, $2 новая
+  local need=0
+  [ "$DIRECT_CHANGED" = 1 ] && need=1
+  if mode_switch_needs_restart "${1:-}" "${2:-}"; then need=1; fi
+  if [ "$need" = 1 ] && omavpn_running; then omavpn_restart; fi
+  return 0
+}
+
 omavpn_running() {
   [ -n "$USER_NAME" ] && [ -x "$OMAVPN" ] || return 1
   runuser -u "$USER_NAME" -- env HOME="$USER_HOME" XDG_RUNTIME_DIR="/run/user/$UID_N" \
@@ -602,6 +698,10 @@ all_writes_failed() { # $1 = сколько кандидатов не запис
 
 run_scan() {
   local key="$1" cf="$2" i rc use_probe=0 total="${#STRATEGIES[@]}" yt_ok=0 dc_ok=0 winner="" direct="" write_fail=0
+  # Стратегия до перебора (в rescan/force — то, что лежало в кэше): по ней видно,
+  # сменился ли режим vpn <-> число, и нужен ли перезапуск VPN.
+  local old_strat=""
+  [ -s "$cf" ] && old_strat="$(cat "$cf" 2>/dev/null || true)"
   probe_state_clear
 
   if probe_setup; then
@@ -630,7 +730,7 @@ run_scan() {
     if [ "$yt_ok" = 1 ] && [ "$dc_ok" = 1 ]; then
       log "сеть чистая: youtube и discord открываются напрямую -> zapret выключен"
       cache_set "$key" off "" "youtube discord"
-      set_direct "youtube discord"; apply_direct_change; probe_teardown; probe_state_clear
+      set_direct "youtube discord"; apply_direct_or_mode "$old_strat" "off"; probe_teardown; probe_state_clear
       return 0
     fi
 
@@ -653,12 +753,12 @@ run_scan() {
       if [ -n "$winner" ]; then
         log "стратегия для discord найдена: индекс $winner"
         cache_set "$key" "$winner" discord "youtube discord"
-        set_direct "youtube discord"; apply_direct_change
+        set_direct "youtube discord"; apply_direct_or_mode "$old_strat" "$winner"
       else
         log "для discord стратегия не найдена -> discord через VPN, youtube напрямую"
         zapret_off
         cache_set "$key" vpn "" "youtube"
-        set_direct "youtube"; apply_direct_change
+        set_direct "youtube"; apply_direct_or_mode "$old_strat" "vpn"
       fi
       probe_teardown; probe_state_clear
       return 0
@@ -680,14 +780,14 @@ run_scan() {
     if [ -n "$winner" ]; then
       log "рабочая стратегия найдена: индекс $winner (${STRATEGIES[$winner]})"
       cache_set "$key" "$winner" "youtube discord" "youtube discord"
-      set_direct "youtube discord"; apply_direct_change
+      set_direct "youtube discord"; apply_direct_or_mode "$old_strat" "$winner"
     else
       log "ни одна стратегия не сработала -> обход недоступен"
       zapret_off
       direct=""
       [ "$dc_ok" = 1 ] && direct="discord"
       cache_set "$key" vpn "" "$direct"
-      set_direct "$direct"; apply_direct_change
+      set_direct "$direct"; apply_direct_or_mode "$old_strat" "vpn"
     fi
     probe_teardown; probe_state_clear
     return 0
@@ -717,6 +817,12 @@ run_scan() {
     if test_targets; then
       log "рабочая стратегия найдена: индекс $i (${STRATEGIES[$i]})"
       cache_set "$key" "$i" "youtube discord" "youtube discord"
+      # Direct-список в этом режиме уже полный (ensure_direct_all выше), поэтому
+      # проверяем только смену режима: конфиг VPN собирается по zapret_active(),
+      # и после vpn -> число видео-домены должны вернуться в direct.
+      if mode_switch_needs_restart "$old_strat" "$i" && omavpn_running; then
+        omavpn_restart
+      fi
       probe_state_clear
       return 0
     fi
@@ -732,12 +838,21 @@ run_scan() {
     log "VPN не поднялся или цели не открылись (проверь профиль/ноду omavpn)"
   fi
   cache_set "$key" vpn "" ""
+  # ensure_vpn перезапускал VPN до записи новой стратегии (кэш ещё говорил
+  # «обход есть»), поэтому после записи режим vpn мог остаться не применённым к
+  # конфигу: видео-домены были бы direct при выключенном zapret.
+  if mode_switch_needs_restart "$old_strat" "vpn" && omavpn_running; then
+    omavpn_restart
+  fi
   probe_state_clear
   return 0
 }
 
 apply_cached() { # $1 = стратегия из кэша, $2 = ключ сети
   # 0 — применено и работает, 1 — не работает (нужен перебор), 2 — конфиг не пишется
+  # Перезапуск VPN по смене режима здесь не нужен: стратегия берётся из того же
+  # файла кэша, режим не меняется — конфиг пересобирает только apply_direct_change
+  # (если поменялся direct-список).
   local strat="$1" key="$2" optf svc direct
   svc="$(cache_services "$key")"
   direct="$(cache_direct "$key")"
@@ -772,7 +887,7 @@ apply_cached() { # $1 = стратегия из кэша, $2 = ключ сети
 }
 
 run() {
-  local force="${1:-}" tries=0 rc
+  local force="${1:-}" tries=0 rc fails
   while ! set_wan; do
     tries=$((tries + 1))
     if [ "$tries" -ge 3 ]; then
@@ -794,8 +909,11 @@ run() {
     strat="$(cat "$cf")"
     log "кэш: strategy=$strat, проверяю"
     if [ "$strat" = "vpn" ] && scan_due "$key"; then
-      log "vpn-режим: пора перепроверить обход (${RETRY_SECONDS}s) -> переподбор"
+      log "vpn-режим: пора перепроверить обход ($(retry_interval "$(fails_get "$key")")s) -> переподбор"
     else
+      if [ "$strat" = "vpn" ]; then
+        log "vpn-режим: следующая перепроверка через $(scan_wait_min "$key") мин (подряд неудач: $(fails_get "$key"))"
+      fi
       apply_cached "$strat" "$key"; rc=$?
       case "$rc" in
         0) log "кэш работает"; return 0 ;;
@@ -808,9 +926,20 @@ run() {
     fi
   fi
   # run_scan возвращает 1, если конфиг zapret не пишется вовсе: тогда прогон не
-  # считается выполненным (mark_scan не ставим) и код возврата — 1.
+  # считается выполненным (mark_scan и счётчик не трогаем), и код возврата — 1.
   run_scan "$key" "$cf" || return 1
   mark_scan "$key"
+  # Итог перебора в кэше: vpn — обход снова не нашёлся, копим неудачи, чтобы
+  # следующая попытка была реже. Число (или off) — сброс и обычный интервал.
+  if [ "$(cat "$cf" 2>/dev/null)" = "vpn" ]; then
+    fails=$(( $(fails_get "$key") + 1 ))
+    [ "$fails" -le "$FAILS_MAX" ] || fails="$FAILS_MAX"
+    fails_set "$key" "$fails"
+    log "обход не найден (подряд: $fails) -> следующая перепроверка реже"
+  elif [ "$(fails_get "$key")" != 0 ]; then
+    fails_set "$key" 0
+    log "обход найден -> счётчик неудачных переборов сброшен"
+  fi
 }
 
 main() {
@@ -828,7 +957,9 @@ main() {
   case "${1:-run}" in
     run)     run normal ;;
     rescan)  run force ;;
-    show)    ls -1 "$CACHE" 2>/dev/null | sed 's/\.strategy$//' | while read -r k; do printf '%-40s %s\n' "$k" "$(cat "$CACHE/$k.strategy" 2>/dev/null)"; done ;;
+    # Только записи стратегий: рядом лежат .lastscan/.services/.direct/.fails,
+    # и раньше они печатались пустыми строками как «сети».
+    show)    for f in "$CACHE"/*.strategy; do [ -e "$f" ] || continue; k="$(basename "$f" .strategy)"; printf '%-40s %s\n' "$k" "$(cat "$f" 2>/dev/null)"; done ;;
     tune-wan) write_lists; set_wan ;;
     probe-selftest)
       write_lists

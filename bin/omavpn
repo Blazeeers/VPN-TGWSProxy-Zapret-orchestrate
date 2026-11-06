@@ -60,6 +60,12 @@ HTTP_PORT = 10809
 TUN_IFACE = "omavpn0"
 TUN_ADDR = "172.19.0.1/30"
 
+# Кэш решений zapret-autotune (его CACHE): <ключ сети>.strategy. Число = для
+# этой сети подобран рабочий обход; `vpn` = обход не тянет; `off`/пусто =
+# обход выключен. Читается пользователем (файлы 0644, каталог world-readable).
+ZAPRET_CACHE = Path("/var/lib/zapret-autotune")
+ZAPRET_NO_BYPASS = ("vpn", "off", "")
+
 # Тест серверов (нод): на каждую ноду поднимается отдельный временный Xray на
 # свободном локальном SOCKS-порту, через него гоняются реальные пробы. Живой
 # VPN (xray + sing-box/TUN) при этом не трогается. Прогресс пишется в
@@ -135,6 +141,20 @@ ALWAYS_DIRECT_DOMAINS = [
 # путь до них ломается. Проверено 23.10.2026: 77.88.8.8 отдаёт для max.ru
 # 155.212.204.5 и отвечает за ~55 мс (через туннель — ~3 с).
 RU_DNS = "77.88.8.8"
+
+# DoH-bootstrap по IP-литералу. Имена серверов подписки резолвятся ДО туннеля, и
+# российский UDP-резолвер (`ru`) в этом месте — единственный путь на сетях, где
+# режут DNS провайдера, но он же и точка отказа: если провайдер отдаёт на
+# cloudflare-dns.com мусор, туннель не поднимается. Поэтому резервный путь —
+# сам DoH-резолвер по IP, без DNS-запроса: адрес известен заранее, а имя для
+# TLS-проверки сертификата задаётся отдельно (tls.server_name). IP выбирается
+# один раз на этапе сборки: TCP-probe 443, кэш на TTL, чтобы не платить
+# таймаутом на каждой сборке конфига.
+BOOTSTRAP_DOH_IPS = ("1.1.1.1", "1.0.0.1", "8.8.8.8")
+BOOTSTRAP_DOH_NAME = "cloudflare-dns.com"
+BOOTSTRAP_PROBE_TIMEOUT = 0.7      # на один IP, с
+BOOTSTRAP_CACHE_TTL = 600          # сколько доверять выбранному IP, с
+BOOTSTRAP_CACHE = STATE / "dns_bootstrap.json"
 
 # Домены, которые ВСЕГДА идут через VPN — даже если zapret-autotune вернул их
 # в direct_domains.txt. Причина (проверено 22.10.2026): youtubei.googleapis.com
@@ -390,6 +410,45 @@ def proxy_domains(overrides: dict | None = None) -> list:
     return result
 
 
+def net_key() -> str:
+    """Ключ текущей сети — по той же формуле, что netkey() в zapret-autotune.
+
+    Кэш решений автотюна адресуется этим ключом, и при расхождении решение не
+    прочитать. Wi-Fi опознаём по SSID (iwgetid, затем профиль nmcli), остальное —
+    по `net-<интерфейс>-<MAC шлюза>`. Внешние утилиты могут отсутствовать: их
+    ошибки не фатальны, в худшем случае вернётся net-...-unknown.
+    """
+    iface = _wan_iface()
+    ssid = _run_out(["iwgetid", "-r", iface], 2) if iface else ""
+    if not ssid:
+        line = _run_out(["nmcli", "-t", "-f", "GENERAL.CONNECTION",
+                         "device", "show", iface], 3) if iface else ""
+        ssid = line.split(":")[-1].strip() if line else ""
+    if ssid and iface:
+        key = f"wifi-{ssid}"
+    else:
+        gw = _run_out(["ip", "route", "show", "default"], 2)
+        gw = gw.split("via ")[1].split()[0] if "via " in gw else ""
+        mac = _run_out(["ip", "neigh", "show", gw], 2) if gw else ""
+        mac = mac.split("lladdr ")[1].split()[0] if "lladdr " in mac else gw
+        key = f"net-{iface or 'unknown'}-{mac or 'unknown'}"
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in key)
+
+
+def _strategy_mode() -> str | None:
+    """Стратегия обхода для текущей сети из кэша автотюна.
+
+    None — файла нет или он не читается (решение неизвестно, доверяем сервису).
+    Иначе — значение файла в нижнем регистре: число = zapret подобран, `vpn` =
+    обход не тянет, `off`/пусто = обход выключен.
+    """
+    try:
+        raw = (ZAPRET_CACHE / f"{net_key()}.strategy").read_bytes()
+    except OSError:
+        return None
+    return raw.decode("utf-8", "replace").strip().lower()
+
+
 def zapret_active() -> bool:
     """Работает ли zapret прямо сейчас (стратегия обхода активна).
 
@@ -397,13 +456,23 @@ def zapret_active() -> bool:
     идут напрямую (быстрее и не грузят туннель), а в режиме `vpn`/`off`
     zapret.service выключен — и тогда прямой путь для YouTube просто не
     работает (проверено на сети, где провайдер режет всё).
+
+    Одного `is-active` мало: автотюн оставляет сервис запущенным, а решение
+    «в этой сети обход не работает» хранит в кэше стратегии. Если там `vpn`,
+    `off` или пусто — обхода нет, и домены обязаны уйти в туннель.
     """
     try:
-        return subprocess.run(["systemctl", "is-active", "--quiet", "zapret.service"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=3).returncode == 0
+        service = subprocess.run(["systemctl", "is-active", "--quiet", "zapret.service"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 timeout=3).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+    if not service:
+        return False
+    mode = _strategy_mode()
+    if mode is None:
+        return True     # кэша нет — как раньше, верим состоянию сервиса
+    return mode not in ZAPRET_NO_BYPASS
 
 
 def direct_domains() -> list:
@@ -766,6 +835,15 @@ def settings() -> dict:
         s.update(data)
     else:
         warn(f"{SETTINGS}: ожидался объект настроек — беру умолчания")
+    # Наследие установок до 2.1.0: там TUN поднимался с mtu 9000 и стеком mixed
+    # (рвалось ~20% TLS к YouTube, mixed ломал туннель). Правим при чтении и
+    # ничего не пишем: файл настроек остаётся как есть, установка идемпотентна.
+    # Сборка конфига (build_singbox) и так берёт 1500/gvisor, но значения из
+    # старых settings.json не должны просочиться ни одному потребителю.
+    if _num(s.get("mtu"), 0) == 9000:
+        s["mtu"] = 1500
+    if str(s.get("stack") or "").strip().lower() == "mixed":
+        s["stack"] = "gvisor"
     return s
 
 
@@ -1609,6 +1687,16 @@ def node_meta(o: dict) -> tuple[str, str, str]:
     return tag, address, str(detail)
 
 
+def profile_display_name(index: int, cfg: dict) -> str:
+    """Имя профиля для вывода: remarks из подписки, иначе «Профиль N».
+
+    Общий для `profiles` и `update`: раньше update подставлял голый индекс,
+    когда remarks не было, и вывод двух команд расходился.
+    """
+    remarks = cfg.get("remarks") if isinstance(cfg, dict) else None
+    return str(remarks or f"Профиль {int(index) + 1}").strip()
+
+
 def profiles() -> list:
     out = []
     configs = get_configs()
@@ -1616,7 +1704,7 @@ def profiles() -> list:
         nodes = node_outbounds(cfg)
         out.append({
             "index": i,
-            "name": str(cfg.get("remarks") or f"Профиль {i + 1}").strip(),
+            "name": profile_display_name(i, cfg),
             "node_count": len(nodes),
         })
     return out
@@ -1842,6 +1930,38 @@ def build_xray(profile_index: int, node_index: int) -> dict:
     return cfg
 
 
+def _tcp_probe(ip: str, port: int = 443, timeout: float = BOOTSTRAP_PROBE_TIMEOUT) -> bool:
+    """Открывается ли TCP-соединение до `ip:port` (сеть может молча блокировать)."""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def bootstrap_doh_ip() -> str:
+    """IP-литерал доступного DoH-резолвера ("" — ни один не отвечает).
+
+    Первый живой IP из BOOTSTRAP_DOH_IPS кладём в STATE/dns_bootstrap.json
+    (`ip`, `checked`) и держим TTL. Неудача тоже кэшируется (ip=""), иначе на
+    сети с заблокированным 443 каждая сборка конфига тратила бы 3×0.7 с на
+    пробы; по истечении TTL попытка повторяется. Битый/чужой кэш — не повод
+    падать: просто перепроверяем.
+    """
+    cached = load_json(BOOTSTRAP_CACHE, {})
+    if isinstance(cached, dict):
+        ip = str(cached.get("ip") or "")
+        checked = _num(cached.get("checked"), 0)
+        if (ip == "" or ip in BOOTSTRAP_DOH_IPS) and 0 <= time.time() - checked < BOOTSTRAP_CACHE_TTL:
+            return ip
+    for ip in BOOTSTRAP_DOH_IPS:
+        if _tcp_probe(ip):
+            save_json(BOOTSTRAP_CACHE, {"ip": ip, "checked": time.time()})
+            return ip
+    save_json(BOOTSTRAP_CACHE, {"ip": "", "checked": time.time()})
+    return ""
+
+
 def build_singbox(profile_index: int, strict: bool) -> dict:
     ips, domains = server_endpoints(profile_index)
     # Re:filter: заблокированное в РФ добиваем в туннель. Наборы — только если
@@ -1874,28 +1994,50 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
     # Имена серверов подписки резолвим ДО туннеля. В подписке адреса нод —
     # домены, а `remote`-резолвер ходит через `proxy`: пока туннель не поднят,
     # Xray не может узнать IP сервера, а без IP не поднимется туннель. Замкнутый
-    # круг. Российский резолвер (`ru`) ходит напрямую, поэтому имена нод отдаём
-    # ему. На сетях, где режут DNS провайдера, это единственный способ поднять
-    # туннель; на обычных сетях результат тот же.
+    # круг. Поэтому имена нод отдаём резолверу, который ходит напрямую —
+    # `bootstrap` (DoH по IP), а если ни один IP не ответил, российскому `ru`,
+    # как было. На сетях, где режут DNS провайдера, это единственный способ
+    # поднять туннель; на обычных сетях результат тот же.
     bootstrap_domains = sorted(set(domains + ["cloudflare-dns.com"]))
-    bootstrap_rule = [{"domain": bootstrap_domains, "action": "route", "server": "ru"}]
+    # Резервный bootstrap-резолвер по IP (см. BOOTSTRAP_DOH_IPS). Ему нужно
+    # работать ДО того, как туннель поднимется. `server` — IP-литерал, поэтому
+    # DNS-запрос для него не нужен; `tls.server_name` оставляет проверку
+    # сертификата по имени.
+    #
+    # `detour` здесь НЕ ставим. Сингбокс проходит `check`, но падает на старте:
+    # «detour to an empty direct outbound makes no sense» — у обычного direct
+    # нет своих настроек. Без `detour` соединение DNS-сервера sing-box
+    # устанавливает сам, мимо маршрутов (то же самое, что у `ru`); страховочное
+    # правило `ip_cidr → direct` ниже добавляем и для его адреса.
+    bootstrap_ip = bootstrap_doh_ip()
+    bootstrap_server = "bootstrap" if bootstrap_ip else "ru"
+    bootstrap_rule = [{"domain": bootstrap_domains, "action": "route",
+                       "server": bootstrap_server}]
+    dns_servers = [
+        {"type": "https", "tag": "remote", "server": "cloudflare-dns.com",
+         "detour": "proxy"},
+        {"type": "udp", "tag": "ru", "server": RU_DNS},
+    ]
+    if bootstrap_ip:
+        dns_servers.append({"type": "https", "tag": "bootstrap", "server": bootstrap_ip,
+                            "tls": {"server_name": BOOTSTRAP_DOH_NAME}})
     return {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
-            # Два резолвера. `remote` (через туннель) — по умолчанию: DNS
+            # Три резолвера. `remote` (через туннель) — по умолчанию: DNS
             # провайдера для заблокированных доменов отдаёт недоступные IP, а
             # через туннель приходит «чистый» адрес. `ru` (российский DNS) — для
             # доменов, которые мы НИКОГДА не туннелируем (ALWAYS_DIRECT_DOMAINS):
             # им нужен именно российский адрес, а не зарубежный из туннеля.
+            # `bootstrap` (DoH по IP, только если IP ответил на пробу) — для имён
+            # серверов подписки и cloudflare-dns.com.
             #
-            # У `ru` НЕТ `detour`: `detour: direct` sing-box на старте отвергает
-            # («detour to an empty direct outbound makes no sense» — у обычного
-            # direct нет своих настроек, и обход бессмыслен).
-            "servers": [
-                {"type": "https", "tag": "remote", "server": "cloudflare-dns.com",
-                 "detour": "proxy"},
-                {"type": "udp", "tag": "ru", "server": RU_DNS},
-            ],
+            # У `ru` НЕТ `detour`: `detour: direct` sing-box отвергает для
+            # UDP-сервера («detour to an empty direct outbound makes no sense»).
+            # У `bootstrap` detour обязателен и допустим (схема проверена
+            # `sing-box check`): без него запрос ушёл бы в `final` = remote, то
+            # есть в туннель, который ещё не поднят.
+            "servers": dns_servers,
             # `action: route` — актуальная форма (с 1.11 поле адресата в правиле
             # DNS задаётся действием: dns.rules[].action + server).
             # `ru_domains` — ALWAYS_DIRECT_DOMAINS минус оверрайды `proxy`.
@@ -1936,13 +2078,14 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
             "rules": [
                 {"action": "sniff"},
                 {"protocol": "dns", "action": "hijack-dns"},
-                # Страховка, а не необходимость: адрес самого DNS-сервера `ru`
-                # sing-box резолвит/доставляет напрямую и без этого правила
-                # (проверено запуском). Правило оставлено на случай, если в
-                # будущей версии запрос к резолверу пойдёт по общим правилам —
-                # тогда он ушёл бы в туннель (final = proxy) и российский адрес
-                # не вернулся бы.
-                {"ip_cidr": [f"{RU_DNS}/32"], "outbound": "direct"},
+                # Страховка, а не необходимость: адреса самих DNS-серверов
+                # sing-box доставляет напрямую и без этого правила (проверено
+                # запуском). Правило оставлено на случай, если в будущей версии
+                # запрос к резолверу пойдёт по общим правилам — тогда он ушёл бы
+                # в туннель (final = proxy) и адрес не вернулся бы.
+                {"ip_cidr": [f"{RU_DNS}/32"]
+                            + ([f"{bootstrap_ip}/32"] if bootstrap_ip else []),
+                 "outbound": "direct"},
                 {"ip_is_private": True, "outbound": "direct"},
                 *forced_rule,
                 *ru_resolve,
@@ -2567,10 +2710,32 @@ def _wan_iface() -> str:
     return ""
 
 
+# Кэш caps_ok(): status() зовёт её на каждый опрос виджета, а getcap — внешний
+# процесс. Ключ — (mtime_ns, size) бинаря sing-box, срок — CAPS_TTL секунд.
+_caps_cache: tuple | None = None
+CAPS_TTL = 60.0
+
+
 def caps_ok() -> bool:
-    """Есть ли у sing-box CAP_NET_ADMIN (иначе TUN потребует root/пароль)."""
-    out = _run_out(["getcap", str(SB_BIN)], 5)
-    return "cap_net_admin" in out
+    """Есть ли у sing-box CAP_NET_ADMIN (иначе TUN потребует root/пароль).
+
+    Результат кэшируется в памяти процесса: меняется бинарь (setcap, обновление)
+    — меняется mtime, и кэш промахивается.
+    """
+    global _caps_cache
+    try:
+        st = SB_BIN.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    now = time.monotonic()
+    if _caps_cache is not None:
+        cached_stamp, cached_at, cached_ok = _caps_cache
+        if cached_stamp == stamp and (now - cached_at) < CAPS_TTL:
+            return cached_ok
+    ok = "cap_net_admin" in _run_out(["getcap", str(SB_BIN)], 5)
+    _caps_cache = (stamp, now, ok)
+    return ok
 
 
 def _index_valid(value) -> bool:
@@ -3189,21 +3354,34 @@ def probe_best(probes_quick: int = 2, timeout_quick: float = 3.5,
                 "loss": best["loss"], "probes": best["probes"],
             }
             if apply:
+                # Сначала проверяем конфиг для выбранной пары и только при успехе
+                # пишем настройки. Раньше set_settings шёл до проверки, и выбор,
+                # на котором конфиг не собирается, оставался в settings.json:
+                # каждый следующий запуск (guard, heal, автозапуск) падал на нём
+                # же (та же ловушка, что чинит `choose`). Хелпер тот же, что в
+                # `choose`, — логику не дублируем.
+                mode_plan = str(settings().get("mode") or "tun")
+                if mode_plan not in ("tun", "proxy"):
+                    mode_plan = "tun"
+                try:
+                    _validate_choice(cur_pi if keep_profile else best["profile"],
+                                     best["index"], mode_plan,
+                                     _truthy(settings().get("strict_route", False)))
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(
+                        "настройки не изменены: конфиг для «"
+                        + best["profile_name"] + "» · " + best["tag"]
+                        + " отклонён — " + str(exc)) from exc
                 if keep_profile:
                     # Авто-подбор: регион не трогаем, только сервер в нём.
                     set_settings(node_index=best["index"])
-                    state["applied"] = True
-                    state["reconnected"] = False
-                    if is_on():
-                        cmd_on(best["profile"], best["index"], None, quiet=True)
-                        state["reconnected"] = True
                 else:
                     set_settings(profile_index=best["profile"], node_index=best["index"])
-                    state["applied"] = True
-                    state["reconnected"] = False
-                    if is_on():
-                        cmd_on(best["profile"], best["index"], None, quiet=True)
-                        state["reconnected"] = True
+                state["applied"] = True
+                state["reconnected"] = False
+                if is_on():
+                    cmd_on(best["profile"], best["index"], None, quiet=True)
+                    state["reconnected"] = True
         else:
             state["error"] = "ни одна нода не ответила"
     except Exception as exc:  # noqa: BLE001
@@ -3668,7 +3846,7 @@ def main(argv: list) -> int:
                     restarted = True
                 except Exception as exc:  # noqa: BLE001
                     restart_error = str(exc)
-            pro = [{"index": i, "name": str(c.get("remarks") or i).strip(),
+            pro = [{"index": i, "name": profile_display_name(i, c),
                     "node_count": len(node_outbounds(c))} for i, c in enumerate(cfg)]
             payload = {"ok": True, "profiles": pro, "changed": changed,
                        "restarted": restarted}

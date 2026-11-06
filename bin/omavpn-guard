@@ -517,41 +517,6 @@ broken_services_quiet() {
 
 health_ok_quiet() { [ -z "$(broken_services_quiet)" ]; }
 
-# --- профиль omavpn --------------------------------------------------------
-# Миграция установок до 2.1.0: в старых версиях TUN поднимался с mtu 9000 и
-# стеком mixed, из-за чего рвалось ~20% TLS-соединений к YouTube, а mixed
-# ломал туннель целиком. Здесь правим установленный CLI один раз.
-# Когда 2.1.0 разойдётся, блок можно удалить (2.2.0).
-
-ensure_profile() {
-    local cnt changed=0
-    cnt=$(grep -c '"mtu": 9000' "$OMAVPN" 2>/dev/null); cnt=${cnt:-0}
-    if [ "${cnt:-0}" -eq 1 ]; then
-        cp -p "$OMAVPN" "$OMAVPN.bak-guard" 2>/dev/null
-        sed -i 's/"mtu": 9000/"mtu": 1500/' "$OMAVPN" && changed=1
-    fi
-    cnt=$(grep -c '"stack": "mixed"' "$OMAVPN" 2>/dev/null); cnt=${cnt:-0}
-    if [ "${cnt:-0}" -eq 1 ]; then
-        cp -p "$OMAVPN" "$OMAVPN.bak-guard" 2>/dev/null
-        sed -i 's/"stack": "mixed"/"stack": "gvisor"/' "$OMAVPN" && changed=1
-    fi
-    if [ "$changed" = "1" ]; then
-        # py_compile пишет __pycache__ в ~/.local/bin даже с -B (это лишь запрет
-        # импорта байткода, а не компиляции). Проверяем синтаксис компиляцией в
-        # памяти: ни следа на диске.
-        if python3 -c 'import sys; f = sys.argv[1]; compile(open(f, encoding="utf-8").read(), f, "exec")' \
-            "$OMAVPN" 2>/dev/null; then
-            log "профиль omavpn поправлен (mtu 1500 / stack gvisor)"
-        else
-            log "ОШИБКА: правка профиля сломала синтаксис — откатываю"
-            [ -f "$OMAVPN.bak-guard" ] && cp -p "$OMAVPN.bak-guard" "$OMAVPN"
-            return 1
-        fi
-        return 0
-    fi
-    return 2
-}
-
 # --- VPN -------------------------------------------------------------------
 
 vpn_up() {
@@ -1015,7 +980,6 @@ cmd_check() {
     fi
 
     if [ "$want" = "on" ] && [ "$VPN_BLOCKED" = 0 ]; then
-        if ensure_profile; then vpn_restart; fi
         if ! vpn_consistent; then
             log "VPN числится живым, но xray мёртв — перезапускаю"
             vpn_restart

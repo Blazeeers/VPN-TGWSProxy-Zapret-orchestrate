@@ -108,6 +108,9 @@ Panel {
   // по ним onRunningChanged понимает, что сброс из onExited не придёт.
   property bool statusAwait: false
   property bool vpnAwait: false
+  // У журнала своя очередь: если --note не стартовал, её надо продолжить
+  // (или очистить), иначе записи встанут до перезапуска оболочки.
+  property bool noteAwait: false
   // Одно и то же сообщение нужно в нескольких местах — держим его строкой.
   readonly property string startErrorText: "bypass-status не запускается — проверь " + root.scriptPath
   // Время последнего УДАЧНОГО снимка --json. Нужен, чтобы честно писать
@@ -677,6 +680,9 @@ Panel {
   // Отдельный инструмент: проверка раз в сутки (его собственный кэш), в виджете
   // — только чтение снимка раз в 5 минут. Без подтверждения ничего не ставит.
   readonly property string updaterPath: Quickshell.env("HOME") + "/.local/bin/omavpn-updater"
+  // Каталог выводим из того же пути — второй хардкод ~/.local/bin разошёлся бы
+  // с апдейтером, если путь когда-нибудь поменяется.
+  readonly property string updaterDir: root.updaterPath.substring(0, root.updaterPath.lastIndexOf("/"))
   property var up: ({})
   property bool upLoaded: false
   property bool stateAwait: false
@@ -1020,6 +1026,7 @@ Panel {
     else if (which === "state") stateProc.running = false
     else if (which === "upall") updateAllProc.running = false
     else if (which === "note") noteProc.running = false
+    else if (which === "fetch") fetchProc.running = false
     else if (which === "action") actionProc.running = false
     else if (which === "route") routeChangeProc.running = false
     else if (which === "route-list") routeListProc.running = false
@@ -1139,6 +1146,7 @@ Panel {
     var line = q.shift()
     root.noteQueue = q
     noteProc.command = [root.updaterPath, "--note", line]
+    root.noteAwait = true
     noteProc.running = true
   }
 
@@ -1827,18 +1835,28 @@ Panel {
   // сессию, результат — мягким текстом в разделе обновлений.
   Process {
     id: fetchProc
+    // Путь берём из updaterPath (без второго хардкода ~/.local/bin), а таймауты
+    // curl страхуют от «полуживой» сети: без них процесс висел бы до сторожа.
     command: ["bash", "-lc",
-      "mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/main/bin/omavpn-updater -o ~/.local/bin/omavpn-updater && chmod 755 ~/.local/bin/omavpn-updater"]
+      "mkdir -p '" + root.updaterDir + "' && curl -fsSL --connect-timeout 10 --max-time 60 --retry 2"
+        + " https://raw.githubusercontent.com/Blazeeers/VPN-TGWSProxy-Zapret-orchestrate/main/bin/omavpn-updater"
+        + " -o '" + root.updaterPath + "' && chmod 755 '" + root.updaterPath + "'"]
     stderr: StdioCollector { id: fetchErr; waitForEnd: true }
     // Не запустился сам bash — снимаем флаг, иначе повторов не будет вовсе.
     onRunningChanged: {
       if (running || !root.updaterFetching) return
       root.updaterFetching = false
-      root.upError = "обновления: не удалось получить omavpn-updater (нет сети?)"
+      if (root.takeTimeout("fetch"))
+        root.upError = "обновления: скачивание не ответило за 90 с — прервано"
+      else
+        root.upError = "обновления: не удалось получить omavpn-updater (нет сети?)"
     }
     onExited: function(code) {
+      var timedOut = root.takeTimeout("fetch")
       root.updaterFetching = false
-      if (code === 0) {
+      if (timedOut) {
+        root.upError = "обновления: скачивание не ответило за 90 с — прервано"
+      } else if (code === 0) {
         root.upError = ""
         root.refreshUpdater()
       } else {
@@ -1895,7 +1913,18 @@ Panel {
   Process {
     id: noteProc
     command: [root.updaterPath, "--note", "note|"]
+    // FailedToStart (нет omavpn-updater) не эмитит exited: без этой ветки метка
+    // ожидания и очередь записей вставали бы до перезапуска оболочки. Писать
+    // дальше бессмысленно — файла нет, поэтому очередь чистим и молчим: запись
+    // в журнал служебная, ошибку человеку не показываем.
+    onRunningChanged: {
+      if (running || !root.noteAwait) return
+      root.noteAwait = false
+      root.takeTimeout("note")
+      root.noteQueue = []
+    }
     onExited: function(code) {
+      root.noteAwait = false
       // Сторож noteWatch мог прервать запись: метку забираем здесь, иначе она
       // висит до конца сессии (никто, кроме нас, её не читает).
       root.takeTimeout("note")
@@ -2316,15 +2345,19 @@ Panel {
   Timer { id: auditWatch; interval: 1200000; running: auditProc.running; onTriggered: root.killProc("audit") }
   Timer { id: optimizeWatch; interval: 240000; running: optimizeProc.running; onTriggered: root.killProc("optimize") }
   Timer { id: rescanWatch; interval: 120000; running: rescanProc.running; onTriggered: root.killProc("rescan") }
-  // 90 с, а не 30: --state-json делает четыре сетевых запроса (GitHub, AUR,
-  // репозитории ядра) и на плохой сети честно идёт до ~80 с. Тридцатисекундный
-  // сторож рубил законную проверку и показывал ошибку.
+  // 90 с, а не 30: --state-json делает четыре сетевых запроса параллельно —
+  // manifest.json и install.sh из raw main, GitHub API по Xray-core и sing-box —
+  // и на плохой сети честно идёт до ~80 с. Тридцатисекундный сторож рубил
+  // законную проверку и показывал ошибку.
   Timer { id: stateWatch; interval: 90000; running: stateProc.running; onTriggered: root.killProc("state") }
   // 60 минут: ядро тянется с GitHub, а один шаг установки идёт в терминале с
   // паролем — человеку нужно время вернуться. Компоненты (zapret, tg-ws-proxy)
   // на плохой сети идут до 15–30 минут каждая.
   Timer { id: updateAllWatch; interval: 3600000; running: updateAllProc.running; onTriggered: root.killProc("upall") }
   Timer { id: noteWatch; interval: 20000; running: noteProc.running; onTriggered: root.killProc("note") }
+  // Скачивание апдейтера: в самом curl уже --connect-timeout 10 --max-time 60,
+  // сторож на 90 с — на случай зависшего bash (DNS, прокси, закрытая сеть).
+  Timer { id: fetchWatch; interval: 90000; running: fetchProc.running; onTriggered: root.killProc("fetch") }
   Timer { id: actionWatch; interval: 180000; running: actionProc.running; onTriggered: root.killProc("action") }
   // 3 минуты: сам set/unset короткий (перезапуск туннеля ~20 с), но на плохой
   // сети лок ctrl.lock ждётся дольше — ранний SIGTERM оставил бы полуприменённое
