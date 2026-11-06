@@ -390,6 +390,22 @@ def proxy_domains(overrides: dict | None = None) -> list:
     return result
 
 
+def zapret_active() -> bool:
+    """Работает ли zapret прямо сейчас (стратегия обхода активна).
+
+    Нужен, чтобы решать судьбу видео-доменов: на сети с рабочим обходом они
+    идут напрямую (быстрее и не грузят туннель), а в режиме `vpn`/`off`
+    zapret.service выключен — и тогда прямой путь для YouTube просто не
+    работает (проверено на сети, где провайдер режет всё).
+    """
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", "zapret.service"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=3).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def direct_domains() -> list:
     """Список direct-правила: ALWAYS_DIRECT + встроенные + файл/умолчания + оверрайды.
 
@@ -398,8 +414,10 @@ def direct_domains() -> list:
     Поэтому домены, которым положено идти в туннель, отсюда вычищаются — даже
     если их записал zapret-autotune (этот файл он перезаписывает сам).
 
-    BUILTIN_DIRECT_DOMAINS (видео YouTube) идут ПЕРЕД файлом: автотюн не должен
-    уводить видеотрафик в туннель. Снять их оттуда может только оверрайд
+    BUILTIN_DIRECT_DOMAINS (видео YouTube) идут ПЕРЕД файлом и только когда
+    zapret реально работает: автотюн не должен уводить видеотрафик в туннель,
+    но в режиме `vpn` (zapret выключен) прямой путь для видео недоступен, и
+    домены обязаны уйти в туннель. Снять их оттуда может и оверрайд
     `route set <домен> proxy` — правило proxy стоит первым.
     """
     over = route_overrides()
@@ -413,8 +431,9 @@ def direct_domains() -> list:
 
     for dom in ALWAYS_DIRECT_DOMAINS:
         add(dom)
-    for dom in BUILTIN_DIRECT_DOMAINS:
-        add(dom)
+    if zapret_active():
+        for dom in BUILTIN_DIRECT_DOMAINS:
+            add(dom)
     # Файл читается общим разборщиком: комментарии, пустые строки и мусор.
     for dom in _direct_file_domains()[0]:
         add(dom)
@@ -1852,6 +1871,14 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
     # срабатывает (проверено запуском).
     ru_resolve = [{"domain_suffix": ru_domains, "action": "resolve",
                    "server": "ru"}] if ru_domains else []
+    # Имена серверов подписки резолвим ДО туннеля. В подписке адреса нод —
+    # домены, а `remote`-резолвер ходит через `proxy`: пока туннель не поднят,
+    # Xray не может узнать IP сервера, а без IP не поднимется туннель. Замкнутый
+    # круг. Российский резолвер (`ru`) ходит напрямую, поэтому имена нод отдаём
+    # ему. На сетях, где режут DNS провайдера, это единственный способ поднять
+    # туннель; на обычных сетях результат тот же.
+    bootstrap_domains = sorted(set(domains + ["cloudflare-dns.com"]))
+    bootstrap_rule = [{"domain": bootstrap_domains, "action": "route", "server": "ru"}]
     return {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
@@ -1865,14 +1892,16 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
             # («detour to an empty direct outbound makes no sense» — у обычного
             # direct нет своих настроек, и обход бессмыслен).
             "servers": [
-                {"type": "udp", "tag": "remote", "server": "1.1.1.1", "detour": "proxy"},
+                {"type": "https", "tag": "remote", "server": "cloudflare-dns.com",
+                 "detour": "proxy"},
                 {"type": "udp", "tag": "ru", "server": RU_DNS},
             ],
             # `action: route` — актуальная форма (с 1.11 поле адресата в правиле
             # DNS задаётся действием: dns.rules[].action + server).
             # `ru_domains` — ALWAYS_DIRECT_DOMAINS минус оверрайды `proxy`.
-            "rules": ([{"domain_suffix": ru_domains, "action": "route", "server": "ru"}]
-                      if ru_domains else []),
+            "rules": (bootstrap_rule
+                      + ([{"domain_suffix": ru_domains, "action": "route", "server": "ru"}]
+                         if ru_domains else [])),
             "final": "remote",
             "strategy": "ipv4_only",
         },
