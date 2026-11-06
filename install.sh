@@ -460,6 +460,35 @@ say "Загружаю списки Re:filter (заблокированные в 
 "$LOCAL_BIN/omavpn" --json refilter update \
   || warn "Списки Re:filter не загрузились — обновятся по таймеру omavpn-refilter.timer (systemctl --user start omavpn-refilter.service)"
 
+# --- tg-ws-proxy: системный юнит должен смотреть на настоящий бинарь ----------
+# В tg-ws-proxy 1.11.4 появился системный юнит tg-ws-proxy.service с
+# ExecStart=/usr/bin/tg-ws-proxy, а там остаётся старый python-обёртыш. Без
+# drop-in автозапуск поднимает не тот бинарь, а guard видит «юнит мёртв» и
+# лечит Telegram по кругу.
+if command -v systemctl >/dev/null 2>&1 \
+   && systemctl --user cat tg-ws-proxy.service >/dev/null 2>&1; then
+  TG_UNIT_DIR="$HOME_DIR/.config/systemd/user/tg-ws-proxy.service.d"
+  TG_OVERRIDE="$TG_UNIT_DIR/override.conf"
+  mkdir -p "$TG_UNIT_DIR"
+  if [ -f "$TG_OVERRIDE" ]; then
+    # Сохраняем аргументы (--secret и пр.), меняем только путь.
+    sed -i 's|^ExecStart=/usr/bin/tg-ws-proxy|ExecStart=%h/.local/bin/tg-ws-proxy|' "$TG_OVERRIDE"
+    grep -q '^ExecStart=' "$TG_OVERRIDE" \
+      || printf '[Service]\nExecStart=%%h/.local/bin/tg-ws-proxy\n' >>"$TG_OVERRIDE"
+  else
+    printf '[Service]\nExecStart=%%h/.local/bin/tg-ws-proxy\n' >"$TG_OVERRIDE"
+  fi
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  systemctl --user enable tg-ws-proxy.service >/dev/null 2>&1 || true
+  # Прокси мог остаться запущенным вне systemd после обновления компонента:
+  # переводим его под юнит, чтобы автозапуск и проверки работали.
+  if pgrep -x tg-ws-proxy >/dev/null 2>&1 \
+     && ! systemctl --user is-active --quiet tg-ws-proxy.service; then
+    say "Перевожу tg-ws-proxy под systemd (иначе не будет автозапуска)…"
+    systemctl --user restart tg-ws-proxy.service >/dev/null 2>&1 || true
+  fi
+fi
+
 cat <<EOF
 
 Готово.

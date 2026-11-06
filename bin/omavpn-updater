@@ -884,6 +884,7 @@ def cmd_update(only: str) -> dict:
         # архива нельзя: получился бы молчаливый откат. Сравниваем версии и
         # отказываемся, показывая обе. Для одних компонентов (zapret, tg-ws-proxy)
         # архив репозитория не нужен — их обновление не блокируем.
+        stale_branch = False
         if only in ("widget", "core", "all"):
             error = bundle.ensure()
             if error:
@@ -895,15 +896,27 @@ def cmd_update(only: str) -> dict:
             new_version = str((remote_manifest or {}).get("version") or "")
             installed_manifest = _read_json(os.path.join(PLUGIN_DIR, "manifest.json"), {})
             installed_version = str((installed_manifest or {}).get("version") or "")
-            if (installed_version and new_version
-                    and _ver_tuple(new_version) < _ver_tuple(installed_version)):
-                message = (f"в ветке {BRANCH} версия {new_version}, установлена "
-                           f"{installed_version} — обновление отменено, это был бы откат")
-                log_action("update", f"{only}: {message}")
-                return {"ok": False, "only": only, "updated": False, "deferred": False,
-                        "restart_required": False, "messages": [message],
-                        "detail": {"versions": {"branch": new_version,
-                                                "installed": installed_version}}}
+            stale_branch = (bool(installed_version and new_version)
+                            and _ver_tuple(new_version) < _ver_tuple(installed_version))
+            if stale_branch:
+                stale_message = (
+                    f"в ветке {BRANCH} версия {new_version}, установлена "
+                    f"{installed_version} — скрипты и виджет не трогаю, это был бы откат")
+                if only != "all":
+                    log_action("update", f"{only}: {stale_message}")
+                    return {"ok": False, "only": only, "updated": False, "deferred": False,
+                            "restart_required": False, "messages": [stale_message],
+                            "detail": {"versions": {"branch": new_version,
+                                                    "installed": installed_version}}}
+                # Для «обновить всё» откат скриптов не повод отказывать целиком:
+                # компоненты (zapret, tg-ws-proxy) живут в своих репозиториях и
+                # от версии виджета не зависят. Их обновляем, репозиторные части
+                # пропускаем и говорим об этом прямо.
+                messages.append(stale_message)
+                detail["versions"] = {"branch": new_version,
+                                      "installed": installed_version}
+        else:
+            stale_branch = False
 
         if only in ("components", "all"):
             result = update_components()
@@ -918,7 +931,7 @@ def cmd_update(only: str) -> dict:
             detail["components"] = {k: v for k, v in result.items() if k != "results"}
 
         core_deferred = False
-        if only in ("core", "all"):
+        if only in ("core", "all") and not (only == "all" and stale_branch):
             result = update_core(bundle)
             messages += result.get("messages") or []
             core_deferred = bool(result.get("deferred"))
@@ -929,7 +942,7 @@ def cmd_update(only: str) -> dict:
                     messages.append(str(result["error"]))
             detail["core"] = {k: v for k, v in result.items() if k != "messages"}
 
-        if only in ("widget", "all"):
+        if only in ("widget", "all") and not (only == "all" and stale_branch):
             if only == "all" and core_deferred:
                 # Установщик в терминале уже ставит и ядро, и скрипты, и виджет.
                 # Копировать Panel.qml из того же архива, пока install.sh ещё

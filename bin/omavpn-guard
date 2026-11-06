@@ -43,7 +43,17 @@ DIRECT_FILE="$HOME_DIR/.config/omavpn/direct_domains.txt"
 SB_BIN="$HOME_DIR/.local/share/omavpn/bin/sing-box"
 AUTOTUNE_DIR="/var/lib/zapret-autotune"
 RESCAN_REQUEST="$HOME_DIR/.cache/zapret-autotune/rescan.request"
-TG_UNIT='app-tg\x2dws\x2dproxy@autostart.service'
+# Юнит tg-ws-proxy менялся: в 1.11.4 появился системный tg-ws-proxy.service,
+# до этого был автозапуск из .desktop. Смотрим оба, иначе после обновления
+# компонента guard считает Telegram сломанным и лечит его по кругу.
+TG_UNITS=('tg-ws-proxy.service' 'app-tg\x2dws\x2dproxy@autostart.service')
+tg_unit() {
+    local u
+    for u in "${TG_UNITS[@]}"; do
+        systemctl --user cat "$u" >/dev/null 2>&1 && { printf '%s' "$u"; return 0; }
+    done
+    printf '%s' "${TG_UNITS[1]}"
+}
 
 COOLDOWN=900        # ручное вмешательство в путь не чаще раза в 15 минут
 MAX_BACKOFF=3600    # потолок паузы после серии неудач
@@ -246,7 +256,7 @@ tun_needed() { [ "$(vpn_mode)" != "proxy" ]; }
 # сломанным (иначе guard будет зря включать VPN и слать тревоги).
 tg_installed() {
     command -v tg-ws-proxy >/dev/null 2>&1 && return 0
-    systemctl --user cat "$TG_UNIT" >/dev/null 2>&1
+    systemctl --user cat "$(tg_unit)" >/dev/null 2>&1
 }
 
 # Есть ли домены сервиса в direct-списке (= идут мимо VPN).
@@ -373,6 +383,19 @@ zapret_active() { systemctl is-active --quiet zapret.service 2>/dev/null; }
 # Идёт ли перебор стратегий прямо сейчас (автотюн ходит под своим flock).
 autotune_running() { systemctl is-active --quiet zapret-autotune.service 2>/dev/null; }
 
+# Перебор идёт или только что закончился. Во время перебора zapret
+# перезапускается каждые ~20 секунд, и проверки guard видят «всё сломано»:
+# так он набирал ложные неудачи и уходил в паузу на 30 минут сразу после
+# удачного подбора. Пока идёт подбор (или прошло меньше 30 секунд после
+# последней пробы), проверку пропускаем, счётчик неудач не трогаем.
+autotune_testing() {
+    autotune_running && return 0
+    local probe="$AUTOTUNE_DIR/probe.json" ts
+    [ -f "$probe" ] || return 1
+    ts=$(stat -c %Y "$probe" 2>/dev/null || echo 0)
+    [ $(( $(now) - ts )) -le 30 ]
+}
+
 request_rescan() {
     # Свой перебор уже идёт — второй запрос только сбил бы его и добавил
     # guard'у ложное «перебор не начался».
@@ -497,8 +520,14 @@ svc_discord_ok() {
 }
 
 svc_telegram_ok() {
-    local code
-    systemctl --user is-active --quiet "$TG_UNIT" 2>/dev/null || return 1
+    local code unit
+    unit=$(tg_unit)
+    # Юнит активен — норма. Если прокси жив, но запущен вне systemd (старое
+    # поведение обновлятора), сервис всё равно работает: не считаем это
+    # поломкой, иначе guard лечит Telegram по кругу.
+    if ! systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+        pgrep -x tg-ws-proxy >/dev/null 2>&1 || return 1
+    fi
     code=$(http_code https://api.telegram.org/)
     [ "$code" = "200" ] || [ "$code" = "302" ] || return 1
     [ "$(http_code https://web.telegram.org/)" = "200" ]
@@ -701,7 +730,10 @@ route_force() {
 
 restart_tg() {
     log "перезапускаю tg-ws-proxy"
-    systemctl --user restart "$TG_UNIT" >/dev/null 2>&1
+    local unit
+    unit=$(tg_unit)
+    systemctl --user restart "$unit" >/dev/null 2>&1 \
+        || systemctl --user enable --now "$unit" >/dev/null 2>&1
     sleep 5
     svc_telegram_ok
 }
@@ -949,6 +981,14 @@ cmd_check() {
 
     reset_on_net_change
     want=$(intent_update)
+
+    # Перебор стратегий временно останавливает zapret и перезапускает VPN:
+    # проверки в этот момент видят «сломано всё» и копят ложные неудачи.
+    # Пропускаем прогон целиком — ни лечения, ни паузы.
+    if autotune_testing; then
+        log "идёт перебор стратегий zapret — проверку пропускаю"
+        return 0
+    fi
 
     # caps нужны только для TUN. В режиме proxy их отсутствие — не поломка:
     # Telegram (локальный прокси) и VPN через socks работают и без них.

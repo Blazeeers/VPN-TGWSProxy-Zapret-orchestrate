@@ -33,7 +33,11 @@ TGWS_REPO = "Flowseal/tg-ws-proxy"
 TGWS_VERSION_FILE = os.path.join(HOME, ".local", "share", "tgwsproxy", "version")
 # Юнит автозапуска tg-ws-proxy, который systemd-xdg-autostart-generator делает
 # из ~/.config/autostart/tg-ws-proxy.desktop (дефис в имени экранирован).
-TGWS_UNIT = "app-tg\\x2dws\\x2dproxy@autostart.service"
+# Имя юнита tg-ws-proxy менялось: до 1.11.x это был автозапуск из .desktop
+# (`app-tg\\x2dws\\x2dproxy@autostart.service`), в 1.11.4 появился системный
+# `tg-ws-proxy.service`. Держим оба: иначе после обновления компонента юнит
+# «мёртв» для проверок и автозапуск не работает.
+TGWS_UNITS = ("tg-ws-proxy.service", "app-tg\\x2dws\\x2dproxy@autostart.service")
 UPDATES_MAX_AGE = 7 * 24 * 3600
 YOUTUBE_CACHE_AGE = 30 * 60
 RESCAN_REQUEST = os.path.join(HOME, ".cache", "zapret-autotune", "rescan.request")
@@ -1675,6 +1679,64 @@ def run_route_audit() -> dict:
                                                  "reason": ROUTE_AUDIT_REASON}
                         _route_restore(cli, dom, prev)
                         overrides[dom] = prev
+        # --- фаза 0b: обход снова работает — возвращаем сервисы напрямую --
+        # Оверрайд "proxy" аудит ставит, когда прямой путь не отвечал. Когда
+        # zapret снова подобрал рабочую стратегию, держать сервис в туннеле
+        # незачем: это лишняя нагрузка и зарубежный выход. Снимаем только свои
+        # оверрайды и только для доменов, у которых есть готовая проба.
+        zp = zapret_status(wan_iface())
+        if (cli and socks and zp.get("service") == "active"
+                and str(zp.get("mode") or "").isdigit()):
+            probe_by_dom = {p["domain"]: p for p in ROUTE_PROBES}
+            freed: list[tuple] = []
+            saved_free: dict = {}
+            for dom in list(overrides):
+                ent = overrides.get(dom) or {}
+                if str(ent.get("path") or "") != "proxy":
+                    continue
+                if not str(ent.get("reason") or "").startswith(ROUTE_REASON_PREFIX):
+                    continue
+                if dom in NEVER_PROXY_DOMAINS:
+                    continue
+                probe = probe_by_dom.get(dom)
+                if not probe:
+                    continue
+                if route_cooldown(state, dom, "direct") > 0:
+                    continue
+                ok, _res, detail = _probe_once(probe)
+                if not ok:
+                    # Прямой путь всё ещё мёртв — запоминаем неудачу с кулдауном,
+                    # чтобы не пробовать снова каждые 10 минут.
+                    route_state_mark(state, dom, "direct", False)
+                    continue
+                un = cli_json_slow(cli, "route", "unset", dom, "--no-restart")
+                if not un.get("ok"):
+                    continue
+                saved_free[dom] = ent
+                overrides.pop(dom, None)
+                freed.append((dom, detail))
+            if freed:
+                restarted, why_restart = _restart_vpn(cli)
+                if restarted:
+                    time.sleep(ROUTE_SETTLE)
+                    ctx = route_context(app, cli)
+                    rules = ctx["rules"]
+                    for dom, detail in freed:
+                        result["actions"].append({
+                            "domain": dom, "from": "proxy", "to": "direct",
+                            "reason": "обход снова работает — вернул напрямую",
+                            "ok": True, "detail": detail})
+                else:
+                    for dom, _detail in freed:
+                        prev = saved_free.get(dom) or {"path": "proxy",
+                                                       "reason": ROUTE_AUDIT_REASON}
+                        _route_restore(cli, dom, prev)
+                        overrides[dom] = prev
+                        result["actions"].append({
+                            "domain": dom, "from": "proxy", "to": "proxy",
+                            "reason": "обход работает, но VPN не перезапустился",
+                            "ok": False, "detail": why_restart})
+
         probes: list[dict] = []
         actions: list[dict] = []
         forward: list[dict] = []   # прямому пути плохо → пробуем туннель
@@ -2328,9 +2390,18 @@ def _launch_in_terminal(command: str) -> bool:
         return False
 
 
+def tgws_unit() -> str:
+    """Имя существующего юнита tg-ws-proxy (новое системное или старое автозапуска)."""
+    for unit in TGWS_UNITS:
+        rc, _ = run_rc(["systemctl", "--user", "cat", unit], timeout=8)
+        if rc == 0:
+            return unit
+    return TGWS_UNITS[-1]
+
+
 def tgws_unit_active() -> bool:
-    """Запущен ли tg-ws-proxy как юнит автозапуска, а не как случайный процесс."""
-    rc, _ = run_rc(["systemctl", "--user", "is-active", "--quiet", TGWS_UNIT],
+    """Запущен ли tg-ws-proxy как юнит, а не как случайный процесс."""
+    rc, _ = run_rc(["systemctl", "--user", "is-active", "--quiet", tgws_unit()],
                    timeout=8)
     return rc == 0
 
@@ -2376,10 +2447,19 @@ def update_tgwsproxy() -> dict:
         # юнита, systemd помечал юнит завершённым, а guard следом поднимал его
         # заново. Второй экземпляр не мог занять 1443, но оставался висеть
         # с треем — и в системе оказывались два tg-ws-proxy.
-        if unit_active:
-            rc, _ = run_rc(["systemctl", "--user", "restart", TGWS_UNIT], timeout=90)
+        unit = tgws_unit()
+        if unit_active or run_rc(["systemctl", "--user", "cat", unit],
+                                 timeout=8)[0] == 0:
+            # Юнит есть — работаем только через systemd: иначе процесс
+            # остаётся вне cgroup, `is-active` врёт, а автозапуск после
+            # перезагрузки не поднимает прокси (так и случилось на 1.11.4).
+            rc, _ = run_rc(["systemctl", "--user", "restart", unit], timeout=90)
+            if rc != 0:
+                rc, _ = run_rc(["systemctl", "--user", "enable", "--now", unit],
+                               timeout=90)
             if rc == 0:
-                return {"ok": True, "version": version, "restarted": True}
+                return {"ok": True, "version": version, "restarted": True,
+                        "unit": unit}
         run(["pkill", "-x", "tg-ws-proxy"])
         time.sleep(0.7)
         subprocess.Popen([binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
