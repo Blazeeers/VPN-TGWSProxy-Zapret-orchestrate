@@ -878,6 +878,33 @@ def cmd_update(only: str) -> dict:
     detail: dict = {}
 
     try:
+        # Предохранитель от отката: ветка канала (BRANCH) может оказаться старше
+        # установленной версии — например, локальная сборка 3.0.0 ещё не в main,
+        # или релиз откатили. Копировать в таком случае скрипты и Panel.qml из
+        # архива нельзя: получился бы молчаливый откат. Сравниваем версии и
+        # отказываемся, показывая обе. Для одних компонентов (zapret, tg-ws-proxy)
+        # архив репозитория не нужен — их обновление не блокируем.
+        if only in ("widget", "core", "all"):
+            error = bundle.ensure()
+            if error:
+                return {"ok": False, "only": only, "updated": False, "deferred": False,
+                        "restart_required": False,
+                        "messages": [f"не удалось скачать обновление: {error}"],
+                        "detail": {}}
+            remote_manifest = _read_json(os.path.join(bundle.root, "manifest.json"), {})
+            new_version = str((remote_manifest or {}).get("version") or "")
+            installed_manifest = _read_json(os.path.join(PLUGIN_DIR, "manifest.json"), {})
+            installed_version = str((installed_manifest or {}).get("version") or "")
+            if (installed_version and new_version
+                    and _ver_tuple(new_version) < _ver_tuple(installed_version)):
+                message = (f"в ветке {BRANCH} версия {new_version}, установлена "
+                           f"{installed_version} — обновление отменено, это был бы откат")
+                log_action("update", f"{only}: {message}")
+                return {"ok": False, "only": only, "updated": False, "deferred": False,
+                        "restart_required": False, "messages": [message],
+                        "detail": {"versions": {"branch": new_version,
+                                                "installed": installed_version}}}
+
         if only in ("components", "all"):
             result = update_components()
             messages += result.get("messages") or []
