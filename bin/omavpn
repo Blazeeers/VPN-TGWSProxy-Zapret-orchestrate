@@ -2010,27 +2010,35 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
     # устанавливает сам, мимо маршрутов (то же самое, что у `ru`); страховочное
     # правило `ip_cidr → direct` ниже добавляем и для его адреса.
     bootstrap_ip = bootstrap_doh_ip()
-    bootstrap_server = "bootstrap" if bootstrap_ip else "ru"
+    # `ru` — резолвер для доменов, которые всегда идут напрямую, и для имён
+    # серверов подписки. UDP/53 во многих сетях режут целиком (проверено
+    # 10.11.2026 в сети OVR_Wi-Fi5: не отвечали ни 77.88.8.8, ни 8.8.8.8),
+    # поэтому основной вариант — DoH по IP-литералу: адрес известен заранее,
+    # DNS-запрос для самого резолвера не нужен, TLS-имя задаётся отдельно.
+    # Ответы при этом гео-корректные: ya.ru и max.ru получают российские
+    # адреса. Если ни один IP не ответил на пробу — остаётся прежний UDP.
+    if bootstrap_ip:
+        ru_server = {"type": "https", "tag": "ru", "server": bootstrap_ip,
+                     "tls": {"server_name": BOOTSTRAP_DOH_NAME}}
+    else:
+        ru_server = {"type": "udp", "tag": "ru", "server": RU_DNS}
     bootstrap_rule = [{"domain": bootstrap_domains, "action": "route",
-                       "server": bootstrap_server}]
+                       "server": "ru"}]
     dns_servers = [
         {"type": "https", "tag": "remote", "server": "cloudflare-dns.com",
          "detour": "proxy"},
-        {"type": "udp", "tag": "ru", "server": RU_DNS},
+        ru_server,
     ]
-    if bootstrap_ip:
-        dns_servers.append({"type": "https", "tag": "bootstrap", "server": bootstrap_ip,
-                            "tls": {"server_name": BOOTSTRAP_DOH_NAME}})
     return {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
-            # Три резолвера. `remote` (через туннель) — по умолчанию: DNS
+            # Два резолвера. `remote` (через туннель) — по умолчанию: DNS
             # провайдера для заблокированных доменов отдаёт недоступные IP, а
             # через туннель приходит «чистый» адрес. `ru` (российский DNS) — для
             # доменов, которые мы НИКОГДА не туннелируем (ALWAYS_DIRECT_DOMAINS):
             # им нужен именно российский адрес, а не зарубежный из туннеля.
-            # `bootstrap` (DoH по IP, только если IP ответил на пробу) — для имён
-            # серверов подписки и cloudflare-dns.com.
+            # `ru` — DoH по IP (или UDP, если IP не ответил): имён серверов подписки
+            # и российских доменов.
             #
             # У `ru` НЕТ `detour`: `detour: direct` sing-box отвергает для
             # UDP-сервера («detour to an empty direct outbound makes no sense»).
