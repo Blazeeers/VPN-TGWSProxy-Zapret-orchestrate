@@ -4,7 +4,7 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [SemVer](https://semver.org/lang/ru/).
 
-## [Unreleased]
+## [3.0.1] — 2026-11-10
 
 ### Fixed — VPN в сетях, где заблокирован UDP/53
 - **Российский резолвер переведён с UDP на DoH по IP.** В сети, где UDP/53
