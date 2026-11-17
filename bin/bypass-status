@@ -59,6 +59,16 @@ HEALTH_LOCK = os.path.join(HOME, ".cache", "bypass-status", "health.lock")
 # панели и каждые 5 минут, а heal — это перезапуск туннеля. При «VPN есть,
 # трафик не идёт» выходило 288 рестартов в сутки.
 HEAL_MIN_GAP = 45 * 60
+# Мёртвый туннель («TUN есть, трафика нет»: VPN плох и НИ ОДНА сетевая проба не
+# отвечает) — это полная потеря связи, и 45 минут тишины в нём дорого стоят.
+# Здесь ждём 10 минут. Меньше нельзя: `omavpn heal` сам ограничен min_gap=600 с
+# (bin/omavpn) и на более частый вызов вернёт {"reason": "throttled"}, а
+# mark_heal стоит ДО разбора результата — попытка сгорела бы впустую, и туннель
+# всё равно поднимался бы не чаще раза в 10 минут.
+HEAL_MIN_GAP_SICK = 10 * 60
+# Пробы, по которым видно, что трафик не идёт. zapret и tg-ws-proxy сюда не
+# входят: это местные службы, за проходимость туннеля они не отвечают.
+TRAFFIC_PROBES = ("youtube", "discord", "deepseek", "telegram")
 DISCORD_GATEWAY = "https://discord.com/api/v9/gateway"
 DEEPSEEK_URL = "https://api.deepseek.com/"
 
@@ -940,11 +950,27 @@ def heal_state_path(app: str) -> str:
     return os.path.join(HOME, ".cache", app, "heal-state.json") if app else ""
 
 
-def heal_allowed(app: str) -> tuple[bool, float]:
+def tunnel_dead(items: list) -> bool:
+    """VPN плох и все сетевые пробы молчат — «TUN есть, трафика нет».
+
+    Один сломанный сервис сюда не попадает: при выпавшем YouTube, Discord или
+    DeepSeek перезапуск туннеля не помогает, и частый heal рвал бы рабочее
+    соединение. Состояние `idle` у пробы (Telegram при не поднятом VPN) считаем
+    молчанием: ответа нет ровно потому, что трафик не идёт.
+    """
+    if not any(i.get("id") == "vpn" and i.get("state") == "bad" for i in items):
+        return False
+    probes = [i for i in items if i.get("id") in TRAFFIC_PROBES]
+    return bool(probes) and all(i.get("state") in ("bad", "idle") for i in probes)
+
+
+def heal_allowed(app: str, min_gap: float = HEAL_MIN_GAP) -> tuple[bool, float]:
     """(можно лечить VPN, сколько секунд ещё ждать).
 
     Формат файла — {"ts": <когда последний раз лечили>}. Отдельный файл, а не
     health.json: тот перезаписывается каждым прогоном, и кулдаун терялся бы.
+    `min_gap` — окно ожидания: 45 минут обычно и 10 минут для мёртвого туннеля
+    (см. HEAL_MIN_GAP_SICK). Файл и его формат от этого не меняются.
     """
     path = heal_state_path(app)
     if not path:
@@ -955,7 +981,7 @@ def heal_allowed(app: str) -> tuple[bool, float]:
     last = _num(data.get("ts"))
     if not last:
         return True, 0.0
-    left = last + HEAL_MIN_GAP - time.time()
+    left = last + min_gap - time.time()
     return left <= 0, max(0.0, left)
 
 
@@ -986,7 +1012,9 @@ def run_health(heal_vpn: bool = True) -> dict:
         # VPN подключён, но не работает → пробуем вылечить (с ограничением частоты)
         vpn_item = next((i for i in items if i["id"] == "vpn"), None)
         if heal_vpn and cli and vpn_item and vpn_item["state"] == "bad":
-            allowed, wait = heal_allowed(app)
+            # Мёртвый туннель — 10 минут, «отвалился один сервис» — 45 как было.
+            gap = HEAL_MIN_GAP_SICK if tunnel_dead(items) else HEAL_MIN_GAP
+            allowed, wait = heal_allowed(app, gap)
             if not allowed:
                 # Перезапуск туннеля — тяжёлая операция, а --health зовётся
                 # каждые 5 минут и при каждом открытии панели.
