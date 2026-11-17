@@ -458,6 +458,21 @@ def _strategy_mode() -> str | None:
     return raw.decode("utf-8", "replace").strip().lower()
 
 
+def zapret_service_active() -> bool:
+    """Запущен ли zapret.service (без учёта решения автотюна по этой сети).
+
+    Отдельно от `zapret_active()`: проверке живого YouTube нужны оба факта по
+    раздельности, чтобы честно написать причину — «сервис выключен» и «сервис
+    жив, но стратегия сети `vpn`» лечатся по-разному.
+    """
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", "zapret.service"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=3).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def zapret_active() -> bool:
     """Работает ли zapret прямо сейчас (стратегия обхода активна).
 
@@ -470,13 +485,7 @@ def zapret_active() -> bool:
     «в этой сети обход не работает» хранит в кэше стратегии. Если там `vpn`,
     `off` или пусто — обхода нет, и домены обязаны уйти в туннель.
     """
-    try:
-        service = subprocess.run(["systemctl", "is-active", "--quiet", "zapret.service"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 timeout=3).returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
-    if not service:
+    if not zapret_service_active():
         return False
     mode = _strategy_mode()
     if mode is None:
@@ -519,6 +528,347 @@ def direct_domains() -> list:
         if ent["path"] == "direct":
             add(dom)
     return result
+
+
+# --------------------------------------------------------------------------- #
+# YouTube: живая проба обхода и перевод группы доменов в туннель
+# --------------------------------------------------------------------------- #
+
+# Причина оверрайдов, которые ставит автоматика (`omavpn youtube proxy`,
+# omavpn-guard). По этому префиксу возврат отличает свои правила от ручных:
+# чужой `route set youtube.com proxy` он снимать не имеет права.
+YOUTUBE_REASON_PREFIX = "аудит: обход не пропускает YouTube"
+YOUTUBE_REASON_BACK = "аудит: обход снова пропускает YouTube"
+# Так причину называла прежняя версия guard'а (до правила «группа доменов»).
+# Считаем её своей: иначе уже стоящий `youtube.com proxy` не расширить до всей
+# группы и не снять при возврате — `route list` показывал бы чужое решение, а
+# аудит маршрутов (bypass-status) уже научен такую причину не трогать.
+YOUTUBE_LEGACY_REASON = "аудит: guard — обход не тянет"
+
+
+def _youtube_own_reason(reason) -> bool:
+    """Оверрайд поставлен правилом YouTube→VPN (включая legacy-причину)."""
+    text = str(reason or "")
+    return (text.startswith(YOUTUBE_REASON_PREFIX)
+            or text.startswith(YOUTUBE_LEGACY_REASON))
+
+# Проба обхода: три точки, которые вместе дают «настоящий контент», а не просто
+# код ответа — тот же набор доказательств, что у svc_youtube_ok в omavpn-guard.
+# Одна проба ≈ 1 с на живой сети и до timeout на мёртвой, поэтому таймаут общий
+# на точку, а не на всю проверку.
+YOUTUBE_PROBE_TIMEOUT = 6.0
+YOUTUBE_PAGE_URL = "https://www.youtube.com/"
+YOUTUBE_ICON_URL = "https://www.youtube.com/favicon.ico"
+YOUTUBE_CDN_URL = "https://redirector.googlevideo.com/generate_204"
+YOUTUBE_PAGE_MARKERS = ("ytimg", "youtube")
+
+
+def youtube_group_domains() -> list:
+    """Домены YouTube, которые уходят в туннель одной группой.
+
+    Источник — BUILTIN_DIRECT_DOMAINS: это ровно то, что direct_domains()
+    подмешивает в direct-правило при живом обходе, и ничего лишнего. Отдельный
+    список «домены YouTube» разошёлся бы с конфигом при первой правке — именно
+    так оверрайд одного youtube.com перестал вытаскивать видео из мёртвого
+    обхода (страница через VPN, а googlevideo/ytimg — напрямую).
+
+    youtubei.googleapis.com сюда не входит намеренно: он в ALWAYS_PROXY_DOMAINS
+    и всегда в туннеле, переводить его некуда.
+    """
+    return list(BUILTIN_DIRECT_DOMAINS)
+
+
+def _wan_ipv4(iface: str) -> str:
+    """IPv4 физического интерфейса — доказательство, что проба шла мимо TUN."""
+    if not iface:
+        return ""
+    out = _run_out(["ip", "-4", "-o", "addr", "show", "dev", iface], 3)
+    match = re.search(r"\binet (\d+\.\d+\.\d+\.\d+)", out)
+    return match.group(1) if match else ""
+
+
+def _probe_http(url: str, timeout: float = YOUTUBE_PROBE_TIMEOUT, iface: str = "",
+                keep_body: bool = False) -> dict:
+    """GET через curl: код, тип, размер, локальный адрес и (по запросу) тело.
+
+    curl, а не urllib: guard проверяет YouTube теми же запросами (включая `-L`
+    на региональные редиректы), а расхождение двух проверок одного сервиса уже
+    давало «health говорит жив, аудит говорит мёртв». `--interface` — это
+    SO_BINDTODEVICE: при поднятом TUN проба иначе ушла бы в туннель и мерила бы
+    VPN, а не обход (проверено: local_ip при этом равен адресу физического
+    интерфейса).
+    """
+    cmd = ["curl", "-4", "-s", "-L", "--max-time", str(timeout),
+           "-w", "\n%{http_code}\t%{content_type}\t%{size_download}\t%{local_ip}"]
+    if iface:
+        cmd += ["--interface", iface]
+    cmd.append(url)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout + 4)
+    except (OSError, subprocess.SubprocessError):
+        return {"code": 0, "ctype": "", "size": 0, "local_ip": "", "body": ""}
+    raw = (proc.stdout or b"").decode("utf-8", "replace")
+    body, _, tail = raw.rpartition("\n")
+    fields = tail.split("\t")
+    code = size = 0
+    try:
+        code = int(fields[0])
+        size = int(float(fields[2])) if len(fields) > 2 else 0
+    except (ValueError, IndexError):
+        code = 0
+    return {"code": code,
+            "ctype": fields[1] if len(fields) > 1 else "",
+            "size": size,
+            "local_ip": fields[3] if len(fields) > 3 else "",
+            "body": body[:200000] if keep_body else ""}
+
+
+def youtube_path_now() -> dict:
+    """Текущий путь youtube.com и источник решения — без сети (для статуса)."""
+    for row in route_entries():
+        if row["domain"] == "youtube.com":
+            return row
+    return {"domain": "youtube.com", "path": "proxy", "source": "final",
+            "reason": "", "ts": 0, "age": None}
+
+
+def youtube_group_state(over: dict | None = None) -> dict:
+    """Группа YouTube: кто уже в туннеле и какие оверрайды наши.
+
+    `over` — уже прочитанные оверрайды (см. route_entries): не читаем файл
+    второй раз внутри лока.
+
+    Фактический путь считается с поправкой на `zapret_active()`: встроенные
+    видео-домены попадают в direct-правило только при живом обходе
+    (`direct_domains()`), поэтому в режиме `vpn`/`off` они и без оверрайда идут
+    в туннель. Без этой поправки `youtube proxy` на такой сети ставил бы
+    оверрайды «на всякий случай», возвращал changed=true, лишний раз
+    перезапускал туннель и жег кулдаун в guard.
+    """
+    over = route_overrides() if over is None else over
+    rows = {row["domain"]: row for row in route_entries(over)}
+    group = youtube_group_domains()
+    ours = {dom for dom, ent in over.items()
+            if ent["path"] == "proxy" and _youtube_own_reason(ent["reason"])}
+    zapret_on = zapret_active()
+    proxied = []
+    for dom in group:
+        row = rows.get(dom) or {}
+        path = row.get("path")
+        if (path == "direct" and not zapret_on and row.get("source") != "override"
+                and dom in BUILTIN_DIRECT_DOMAINS):
+            path = "proxy"        # BUILTIN не подмешан: домен идёт по final=proxy
+        if path == "proxy":
+            proxied.append(dom)
+    return {"group": group, "proxied": proxied,
+            "ours": sorted(ours & set(group)), "zapret_active": zapret_on}
+
+
+def youtube_direct_ok(timeout: float = YOUTUBE_PROBE_TIMEOUT) -> dict:
+    """Пропускает ли zapret YouTube на этой сети — по живой пробе, а не по флагам.
+
+    Зачем: самая частая поломка — стратегия сети числовая (обход «работает» по
+    мнению автотюна), страница отдаётся, а CDN видео молчит. По одним флагам
+    такую сеть не отличить от здоровой, поэтому решение принимается по пробам.
+
+    Прямой путь проверяется отдельно от текущего маршрута: если youtube.com уже
+    уведён в туннель оверрайдом, обычный curl померил бы VPN. Тогда проба идёт
+    через физический интерфейс, а `local_ip` подтверждает, что она вправду шла
+    мимо TUN (иначе `probed=false` — «судить не берусь»).
+
+    Возвращает плоский словарь: его же разбирает guard и печатает `--json`.
+    Ключ `probed` — можно ли доверять `direct_ok`: без подтверждённого прямого
+    пути `direct_ok=false` означает «не проверено», а не «сломано».
+    """
+    service = zapret_service_active()
+    strategy = _strategy_mode()
+    strategy_ok = strategy is None or strategy not in ZAPRET_NO_BYPASS
+    route = youtube_path_now()
+    cur_path = str(route.get("path") or "proxy")
+    # Состояние группы: guard по нему решает, надо ли расширять оверрайд до всех
+    # доменов. Без этого он видел только «youtube.com в proxy» и считал, что
+    # видео уже прикрыто, хотя googlevideo/ytimg шли по мёртвому direct.
+    group = youtube_group_state()
+    group_direct = [dom for dom in group["group"] if dom not in group["proxied"]]
+    group_fields = {"group_size": len(group["group"]), "group_direct": group_direct,
+                    "overrides": len(group["ours"])}
+
+    # Обход выключен по решению автотюна: заведомо не работает, и тратить
+    # 20 секунд на три таймаута незачем. Это не «сломано», а «так решено» —
+    # домены в этом режиме и так уходят в туннель (BUILTIN не подмешивается).
+    if not service or not strategy_ok:
+        why = ("zapret.service не работает" if not service
+               else f"стратегия сети «{strategy}» — обход выключен")
+        return {"ok": True, "direct_ok": False, "probed": False, "reason": why,
+                "path_now": cur_path, "path_source": route.get("source", ""),
+                "service": service, "strategy": strategy or "",
+                "strategy_ok": strategy_ok, "probe_iface": "", "wan_ip": "",
+                "probe_mode": "", "checks": {}, **group_fields}
+
+    iface = _wan_iface() if cur_path != "direct" else ""
+    if cur_path != "direct" and not iface:
+        # youtube.com уже в туннеле, а физический интерфейс не нашёлся: проба
+        # ушла бы в туннель, и VPN был бы выдан за обход. Честнее «не проверено»,
+        # чем ложное «обход работает» (по нему guard снял бы нужные оверрайды).
+        return {"ok": True, "direct_ok": False, "probed": False,
+                "reason": "нет физического интерфейса для пробы мимо TUN",
+                "path_now": cur_path, "path_source": route.get("source", ""),
+                "service": service, "strategy": strategy or "",
+                "strategy_ok": strategy_ok, "probe_iface": "", "wan_ip": "",
+                "probe_mode": "", "checks": {}, **group_fields}
+
+    wan_ip = _wan_ipv4(iface)
+
+    page = _probe_http(YOUTUBE_PAGE_URL, timeout, iface, keep_body=True)
+    icon = _probe_http(YOUTUBE_ICON_URL, timeout, iface)
+    cdn = _probe_http(YOUTUBE_CDN_URL, timeout, iface)
+
+    body = str(page["body"]).lower()
+    page_ok = page["code"] in (200, 301, 302) and any(m in body for m in YOUTUBE_PAGE_MARKERS)
+    icon_ok = (icon["code"] == 200 and str(icon["ctype"]).startswith("image/")
+               and icon["size"] > 500)
+    cdn_ok = cdn["code"] in (200, 204)
+
+    # Проба считалась прямой, если TUN не мешал (текущий путь direct: трафик идёт
+    # по правилам sing-box в direct-outbound, где zapret и применяется) или curl
+    # подтвердил исход с адреса физического интерфейса.
+    if iface:
+        probed = bool(wan_ip) and any(chk["local_ip"] == wan_ip for chk in (page, icon, cdn))
+    else:
+        probed = True
+
+    if not page_ok:
+        reason = ("страница YouTube не открылась" if page["code"] == 0 else
+                  f"страница без признаков контента (HTTP {page['code']})")
+    elif not icon_ok:
+        reason = "превью/фавикон не отдаются"
+    elif not cdn_ok:
+        reason = "CDN googlevideo не отвечает"
+    else:
+        reason = ""
+    if not probed and not reason:
+        reason = "прямой путь не подтверждён (проба могла уйти в туннель)"
+
+    return {"ok": True, "direct_ok": bool(page_ok and icon_ok and cdn_ok),
+            "probed": probed, "reason": reason,
+            "path_now": cur_path, "path_source": route.get("source", ""),
+            "service": service, "strategy": strategy or "",
+            "strategy_ok": strategy_ok, "probe_iface": iface, "wan_ip": wan_ip,
+            # interface — проба принудительно мимо TUN; rules — по правилам
+            # sing-box (путь YouTube был direct, туннель не при чём)
+            "probe_mode": "interface" if iface else "rules",
+            **group_fields,
+            "checks": {
+                "page": f"HTTP {page['code']}"
+                        + (f" · {page['local_ip']}" if page["local_ip"] else "")
+                        + (" · контент есть" if page_ok else " · контента нет"),
+                "icon": f"HTTP {icon['code']} {icon['ctype']} {icon['size']} Б",
+                "cdn": f"HTTP {cdn['code']}",
+            }}
+
+
+def youtube_set(path: str, reason: str = "", restart: bool = True) -> dict:
+    """Переводит всю группу YouTube в туннель или возвращает её на обход.
+
+    Группа, а не один домен: страница и видео разведены по разным правилам
+    (youtube.com в direct-списке, googlevideo/ytimg — тоже), и оверрайд одного
+    youtube.com оставлял видео в мёртвом обходе.
+
+    `proxy` ставит оверрайды только тем доменам группы, у которых оверрайда нет
+    вовсе. Любой существующий не трогаем: ручной `route set <домен> direct` —
+    это решение человека, и переписав его своей причиной, вернуть его было бы
+    нечем (`route list` показывал бы причину аудита). Такие домены попадают в
+    `skipped_manual`. `direct` снимает **только свои** оверрайды (по префиксу
+    причины): explicit `direct` не ставим, иначе домен остался бы пришпилен к
+    direct и после того, как обход в этой сети умрёт.
+
+    Лок берётся один на всю пачку, рестарт — тоже один: поштучный `route set`
+    упирался в лок и перезапускал туннель 10 раз подряд. Файл пишется атомарно
+    (`save_json`: tmp + rename), поэтому даже убитый по таймауту процесс не
+    оставит битый JSON; если убили между записью и рестартом, правило «не
+    применено к конфигу» видно в `route list`, а чинится любым `on`/`restart`.
+    """
+    path = str(path).strip().lower()
+    if path not in ROUTE_PATHS:
+        raise RuntimeError(f"неизвестный путь: {path!r} (нужно proxy или direct)")
+    default_reason = YOUTUBE_REASON_PREFIX if path == "proxy" else YOUTUBE_REASON_BACK
+    reason = _route_reason(reason or default_reason)
+    changed: list[str] = []
+    skipped: list[str] = []
+    with ctrl_lock(0 if restart else 4):
+        over = route_overrides()
+        state = youtube_group_state(over)
+        now = int(time.time())
+        if path == "proxy":
+            for dom in state["group"]:
+                ent = over.get(dom)
+                if ent is not None:
+                    # Своя причина → путь уже нужный; чужая → не наше дело.
+                    # И в том, и в другом случае оверрайд оставляем как есть.
+                    if not _youtube_own_reason(ent["reason"]):
+                        skipped.append(dom)
+                    continue
+                if dom in state["proxied"]:
+                    continue
+                over[dom] = {"path": "proxy", "reason": reason, "ts": now}
+                changed.append(dom)
+        else:
+            # Отчёт симметричен `proxy`: чужие оверрайды в группе мы не снимаем
+            # и обязаны это показать, иначе «вернул всё» звучало бы как факт.
+            for dom in state["group"]:
+                ent = over.get(dom)
+                if ent is not None and not _youtube_own_reason(ent["reason"]):
+                    skipped.append(dom)
+            for dom in state["ours"]:
+                if dom in over:
+                    over.pop(dom, None)
+                    changed.append(dom)
+        restarted, note = False, "изменений нет"
+        if changed:
+            save_route_overrides(over)
+            note = "без перезапуска (--no-restart)"
+            if restart:
+                restarted, note = _restart_after_route_change()
+    return {"ok": True, "path": path, "changed": bool(changed), "domains": changed,
+            "count": len(changed), "skipped_manual": skipped,
+            "skipped_manual_count": len(skipped), "reason": reason,
+            "restarted": restarted, "note": note}
+
+
+def youtube_path_field() -> dict:
+    """Поле `youtube_path` для `--json status`: без сети, только правила и флаги.
+
+    Полная проба (`youtube check`) занимает секунды и в статусе панели не
+    годится — виджет опрашивает его часто. Здесь честная картина маршрута:
+    куда идёт YouTube сейчас, из какого правила и почему.
+    """
+    row = youtube_path_now()
+    state = youtube_group_state()
+    return {"path": row.get("path", "proxy"), "source": row.get("source", ""),
+            "reason": row.get("reason", ""), "age": row.get("age"),
+            "zapret_active": zapret_active(), "strategy": _strategy_mode() or "",
+            "overridden": len(state["ours"]), "group_size": len(state["group"])}
+
+
+def youtube_path_field_safe() -> dict:
+    """`youtube_path` для статуса: статус обещан валидным даже на битых файлах."""
+    try:
+        return youtube_path_field()
+    except Exception as exc:  # noqa: BLE001 — иначе виджет решит, что VPN не установлен
+        warn(f"youtube_path: {type(exc).__name__}: {exc}")
+        return {}
+
+
+def youtube_check_text(res: dict) -> str:
+    """Строка для человека: пропускает ли обход и чем именно это доказано."""
+    state = "пропускает" if res.get("direct_ok") else "НЕ пропускает"
+    if not res.get("probed"):
+        state += " (не проверено)"
+    why = res.get("reason") or "все пробы прошли"
+    via = f" · проба мимо TUN через {res['probe_iface']}" if res.get("probe_iface") else ""
+    checks = res.get("checks") or {}
+    detail = ", ".join(f"{name}: {val}" for name, val in checks.items())
+    return f"обход {state} YouTube — {why}{via}" + (f"\n{detail}" if detail else "")
 
 
 def fmt_age(seconds) -> str:
@@ -596,7 +946,7 @@ def _rule_hit(dom: str, rule: list):
     return None
 
 
-def route_entries() -> list:
+def route_entries(over: dict | None = None) -> list:
     """Полная картина маршрутов для `omavpn route list`.
 
     Путь каждого домена считается **проходом по правилам в их порядке** —
@@ -606,8 +956,12 @@ def route_entries() -> list:
     Поэтому таблица не может разойтись с конфигом: поддомен `youtubei.
     googleapis.com` показывается как proxy, даже если родитель лежит в
     direct_domains.txt.
+
+    `over` — уже прочитанные оверрайды: `youtube_set` держит лок и правит их
+    в памяти, и повторное чтение файла внутри лока давало две «правды» об одном
+    и том же (вторая могла быть уже чужой записью).
     """
-    over = route_overrides()
+    over = route_overrides() if over is None else over
     now = int(time.time())
     file_domains, file_exists = _direct_file_domains()
     forced_direct = {dom for dom, ent in over.items() if ent["path"] == "direct"}
@@ -668,12 +1022,23 @@ def route_table_text(rows: list) -> str:
 def _restart_after_route_change() -> tuple[bool, str]:
     """Перезапускает VPN, чтобы новый маршрут вступил в силу.
 
-    Если VPN выключен — ничего не делаем: конфиг соберётся при следующем `on`.
-    Возвращает (перезапущено, пояснение).
+    Возвращает (туннель действительно поднят, пояснение). Раньше True
+    возвращалось сразу после `cmd_on`: если sing-box не встал (нет caps, мёртвая
+    нода), правило оставалось только в файле, а JSON и `route list` сообщали
+    «перезапущено» — guard на этом основании считал меру применённой.
+    Теперь успех — это `is_on()` после старта.
+
+    Оверрайд при этом не откатывается: правило записано и честно видно в
+    `route list`, а конфиг соберётся при следующем `on`/`restart`.
     """
     if not is_on():
         return False, "VPN выключен — правило применится при следующем подключении"
-    cmd_on(None, None, None, quiet=True)
+    try:
+        cmd_on(None, None, None, quiet=True)
+    except Exception as exc:  # noqa: BLE001 — правило уже записано, это отдельный итог
+        return False, f"правило записано, но VPN не перезапустился: {exc}"
+    if not is_on():
+        return False, "правило записано, но туннель не поднялся — применится при следующем on"
     return True, ""
 
 
@@ -2925,6 +3290,9 @@ def status() -> dict:
         "profiles": pro,
         "nodes": nd,
         "probe": probe_state(),
+        # Куда идёт YouTube и почему — без сети (см. youtube_path_field).
+        # Ключ добавлен, существующие не менялись: панель читает JSON по именам.
+        "youtube_path": youtube_path_field_safe(),
     }
 
 
@@ -3918,6 +4286,20 @@ def main(argv: list) -> int:
     runset.add_argument("--no-restart", action="store_true",
                         help="не перезапускать VPN")
 
+    # YouTube: живая проба обхода и перевод группы доменов. Проба одна на всех
+    # (guard, статус панели, человек) — вторая копия расходилась бы с первой.
+    syt = sub.add_parser("youtube", help="YouTube: пропускает ли обход и группа доменов в VPN")
+    ytsub = syt.add_subparsers(dest="youtube_cmd")
+    _add_json(ytsub.add_parser("check", help="пропускает ли zapret YouTube на этой сети "
+                                             "(живая проба; rc=1 — не пропускает)"))
+    yt_proxy = _add_json(ytsub.add_parser("proxy", help="увести группу доменов YouTube в VPN"))
+    yt_direct = _add_json(ytsub.add_parser("direct",
+                                           help="вернуть группу YouTube на обход (снять свои оверрайды)"))
+    for ytp in (yt_proxy, yt_direct):
+        ytp.add_argument("--reason", default="", help="почему так (сохраняется в оверрайде)")
+        ytp.add_argument("--no-restart", action="store_true",
+                         help="не перезапускать VPN (правило применится при следующем on)")
+
     args = p.parse_args(argv)
     JSON_OUT = args.json or getattr(args, "route_json", False) \
         or getattr(args, "sub_json", False)
@@ -4095,6 +4477,30 @@ def main(argv: list) -> int:
                 if JSON_OUT:
                     fail("route: не указана подкоманда (list | set | unset)", 2)
                 srt.print_help()
+                return 0
+        elif args.cmd == "youtube":
+            if args.youtube_cmd == "check":
+                res = youtube_direct_ok()
+                emit(res, youtube_check_text(res))
+                # Ненулевой код — чтобы таймер/guard видели сбой без разбора JSON.
+                return 0 if res["direct_ok"] else 1
+            elif args.youtube_cmd in ("proxy", "direct"):
+                res = youtube_set(args.youtube_cmd, args.reason, not args.no_restart)
+                note = " · перезапущено" if res["restarted"] else \
+                    " · " + (res["note"] or "")
+                if not res["changed"]:
+                    text = f"YouTube: изменений нет{note}"
+                else:
+                    text = f"YouTube → {res['path']}: доменов {res['count']}{note}"
+                if res.get("skipped_manual_count"):
+                    text += (f" · пропущено (чужой оверрайд): "
+                             f"{res['skipped_manual_count']}")
+                emit(res, text)
+                return 0 if res["ok"] else 1
+            else:
+                if JSON_OUT:
+                    fail("youtube: не указана подкоманда (check | proxy | direct)", 2)
+                syt.print_help()
                 return 0
         elif args.cmd == "best":
             res = probe_best(args.probes_quick, args.timeout_quick, args.probes_final,
