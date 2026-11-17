@@ -82,6 +82,23 @@ ROUTE_AUDIT_REASON_BACK = "аудит: proxy не отвечает"
 # По этому префиксу аудит узнаёт собственные оверрайды: ручные (`omavpn route
 # set`) не снимаются перепроверкой и не перебиваются аудитом никогда.
 ROUTE_REASON_PREFIX = "аудит"
+# Оверрайды правила «обход не пропускает YouTube»: их ставит omavpn-guard
+# (`yt_group_to_vpn`) или человек командой `omavpn youtube proxy`. Аудит такие
+# решения не трогает ни в одну сторону — ни «залипшими» (фаза 0), ни «обход
+# снова работает» (фаза 0b), ни суточной перепроверкой: возврат делает guard
+# (`yt_maybe_return`) по двум успешным пробам с паузой. Иначе два механизма
+# дёргают путь вразнобой, и группа уезжает на direct ровно там, где обход не
+# работает (15:54:56: youtube.com снят при «не отвечают: www.youtube.com,
+# i.ytimg.com»). Причины начинаются с «аудит», поэтому одного префикса мало —
+# список и проверка живут в _own_override/_guard_override.
+YOUTUBE_GUARD_REASONS = (
+    "аудит: обход не пропускает YouTube",      # ставит omavpn-guard (yt_group_to_vpn)
+    "аудит: обход снова пропускает YouTube",   # причина возврата у guard'а
+    # legacy: так причина называлась в прежней версии guard'а (до правила
+    # «группа доменов»). Такие оверрайды уже стоят на машинах, и снимать их
+    # аудитом — та же ошибка: решение принимал guard, а не он.
+    "аудит: guard — обход не тянет",
+)
 ROUTE_PATHS = ("proxy", "direct")  # допустимые пути оверрайда (как в bin/omavpn)
 ROUTE_RECHECK_AGE = 24 * 3600      # оверрайд proxy старше суток перепроверяем
 ROUTE_RECHECK_GAP = 20 * 3600      # но сам перепроверочный прогон — не чаще раза в 20 ч
@@ -1549,6 +1566,18 @@ def _fmt_cooldown(seconds: float) -> str:
     return (f"{hours:.1f}".rstrip("0").rstrip(".")) + " ч"
 
 
+def _guard_override(reason) -> bool:
+    """Оверрайд поставлен правилом «обход не пропускает YouTube» (guard).
+
+    Причина такого оверрайда тоже начинается с «аудит», поэтому общий префикс
+    `ROUTE_REASON_PREFIX` его не защищает. Решение о возврате на direct
+    принимает guard (`yt_maybe_return`) по двум успешным пробам с паузой —
+    аудит в это решение не вмешивается.
+    """
+    text = str(reason or "")
+    return any(text.startswith(prefix) for prefix in YOUTUBE_GUARD_REASONS)
+
+
 def _own_override(overrides: dict, dom: str) -> bool:
     """Можно ли трогать маршрут домена: True, если человек его не закреплял.
 
@@ -1557,12 +1586,18 @@ def _own_override(overrides: dict, dom: str) -> bool:
     `redirector.googlevideo.com`: точного ключа нет, аудит ставил оверрайд на
     поддомен, а proxy-правило в конфиге ловит его по суффиксу первым — и ручное
     решение переставало действовать.
+
+    Здесь же единая точка защиты решений guard'а по YouTube (`_guard_override`):
+    такой оверрайд считается не нашим, даже если причина начинается с «аудит».
     """
     for key, ent in overrides.items():
         cand = str(key).strip().lower()
         if not (dom == cand or dom.endswith("." + cand)):
             continue
-        if not str(ent.get("reason") or "").startswith(ROUTE_REASON_PREFIX):
+        reason = str((ent or {}).get("reason") or "")
+        if _guard_override(reason):
+            return False          # возврат решает guard, а не аудит
+        if not reason.startswith(ROUTE_REASON_PREFIX):
             return False
     return True
 
@@ -1668,6 +1703,11 @@ def run_route_audit() -> dict:
         socks = _vpn_socks(app)
         overrides = read_route_overrides(app)
         state = read_route_state(app)
+        # Понятные строки для журнала: что аудит сознательно не тронул и почему.
+        # JSON аудита — это и есть лог (`--route-audit` печатает его в journal).
+        # Копим домены, а текст собираем один раз: иначе фазы 0 и 0b писали по
+        # строке на один и тот же оверрайд.
+        guard_kept: list[str] = []
 
         # --- фаза 0: залипшие видео-домены возвращаем на прямой путь ----------
         # Видео YouTube через туннель не работает вовсе, значит оверрайд
@@ -1675,10 +1715,22 @@ def run_route_audit() -> dict:
         # которая считала видео зависимым от обхода). Снимаем сразу, не
         # дожидаясь суточной перепроверки, и перечитываем правила после одного
         # рестарта — иначе пробы пойдут по устаревшему конфигу.
-        stuck = [dom for dom, ent in overrides.items()
-                 if in_list(dom, NEVER_PROXY_DOMAINS)
-                 and str((ent or {}).get("path") or "") == "proxy"
-                 and str((ent or {}).get("reason") or "").startswith(ROUTE_REASON_PREFIX)]
+        #
+        # Исключение — оверрайды правила «обход не пропускает YouTube»: их
+        # решение принимает guard, а не аудит (`_own_override`). Иначе правило
+        # работало бы через раз: guard уводит группу в туннель, аудит тут же
+        # возвращает её на мёртвый direct.
+        stuck = []
+        for dom, ent in overrides.items():
+            if not (in_list(dom, NEVER_PROXY_DOMAINS)
+                    and str((ent or {}).get("path") or "") == "proxy"):
+                continue
+            if _guard_override((ent or {}).get("reason")):
+                guard_kept.append(dom)
+                continue
+            if not _own_override(overrides, dom):
+                continue
+            stuck.append(dom)
         if stuck and cli and socks:
             # Без живого туннеля перезапускать нельзя: `omavpn restart` — это
             # off+on, он поднял бы VPN, который человек выключил.
@@ -1722,8 +1774,12 @@ def run_route_audit() -> dict:
                 ent = overrides.get(dom) or {}
                 if str(ent.get("path") or "") != "proxy":
                     continue
-                if not str(ent.get("reason") or "").startswith(ROUTE_REASON_PREFIX):
+                if _guard_override(ent.get("reason")):
+                    if dom not in guard_kept:
+                        guard_kept.append(dom)
                     continue
+                if not _own_override(overrides, dom):
+                    continue          # ручной оверрайд — не трогаем никогда
                 if dom in NEVER_PROXY_DOMAINS:
                     continue
                 probe = probe_by_dom.get(dom)
@@ -1974,6 +2030,11 @@ def run_route_audit() -> dict:
             "socks_port": socks,
             "probes": probes,
             "actions": all_actions,
+            # Что аудит сознательно не тронул и почему (решения guard'а по
+            # YouTube). Печатается вместе с остальным JSON — это и есть лог.
+            "notes": [f"{dom}: оверрайд YouTube оставлен решением guard — "
+                      "возврат на прямой путь делает guard двумя успешными пробами"
+                      for dom in guard_kept],
             "secs": round(time.time() - started, 1),
         }
     except Exception as exc:  # noqa: BLE001
@@ -2035,8 +2096,10 @@ def run_route_recheck(force: bool = False) -> dict:
         for dom, ent in overrides.items():
             if str(ent.get("path") or "") != "proxy":
                 continue
-            if not str(ent.get("reason") or "").startswith(ROUTE_REASON_PREFIX):
-                continue          # ручной оверрайд — не трогаем никогда
+            # `_own_override`, а не префикс: он же защищает решения guard'а по
+            # YouTube, у которых причина тоже начинается с «аудит».
+            if not _own_override(overrides, dom):
+                continue          # ручной оверрайд и решение guard — не трогаем
             if now - _num(ent.get("ts")) > ROUTE_RECHECK_AGE:
                 candidates.append(dom)
 
