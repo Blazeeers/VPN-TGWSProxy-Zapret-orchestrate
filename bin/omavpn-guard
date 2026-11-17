@@ -39,6 +39,13 @@ VPN_STATE="$HOME_DIR/.local/state/omavpn/state.json"
 XRAY_PID_FILE="$HOME_DIR/.local/state/omavpn/xray.pid"
 VPN_SETTINGS="$HOME_DIR/.config/omavpn/settings.json"
 SINGBOX_CFG="$HOME_DIR/.local/state/omavpn/singbox.json"
+SINGBOX_LOG="$HOME_DIR/.local/state/omavpn/singbox.log"
+# Порт SOCKS туннельного xray — тот же, что SOCKS_PORT в omavpn. Через него
+# проверяем реальный выход: сам по себе поднятый omavpn0 ничего не доказывает.
+VPN_SOCKS_PORT=10808
+VPN_PROBE_URL="https://www.cloudflare.com/cdn-cgi/trace"
+VPN_PROBE_T=5       # таймаут SOCKS-пробы, с
+VPN_PROBE_TTL=20    # кэш результата пробы: vpn_alive зовётся в циклах wait_vpn
 DIRECT_FILE="$HOME_DIR/.config/omavpn/direct_domains.txt"
 SB_BIN="$HOME_DIR/.local/share/omavpn/bin/sing-box"
 AUTOTUNE_DIR="/var/lib/zapret-autotune"
@@ -172,14 +179,86 @@ xray_up() {
     tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'xray'
 }
 
-# Жив ли VPN. В режиме tun признак — интерфейс omavpn0 (флаг running в
-# state.json ставится при запуске и сам не снимается, поэтому падение туннеля по
-# нему не видно). В режиме proxy TUN нет по определению: там живой VPN — это
-# записанный running=true и живой процесс xray. Раньше живость проверялась
-# только по `ip link show omavpn0`, и guard каждые 10 минут зря делал
-# `omavpn on` (off+on — реальный обрыв) и слал «туннель не поднялся».
+# Свежая запись «sing-box не нашёл default interface» = туннель собран без
+# outbound. Это защита от гонки после сна: интерфейс есть, правила TUN стоят, а
+# трафик не идёт. Старые записи из истории (mtime лога старше 5 минут) не
+# считаем — иначе одна авария ломала бы статус навсегда.
+tun_route_lost() {
+    local mtime
+    [ -f "$SINGBOX_LOG" ] || return 1
+    mtime=$(stat -c %Y "$SINGBOX_LOG" 2>/dev/null) || return 1
+    [ $(( $(now) - mtime )) -le 300 ] || return 1
+    tail -n 50 "$SINGBOX_LOG" 2>/dev/null | grep -q 'missing default interface'
+}
+
+VPNTRAFFIC_TS=0
+VPNTRAFFIC_OK=0
+
+# Реальный выход через туннель: сам по себе поднятый omavpn0 ничего не
+# доказывает. 17.11.2026 sing-box после сна не нашёл default interface —
+# интерфейс был, весь трафик висел, а guard считал VPN живым и лечил YouTube
+# вместо VPN. В режиме tun проба идёт обычным запросом (без SOCKS), как у
+# пользователя, — через sing-box. В proxy-режиме TUN нет, мерить можно только
+# SOCKS. На «YouTube/Discord идут мимо VPN» это не влияет: проверяется выход
+# целиком (xray + нода + sing-box), а не маршрут конкретного домена.
+#
+# Один запрос текущим путём (TUN либо SOCKS) → HTTP-код (000 — не ответил).
+vpn_http_probe() {
+    if [ "$(vpn_mode)" = "proxy" ]; then
+        curl -4 -s -o /dev/null -w '%{http_code}' --max-time "$VPN_PROBE_T" \
+            --socks5-hostname "127.0.0.1:$VPN_SOCKS_PORT" "$VPN_PROBE_URL" 2>/dev/null
+    else
+        curl -4 --noproxy '*' -s -o /dev/null -w '%{http_code}' \
+            --max-time "$VPN_PROBE_T" "$VPN_PROBE_URL" 2>/dev/null
+    fi
+}
+
+vpn_traffic_ok() {
+    local ts code i=0
+    ts=$(now)
+    # TTL-кэш: vpn_alive зовётся и в wait_vpn (цикл по секунде), и из svc_*;
+    # без кэша один прогон стоил бы десятки секунд.
+    if [ "${VPNTRAFFIC_TS:-0}" -gt 0 ] \
+        && [ $(( ts - VPNTRAFFIC_TS )) -lt "$VPN_PROBE_TTL" ]; then
+        [ "$VPNTRAFFIC_OK" = 1 ]
+        return
+    fi
+    # Две попытки: одиночный обрыв не должен выглядеть мёртвым VPN.
+    while [ "$i" -lt 2 ]; do
+        i=$((i + 1))
+        code=$(vpn_http_probe)
+        case "${code:-000}" in
+            2??) break ;;
+            *)   [ "$i" -lt 2 ] && sleep 1 ;;
+        esac
+    done
+    VPNTRAFFIC_TS=$ts
+    case "${code:-000}" in
+        2??) VPNTRAFFIC_OK=1 ;;
+        *)   VPNTRAFFIC_OK=0 ;;
+    esac
+    [ "$VPNTRAFFIC_OK" = 1 ]
+}
+
+# Сброс кэша: после подъёма/перезапуска VPN старый «мёртв» не должен мешать.
+vpn_traffic_reset() {
+    VPNTRAFFIC_TS=0
+    VPNTRAFFIC_OK=0
+}
+
+# Жив ли VPN. В режиме tun признак — интерфейс omavpn0 И реальный трафик:
+# флаг running в state.json ставится при запуске и сам не снимается, а пустой
+# TUN без outbound раньше выглядел полностью здоровым. В режиме proxy TUN нет
+# по определению: там живой VPN — это записанный running=true и живой процесс
+# xray. Раньше живость проверялась только по `ip link show omavpn0`, и guard
+# каждые 10 минут зря делал `omavpn on` (off+on — реальный обрыв) и слал
+# «туннель не поднялся».
 vpn_alive() {
-    tun_up && return 0
+    if tun_up; then
+        tun_route_lost && return 1
+        vpn_traffic_ok && return 0
+        return 1
+    fi
     [ "$(vpn_mode)" = "proxy" ] || return 1
     [ "$(runtime_field running)" = "true" ] || return 1
     xray_up
@@ -551,11 +630,13 @@ health_ok_quiet() { [ -z "$(broken_services_quiet)" ]; }
 vpn_up() {
     vpn_alive && return 0
     timeout 90 "$OMAVPN" on >/dev/null 2>&1
+    vpn_traffic_reset
     wait_vpn
 }
 
 vpn_restart() {
     timeout 90 "$OMAVPN" restart >/dev/null 2>&1
+    vpn_traffic_reset
     wait_vpn || vpn_up
 }
 
