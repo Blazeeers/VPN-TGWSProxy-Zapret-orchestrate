@@ -55,6 +55,11 @@ Panel {
   // --health, который тут же получал heal.skipped, — лишняя нагрузка и ложное
   // «лечение не помогло».
   readonly property real autoHealGap: 2700
+  // Мёртвый туннель (tunnelDead): бэкенд разрешает лечение через 600 с
+  // (HEAL_MIN_GAP_SICK), поэтому и свой порог опускаем до того же. Иначе
+  // виджет ждал бы 45 минут, пока лежит вообще всё, и правка бэкенда не
+  // доходила бы до автоматического лечения. Обычный случай — 2700 с.
+  readonly property real autoHealGapSick: 600
 
   readonly property bool autoconnect: root.setting("autoconnect", false)
   // Тихая иконка: когда всё в порядке, пиктограмма в баре не красится и не
@@ -381,6 +386,26 @@ Panel {
     var it = root.hItem(id)
     if (it) return it.detail
     return fallback || emptyText || "нет данных — нажми «Проверить всё»"
+  }
+  // Мёртвый туннель: VPN плох и все сетевые пробы молчат — «TUN есть, трафика
+  // нет». Признак тот же, что у tunnel_dead в bin/bypass-status: один выпавший
+  // сервис (YouTube, Discord, DeepSeek) сюда не попадает — перезапуск туннеля
+  // там не помогает. `idle` у пробы считаем молчанием: ответа нет потому, что
+  // трафик не идёт (Telegram без поднятого VPN). Нет пунктов в ответе — не
+  // гадаем и оставляем обычный порог.
+  function tunnelDead(items) {
+    if (!(items instanceof Array)) return false
+    var probes = ["youtube", "discord", "deepseek", "telegram"]
+    var vpnBad = false
+    var silent = 0
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i]
+      if (!it || !it.id) continue
+      if (it.id === "vpn") vpnBad = (it.state === "bad")
+      else if (probes.indexOf(it.id) >= 0 && (it.state === "bad" || it.state === "idle"))
+        silent += 1
+    }
+    return vpnBad && silent === probes.length
   }
   function stateColor(state) {
     if (state === "ok") return root.okColor
@@ -1672,10 +1697,12 @@ Panel {
                 // только показывает результат. Своё лечение здесь означало бы
                 // два перезапуска VPN подряд — они мешают друг другу.
                 root.maybeAutoOptimize()
-              } else if ((Date.now() / 1000 - root.autoHealAt) > root.autoHealGap) {
+              } else if ((Date.now() / 1000 - root.autoHealAt)
+                         > (root.tunnelDead(hItems) ? root.autoHealGapSick : root.autoHealGap)) {
                 // Фолбэк без guard: лечим сами, без нажатий. Порог равен
                 // HEAL_MIN_GAP бэкенда: при меньшем каждые 15 минут уходил полный
-                // --health, который тут же получал heal.skipped.
+                // --health, который тут же получал heal.skipped. Для мёртвого
+                // туннеля порог короче — как HEAL_MIN_GAP_SICK в бэкенде.
                 root.autoHealAt = Date.now() / 1000
                 root.logNote("auto", "плохо при выключенном guard — лечу VPN")
                 Qt.callLater(function() { root.startHealth(true, true) })
