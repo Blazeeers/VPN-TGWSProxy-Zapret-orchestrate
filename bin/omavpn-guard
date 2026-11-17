@@ -79,6 +79,30 @@ HEAL_TIMEOUT=420
 MAX_NODES=5         # сколько нод перебрать за один прогон
 CURL_T=8            # таймаут одной HTTP-проверки, с (в --status урезается)
 ROUTE_T=20          # таймаут `omavpn --json route list`, с (в --status урезается)
+# YouTube: «обход формально жив, а видео не идёт» — самая частая поломка
+# (стратегия числовая, страница отдаётся, CDN молчит). Пробу и перевод группы
+# делает omavpn (`youtube check` / `youtube proxy`): вторая копия пробы в bash
+# уже расходилась с первой — guard считал живым то, что аудит называл мёртвым.
+# Бюджет пробы считается явно: три запроса по 6 с (YOUTUBE_PROBE_TIMEOUT в
+# omavpn) + до 4 с запаса на каждый (TLS, редиректы, чтение тела) = 30 с, плюс
+# старт python и systemctl. 45 с было впритык: timeout убивал проверку на
+# середине, и проба вечно отвечала unknown.
+YT_T=75             # таймаут `omavpn --json youtube check`, с (3×(6+4) + запас)
+YT_CONFIRM_GAP=10   # пауза между двумя подтверждающими пробами возврата, с
+# Возвраты YouTube — свой лимит: общий (COOLDOWN/switches_last_hour) про лечение
+# VPN, и три возврата выедали его целиком.
+YT_RETURN_COOLDOWN=900
+YT_RETURN_HISTORY="$STATE_DIR/yt-switches"
+YT_LAST_RETURN="$STATE_DIR/yt-last-return"
+YT_REASON="аудит: обход не пропускает YouTube"
+YT_REASON_BACK="аудит: обход снова пропускает YouTube"
+# Так причину называла прежняя версия guard'а. Считаем её своей: иначе уже
+# стоящий `youtube.com proxy` не расширяется до группы и не снимается возвратом
+# (omavpn считает её своей тем же правилом).
+YT_REASON_LEGACY="аудит: guard — обход не тянет"
+# Разбор одного ответа `youtube check` переиспользуется несколько секунд:
+# health_ok_quiet зовётся пачкой, а полная проба — до 75 с.
+YT_PROBE_TTL=120
 
 # 1 — VPN трогать нельзя (нет cap_net_admin / нет sing-box в tun-режиме).
 # Ставится в cmd_check. При этом guard НЕ выходит: Telegram чинится локальным
@@ -623,7 +647,13 @@ broken_services_quiet() {
     echo "${broken# }"
 }
 
-health_ok_quiet() { [ -z "$(broken_services_quiet)" ]; }
+health_ok_quiet() {
+    [ -z "$(broken_services_quiet)" ] || return 1
+    # Пробы выше меряют ТЕКУЩИЙ путь: пока страница открывается через proxy, они
+    # говорят «всё работает», хотя видео-домены сидят на мёртвом direct и группа
+    # в VPN не переведена. Поэтому YouTube проверяется ещё и по прямому пути.
+    yt_path_ok_quiet
+}
 
 # --- VPN -------------------------------------------------------------------
 
@@ -807,6 +837,225 @@ route_force() {
     esac
 }
 
+# --- YouTube: проба обхода и группа доменов ---------------------------------
+# «Обход не пропускает YouTube» — единственное основание уводить группу доменов
+# в туннель. Признак берётся не из факта «страница не открылась»: при живом
+# обходе и мёртвой ноде виноват туннель, и уводить в него видео — вредить.
+# Проверку делает omavpn: там же живут BUILTIN_DIRECT_DOMAINS, поэтому список
+# группы не дублируется (дубль уже расходился: оверрайд одного youtube.com
+# оставлял googlevideo/ytimg в мёртвом обходе).
+
+yt_probe() { # JSON `omavpn --json youtube check` ("" — спросить не удалось)
+    timeout "$YT_T" "$OMAVPN" --json youtube check 2>/dev/null
+}
+
+# Последний разбор `youtube check`: глобалы, а не echo. Одному ответу нужно три
+# факта (состояние прямого пути, сколько доменов группы ещё не в VPN, причина), и
+# три отдельных прогона по 75 с недопустимы.
+YT_PROBE_JSON=""
+YT_PROBE_STATE="unknown"
+YT_PROBE_GROUP_DIRECT=0
+YT_PROBE_REASON=""
+YT_PROBE_AT=0
+
+yt_probe_reset() { # забыть разбор: состояние маршрутов изменилось
+    YT_PROBE_JSON=""
+    YT_PROBE_STATE="unknown"
+    YT_PROBE_GROUP_DIRECT=0
+    YT_PROBE_REASON=""
+    YT_PROBE_AT=0
+}
+
+# 0 — ответ получен и разобран, 1 — спросить не удалось.
+yt_probe_run() {
+    local now_t direct probed strategy n
+    now_t=$(now)
+    if [ -n "$YT_PROBE_JSON" ] && [ $(( now_t - YT_PROBE_AT )) -lt "$YT_PROBE_TTL" ]; then
+        return 0
+    fi
+    YT_PROBE_JSON=$(yt_probe)
+    YT_PROBE_STATE=unknown
+    YT_PROBE_GROUP_DIRECT=0
+    YT_PROBE_REASON=""
+    YT_PROBE_AT=$now_t
+    [ -n "$YT_PROBE_JSON" ] || return 1
+    direct=$(json_field "$YT_PROBE_JSON" direct_ok)
+    probed=$(json_field "$YT_PROBE_JSON" probed)
+    strategy=$(json_field "$YT_PROBE_JSON" strategy_ok)
+    case "$direct:$probed:$strategy" in
+        true:true:*)  YT_PROBE_STATE=ok ;;
+        false:true:*) YT_PROBE_STATE=bad ;;
+    esac
+    n=$(printf '%s' "$YT_PROBE_JSON" | jq -r '(.group_direct // []) | length' 2>/dev/null)
+    case "$n" in
+        ''|*[!0-9]*) n=0 ;;
+        *)           YT_PROBE_GROUP_DIRECT=$n ;;
+    esac
+    YT_PROBE_REASON=$(json_field "$YT_PROBE_JSON" reason)
+    return 0
+}
+
+# ok — обход проверен и пропускает; bad — проверен и не пропускает;
+# unknown — проверить не удалось (обход выключен автотюном, нет интерфейса,
+# проба не подтвердила, что шла мимо TUN). Переводить группу можно только на
+# bad: на unknown решение было бы догадкой.
+yt_direct_state() {
+    yt_probe_run >/dev/null 2>&1
+    echo "$YT_PROBE_STATE"
+}
+
+# 0 — обход проверен и НЕ пропускает YouTube, а группа ещё не вся в VPN.
+# Это и есть основание для перевода группы в туннель.
+yt_group_needs_vpn() {
+    yt_probe_run || return 1
+    [ "$YT_PROBE_STATE" = "bad" ] || return 1
+    [ "$YT_PROBE_GROUP_DIRECT" -gt 0 ] || return 1
+    return 0
+}
+
+# YouTube в порядке: группа целиком в VPN (и пробы текущего пути прошли) либо
+# обход реально пропускает видео. Отдельно от svc_youtube_ok, который меряет
+# только текущий путь: «страница через proxy открылась» не значит, что видео не
+# сидит на мёртвом direct.
+yt_path_ok_quiet() {
+    yt_probe_run || return 0     # не спросили — не выдумываем проблему
+    [ "$YT_PROBE_GROUP_DIRECT" -eq 0 ] && return 0
+    [ "$YT_PROBE_STATE" = "ok" ]
+}
+
+# yt_group_to_vpn — 0 переведено, 2 уже в VPN, 1 ошибка (как route_force)
+yt_group_to_vpn() {
+    local out rc changed
+    out=$(timeout 60 "$OMAVPN" --json youtube proxy --reason "$YT_REASON" --no-restart 2>/dev/null)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "youtube proxy: ошибка (код $rc)"
+        return 1
+    fi
+    changed=$(json_field "$out" changed)
+    case "$changed" in
+        true)  return 0 ;;
+        false) return 2 ;;
+        *)     log "youtube proxy: непонятный ответ omavpn"
+               return 1 ;;
+    esac
+}
+
+# yt_group_to_direct — снимает только свои оверрайды (причина с префиксом
+# аудита), ручной `route set youtube.com proxy` остаётся человеку.
+yt_group_to_direct() {
+    local out rc changed
+    out=$(timeout 60 "$OMAVPN" --json youtube direct --reason "$YT_REASON_BACK" --no-restart 2>/dev/null)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "youtube direct: ошибка (код $rc)"
+        return 1
+    fi
+    changed=$(json_field "$out" changed)
+    case "$changed" in
+        true)  return 0 ;;
+        false) return 2 ;;
+        *)     log "youtube direct: непонятный ответ omavpn"
+               return 1 ;;
+    esac
+}
+
+yt_our_overrides() { # сколько доменов группы уведено в VPN нашим оверрайдом
+    local out n
+    out=$(timeout "$ROUTE_T" "$OMAVPN" --json route list 2>/dev/null) || { echo 0; return 0; }
+    # Legacy-причина — тоже наша: иначе стоящий с прежней версии guard'а
+    # `youtube.com proxy` не снимался бы возвратом и не считался своим.
+    n=$(printf '%s' "$out" | jq -r --arg p "$YT_REASON" --arg l "$YT_REASON_LEGACY" \
+        '[.overrides[]? | select(.path == "proxy" and (((.reason // "") | startswith($p)) or ((.reason // "") | startswith($l))))] | length' \
+        2>/dev/null)
+    case "$n" in
+        ''|*[!0-9]*) echo 0 ;;
+        *)           echo "$n" ;;
+    esac
+}
+
+# Возвраты YouTube считаются отдельно от смен пути VPN: раньше они тратили
+# общий бюджет switches_last_hour/can_switch, и три возврата съедали лимит —
+# настоящее лечение VPN после этого упиралось в «3+ раза за час» и не
+# применялось. Файлы лежат рядом с остальным состоянием guard.
+yt_returns_last_hour() {
+    local cutoff cnt ts
+    cutoff=$(( $(now) - 3600 ))
+    cnt=0
+    [ -f "$YT_RETURN_HISTORY" ] || { echo 0; return 0; }
+    while read -r ts; do
+        [ -n "$ts" ] || continue
+        [ "$ts" -ge "$cutoff" ] 2>/dev/null && cnt=$((cnt + 1))
+    done <"$YT_RETURN_HISTORY"
+    echo "$cnt"
+}
+
+yt_can_return() {
+    [ -f "$YT_LAST_RETURN" ] || return 0
+    local last
+    last=$(cat "$YT_LAST_RETURN" 2>/dev/null)
+    last=${last:-0}
+    case "$last" in *[!0-9]*|"") last=0 ;; esac
+    [ $(( $(now) - last )) -ge "$YT_RETURN_COOLDOWN" ]
+}
+
+note_yt_return() {
+    date +%s >>"$YT_RETURN_HISTORY" 2>/dev/null
+    tail -n 20 "$YT_RETURN_HISTORY" >"$YT_RETURN_HISTORY.tmp" 2>/dev/null \
+        && mv "$YT_RETURN_HISTORY.tmp" "$YT_RETURN_HISTORY" 2>/dev/null
+    date +%s >"$YT_LAST_RETURN" 2>/dev/null
+}
+
+# Авто-возврат: обход снова тянет — снять свои оверрайды группы. Вызывается из
+# cmd_check до лечения: возврат нужен и когда всё в порядке (иначе YouTube
+# навсегда остался бы в туннеле после одной плохой сети).
+yt_maybe_return() {
+    local have state rc
+
+    have=$(yt_our_overrides)
+    [ "${have:-0}" -gt 0 ] 2>/dev/null || return 0
+
+    # Свои предохранители: кулдаун возврата и не больше трёх возвратов в час.
+    # Общий лимит смен пути (can_switch/switches_last_hour) не расходуем — он
+    # про лечение VPN, и возвраты YouTube его выедали.
+    if ! yt_can_return; then
+        log "возврат YouTube: кулдаун возврата — не трогаю"
+        return 0
+    fi
+    if [ "$(yt_returns_last_hour)" -ge 3 ]; then
+        log "возврат YouTube: 3+ возврата за час — не воюю"
+        return 0
+    fi
+
+    # Две успешные пробы подряд с паузой: одиночная врёт (сеть дёргается, автотюн
+    # как раз перебрал стратегию), и откат по одной пробе дал бы новые качели.
+    state=$(yt_direct_state)
+    case "$state" in
+        ok) : ;;
+        bad) log "возврат YouTube: обход пока не пропускает — остаётся VPN"
+             return 0 ;;
+        *)   log "возврат YouTube: прямой путь не проверен ($state) — остаётся VPN"
+             return 0 ;;
+    esac
+    sleep "$YT_CONFIRM_GAP"
+    state=$(yt_direct_state)
+    if [ "$state" != "ok" ]; then
+        log "возврат YouTube: повторная проба не прошла ($state) — остаётся VPN"
+        return 0
+    fi
+
+    yt_group_to_direct
+    rc=$?
+    case "$rc" in
+        0) note_yt_return
+           if vpn_alive; then vpn_restart; fi
+           log "YouTube возвращён на обход: снято оверрайдов группы $have" ;;
+        1) log "возврат YouTube: omavpn не снял оверрайды" ;;
+        *) log "возврат YouTube: своих оверрайдов не нашлось — снимать нечего" ;;
+    esac
+    return 0
+}
+
 # --- лечение ---------------------------------------------------------------
 
 restart_tg() {
@@ -868,6 +1117,49 @@ heal() {
         if vpn_up; then log "VPN поднят"; else log "VPN не поднимается"; return 1; fi
     fi
 
+    # --- YouTube: сначала прямой путь, потом всё остальное -------------------
+    # Пробы ниже (`broken_services_quiet`) идут по ТЕКУЩЕМУ маршруту: пока
+    # страница открывается через proxy, они отвечают «всё уже работает», и heal
+    # выходил, не переведя видео-домены в туннель (15:53:50 → 15:54:03: группа
+    # так и осталась на direct). Здесь решение принимается по прямому пути:
+    # обход не пропускает YouTube — вся группа идёт в VPN, и результат
+    # проверяется пробами через туннель, а не флагами.
+    if [ "$VPN_BLOCKED" = 0 ] && yt_group_needs_vpn; then
+        if ! can_switch; then
+            # Тот же COOLDOWN, что у прежней крайней меры: не дёргаем путь чаще
+            # раза в 15 минут. Сам перевод идемпотентен, так что ожидание ничего
+            # не ломает — оверрайды останутся до следующего прогона.
+            log "обход не пропускает YouTube, но смена пути на кулдауне — жду следующего прогона"
+        else
+            log "обход не пропускает YouTube (${YT_PROBE_REASON:-прямой путь не отвечает}) — перевожу группу доменов в VPN"
+            # Возврат кода, а не stdout: функция пишет в лог сама, а результат
+            # отдаёт кодом (0 — переведено, 2 — уже в VPN, 1 — ошибка).
+            yt_group_to_vpn
+            case $? in
+                0) note_switch ;;
+                2) log "группа YouTube уже целиком в VPN" ;;
+                *) log "не удалось записать оверрайды группы — продолжаю общим лечением" ;;
+            esac
+            yt_probe_reset          # маршруты изменились — разбор ответа устарел
+            # Один перезапуск на пачку: оверрайды ставились с --no-restart.
+            vpn_restart
+            # Успех — это два проверенных факта: группа действительно в туннеле
+            # (по правилам, а не по нашему намерению) и YouTube через него
+            # работает. Иначе «группа переведена» было бы обещанием, а не фактом.
+            if ! yt_probe_run; then
+                log "группа записана, но состояние маршрутов не подтвердилось — продолжаю общим лечением"
+            elif [ "$YT_PROBE_GROUP_DIRECT" -ne 0 ]; then
+                log "в туннель ушло не всё ($YT_PROBE_GROUP_DIRECT дом. группы ещё на direct) — продолжаю общим лечением"
+            elif svc_youtube_ok; then
+                log "обход не пропускает YouTube — группа переведена в VPN, YouTube работает"
+                fixed=1
+                return 0
+            else
+                log "через VPN YouTube тоже не работает — иду общим лечением (ноды/перебор)"
+            fi
+        fi
+    fi
+
     broken=$(broken_services_quiet)
     [ -n "$broken" ] || { log "всё уже работает"; return 0; }
 
@@ -915,7 +1207,12 @@ heal() {
         fi
 
         # Крайняя мера: увести сломанный сервис в VPN оверрайдом маршрута.
-        if [ "$VPN_BLOCKED" = 1 ]; then
+        # Дедлайн проверяем ДО пробы обхода (до 75 с): после долгого
+        # wait_rescan_result её не хватало, прогон вылезал за бюджет и
+        # mark_fail записывал неудачу за «не успели», а не за «не помогло».
+        if guard_expired; then
+            log "крайняя мера: внутренний дедлайн прогона ($GUARD_DEADLINE с) — оверрайд не ставлю"
+        elif [ "$VPN_BLOCKED" = 1 ]; then
             log "крайняя мера (оверрайд в VPN) недоступна: VPN не поднять"
         elif [ "$(switches_last_hour)" -ge 3 ]; then
             log "путь переключался 3+ раза за час — не воюю с autotune"
@@ -927,17 +1224,30 @@ heal() {
             for svc in $broken; do
                 case "$svc" in
                     youtube)
-                        # переводим только если домен реально на direct, иначе
-                        # оверрайд вернул бы 2 и «переведён» было бы ложью
-                        if [ "$(route_path_of youtube.com)" = "direct" ]; then
-                            route_force youtube.com proxy "аудит: guard — обход не тянет"
-                            case $? in
-                                0) note_switch; fixed=1
-                                   log "YouTube переведён на VPN (route override)" ;;
-                                2) log "YouTube уже идёт через VPN — переключать нечего" ;;
-                                *) : ;;
-                            esac
-                        fi
+                        # Группа, а не youtube.com: видео-домены (googlevideo,
+                        # ytimg…) стоят в direct-правиле встроенным списком, и
+                        # оверрайд одного youtube.com их не вытаскивал — страница
+                        # шла через VPN, видео продолжало упираться в мёртвый
+                        # обход. Признак — проверенный прямой путь, а не сам факт
+                        # «страница не открылась»: при живой сети и мёртвой ноде
+                        # виноват туннель, и уводить в него видео нельзя.
+                        case "$(yt_direct_state)" in
+                            bad)
+                                yt_group_to_vpn
+                                case $? in
+                                    0) note_switch; fixed=1
+                                       log "YouTube переведён на VPN целиком (группа доменов)" ;;
+                                    2) log "YouTube уже целиком идёт через VPN — переключать нечего" ;;
+                                    *) : ;;
+                                esac
+                                ;;
+                            ok)
+                                log "YouTube: обход пропускает — сломан туннель, группу не перевожу"
+                                ;;
+                            *)
+                                log "YouTube: прямой путь не проверен — группу не перевожу"
+                                ;;
+                        esac
                         ;;
                     discord)
                         if [ "$(route_path_of discord.com)" = "direct" ]; then
@@ -1111,7 +1421,21 @@ cmd_check() {
         fi
     fi
 
+    # Авто-возврат YouTube на обход: если наши оверрайды группы стоят, а обход
+    # снова тянет — снять их. Стоит до проверки сломанных сервисов: возврат нужен
+    # и в прогоне, где всё работает, иначе YouTube остался бы в туннеле навсегда
+    # после одной плохой сети. Провал сервисов лечится ниже, но сначала — возврат:
+    # лечить то, что и так должно уйти из туннеля, незачем.
+    yt_maybe_return
+
     broken=$(broken_services_quiet)
+    if [ -z "$broken" ] && [ "$VPN_BLOCKED" = 0 ] && yt_group_needs_vpn; then
+        # Пробы по текущему пути прошли, а обход YouTube не пропускает: видео
+        # пойдёт по мёртвому direct. Это поломка, а не «всё в порядке» — иначе
+        # правило не срабатывало ровно в этом сценарии.
+        broken="youtube"
+        log "прямой путь YouTube не работает (${YT_PROBE_REASON:-проба}) — лечение нужно, хотя пробы проходят"
+    fi
     if [ -z "$broken" ]; then
         mark_ok
         log "всё в порядке (путь $(path_now), autotune $(autotune_mode), режим $(vpn_mode))"
