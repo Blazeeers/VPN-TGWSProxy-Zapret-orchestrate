@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 *.bak
 *.bak.*
+# бэкапы вида Panel.qml.bak-2026-11-17 (дефис, а не точка — под *.bak.* не попадают)
+*.bak-*
 .bak-*/
 *.tmp
 .DS_Store
