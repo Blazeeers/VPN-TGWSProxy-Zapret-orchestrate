@@ -60,6 +60,15 @@ HTTP_PORT = 10809
 TUN_IFACE = "omavpn0"
 TUN_ADDR = "172.19.0.1/30"
 
+# Сколько ждать появления default route перед подъёмом туннеля. После сна
+# NetworkManager активирует Wi-Fi позже, чем стартует VPN: если sing-box
+# собирается без default route, он не находит интерфейс и остаётся без outbound
+# навсегда («missing default interface» в singbox.log, 2026-11-17).
+DEFAULT_ROUTE_WAIT = 25.0
+# Сколько попыток поднять sing-box, если трафик не пошёл.
+TUN_ATTEMPTS = 2
+TUN_RETRY_PAUSE = 2.0
+
 # Кэш решений zapret-autotune (его CACHE): <ключ сети>.strategy. Число = для
 # этой сети подобран рабочий обход; `vpn` = обход не тянет; `off`/пусто =
 # обход выключен. Читается пользователем (файлы 0644, каталог world-readable).
@@ -2355,6 +2364,37 @@ def wait_iface(iface: str, timeout: float, proc: subprocess.Popen | None = None)
     return False
 
 
+def has_default_route() -> bool:
+    """Есть ли в таблице маршрутизации хоть один default route.
+
+    Проверяем «любой default», а не конкретно через физический интерфейс: при
+    уже поднятом туннеле default может идти через omavpn0 (strict_route), и
+    ожидание «физического» маршрута означало бы заведомый таймаут.
+    """
+    return bool(_run_out(["ip", "route", "show", "default"], 5))
+
+
+def wait_default_route(timeout: float = DEFAULT_ROUTE_WAIT) -> bool:
+    """Ждёт непустой default route, но не дольше `timeout` (не вечный цикл)."""
+    deadline = time.time() + timeout
+    while True:
+        if has_default_route():
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(1.0)
+
+
+def log_grew(path: Path, offset: int, needle: str) -> bool:
+    """Появилась ли строка `needle` в логе после позиции `offset`."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(max(0, offset))
+            return needle.encode() in handle.read(128 * 1024)
+    except OSError:
+        return False
+
+
 def log_tail(path: Path, lines: int = 6) -> str:
     """Последние строки лога: читаем хвост файла, а не весь лог целиком."""
     trim_log(path)
@@ -2532,6 +2572,14 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
     # на нём же. Теперь при отказе файл не меняется вовсе — откатывать нечего.
     set_settings(profile_index=profile_index, node_index=node_index, mode=mode)
 
+    # Сеть проверяем ДО остановки туннеля: после сна NetworkManager поднимает
+    # Wi-Fi позже, чем стартует VPN, и sing-box, собранный без default route,
+    # навсегда остаётся без outbound (2026-11-17). Ждём любой default route, в
+    # том числе через omavpn0, поэтому зациклиться на этом ожидании нельзя.
+    if not wait_default_route():
+        warn(f"default route не появился за {int(DEFAULT_ROUTE_WAIT)} с — "
+             "поднимаю туннель как есть")
+
     _cmd_off(quiet=True)
 
     last_error = ""
@@ -2546,9 +2594,32 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
                         "завершите его или освободите порт")
             raise RuntimeError("Xray не открыл SOCKS-порт: " + log_tail(XRAY_LOG) + hint)
         if mode == "tun":
-            sb_proc = spawn([str(SB_BIN), "run", "-c", str(SB_CFG)], SB_LOG, SB_PID)
-            if not wait_iface(TUN_IFACE, 8, sb_proc):
-                raise RuntimeError("TUN не поднялся: " + log_tail(SB_LOG))
+            # TUN может подняться, а outbound — нет: интерфейс есть, трафика нет.
+            # Поэтому ждём не только wait_iface, но и реальный ответ через TUN,
+            # и при провале один раз перезапускаем sing-box (пауза — на случай,
+            # что сеть доехала только что).
+            sb_offset = SB_LOG.stat().st_size if SB_LOG.exists() else 0
+            for attempt in range(1, TUN_ATTEMPTS + 1):
+                sb_proc = spawn([str(SB_BIN), "run", "-c", str(SB_CFG)], SB_LOG, SB_PID)
+                if not wait_iface(TUN_IFACE, 8, sb_proc):
+                    raise RuntimeError("TUN не поднялся: " + log_tail(SB_LOG))
+                lost = log_grew(SB_LOG, sb_offset, "missing default interface")
+                if not lost and _proxy_ok() and _tun_ok():
+                    break
+                if attempt >= TUN_ATTEMPTS:
+                    raise RuntimeError(
+                        "TUN поднят, но трафик через него не идёт: " + log_tail(SB_LOG))
+                warn("sing-box не нашёл default interface — перезапускаю"
+                     if lost else "трафик через TUN не идёт — перезапускаю sing-box")
+                stop_proc(SB_PID, "sing-box")
+                time.sleep(TUN_RETRY_PAUSE)
+                sb_offset = SB_LOG.stat().st_size if SB_LOG.exists() else 0
+        elif not _proxy_ok():
+            # В режиме proxy TUN нет: единственный признак рабочего VPN — выход
+            # через SOCKS. Одна повторная попытка гасит случайный обрыв сети.
+            time.sleep(TUN_RETRY_PAUSE)
+            if not _proxy_ok():
+                raise RuntimeError("SOCKS слушает, но выхода через ноду нет")
     except Exception as exc:  # noqa: BLE001
         last_error = str(exc)
         stop_proc(SB_PID, "sing-box")
@@ -3406,6 +3477,24 @@ def _proxy_ok(timeout: float = 8.0) -> bool:
     """Работает ли туннель: HTTP-код через локальный SOCKS."""
     out = _run_out(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time",
                     str(timeout), "--socks5-hostname", f"127.0.0.1:{SOCKS_PORT}",
+                    "https://www.cloudflare.com/cdn-cgi/trace"], timeout + 3)
+    try:
+        return int(out or 0) == 200
+    except ValueError:
+        return False
+
+
+def _tun_ok(timeout: float = 6.0) -> bool:
+    """Идёт ли трафик через TUN: обычный запрос (без SOCKS) должен дать 200.
+
+    Проверка через SOCKS этого не заменяет: она идёт напрямую в xray, а TUN —
+    отдельный путь через sing-box. Именно он ломался после сна, когда sing-box
+    не находил default interface: SOCKS отвечал, а весь системный трафик висел.
+    `--noproxy '*'` — чтобы HTTP-прокси из переменных окружения не подменил
+    проверяемый путь.
+    """
+    out = _run_out(["curl", "--noproxy", "*", "-s", "-o", "/dev/null",
+                    "-w", "%{http_code}", "--max-time", str(timeout),
                     "https://www.cloudflare.com/cdn-cgi/trace"], timeout + 3)
     try:
         return int(out or 0) == 200
