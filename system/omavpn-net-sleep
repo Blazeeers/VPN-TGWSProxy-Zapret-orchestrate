@@ -1,0 +1,13 @@
+#!/bin/bash
+# omavpn-net — system-sleep хук: после выхода из сна проверить TUN и при
+# необходимости пересобрать его.
+#
+# Нужен отдельно от NM-dispatcher: если Wi-Fi не переподключался (остался тот же
+# BSSID), события "up" не будет, а туннель после сна всё равно мог собраться без
+# default route (17.11.2026). Вся работа — в фоне: systemd не должен ждать,
+# иначе тормозится и сам сон, и пробуждение.
+[ "${1:-}" = "post" ] || exit 0
+
+setsid /etc/NetworkManager/dispatcher.d/95-omavpn-net post "${2:-}" \
+    >>/dev/null 2>&1 </dev/null &
+exit 0

@@ -60,6 +60,19 @@ rm -f "$HOME_DIR/.config/systemd/user/omavpn-route-audit.service" \
       "$HOME_DIR/.config/systemd/user/omavpn-route-recheck.timer"
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 
+# Хук на смену сети и выход из сна: пути системные (root). Без хука таймер guard
+# продолжит работать, но после сна туннель восстановится не сразу — поэтому
+# убираем, чтобы не осталось скриптов, дёргающих удалённый CLI.
+HOOK_NM=/etc/NetworkManager/dispatcher.d/95-omavpn-net
+HOOK_SLEEP=/usr/lib/systemd/system-sleep/omavpn-net
+if sudo -n rm -f "$HOOK_NM" "$HOOK_SLEEP" 2>/dev/null; then
+  :
+elif command -v pkexec >/dev/null 2>&1 && timeout 60 pkexec rm -f "$HOOK_NM" "$HOOK_SLEEP" 2>/dev/null; then
+  :
+else
+  printf '\033[1;33m[!]\033[0m Хуки остались (нужен root): %s %s\n' "$HOOK_NM" "$HOOK_SLEEP"
+fi
+
 # Оверрайды маршрутов — это решение человека, а не мусор установки: в обычном
 # режиме сохраняем их и убираем только записи аудита (reason начинается с
 # «аудит»). Иначе переустановка молча стирает ручные `omavpn route set`, а

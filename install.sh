@@ -142,6 +142,40 @@ fi
 say "Ставлю CLI в $LOCAL_BIN/omavpn"
 install -m 0755 "$HERE/bin/omavpn" "$LOCAL_BIN/omavpn"
 
+# --- хук на смену сети и выход из сна ---------------------------------------
+# Таймер guard живёт на монотонных часах и на время сна «замирает», а autostart
+# срабатывает только при входе в сессию. После сна NetworkManager поднимает
+# Wi-Fi позже, чем стартует VPN, и sing-box мог собраться без default route —
+# TUN есть, трафика нет. Хук ловит up/dhcp4-change у NetworkManager и фазу post
+# у system-sleep. Оба пути системные, поэтому нужен root; недоступный root не
+# рвёт установку: без хука работает таймер guard, просто медленнее.
+say "Ставлю хук на смену сети и выход из сна (нужен root)…"
+HOOK_NM=/etc/NetworkManager/dispatcher.d/95-omavpn-net
+HOOK_SLEEP=/usr/lib/systemd/system-sleep/omavpn-net
+HOOK_RENDERED="$(mktemp)"
+sed -e "s|@HOME_DIR@|$HOME_DIR|g" -e "s|@USER@|$(id -un)|g" -e "s|@UID@|$(id -u)|g" \
+  "$HERE/system/95-omavpn-net" >"$HOOK_RENDERED"
+HOOK_OK=0
+HOOK_CMD=(sh -c "install -o root -g root -m 0755 '$HOOK_RENDERED' '$HOOK_NM' \
+  && install -o root -g root -m 0755 '$HERE/system/omavpn-net-sleep' '$HOOK_SLEEP'")
+if sudo -n "${HOOK_CMD[@]}" 2>/dev/null; then
+  HOOK_OK=1
+elif [ -t 0 ] && [ -t 1 ] && sudo "${HOOK_CMD[@]}"; then
+  HOOK_OK=1
+elif command -v pkexec >/dev/null 2>&1 &&
+     timeout 120 pkexec "${HOOK_CMD[@]}"; then
+  HOOK_OK=1
+fi
+rm -f "$HOOK_RENDERED"
+if [ "$HOOK_OK" = 1 ]; then
+  say "хук стоит: $HOOK_NM и $HOOK_SLEEP"
+else
+  warn "Не удалось поставить хук на смену сети и выход из сна (нет root)."
+  warn "Туннель будет восстанавливаться по таймеру guard, а не сразу после сна."
+  warn "Поставить вручную: sudo install -o root -g root -m 0755 system/95-omavpn-net $HOOK_NM"
+  warn "                   sudo install -o root -g root -m 0755 system/omavpn-net-sleep $HOOK_SLEEP"
+fi
+
 # --- Плагин панели -----------------------------------------------------------
 if [ -d "$HERE/shell-plugin/bypass-status" ]; then
   say "Устанавливаю плагин панели ($PLUGIN_ID — виджет «Обходы»)…"

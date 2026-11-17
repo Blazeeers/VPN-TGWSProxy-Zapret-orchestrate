@@ -1,0 +1,110 @@
+#!/bin/bash
+# omavpn-net — пересобрать TUN после выхода из сна / поднятия Wi-Fi.
+#
+# Ставится как /etc/NetworkManager/dispatcher.d/95-omavpn-net (root:root 0755).
+# NM зовёт: $1=интерфейс $2=действие (up, down, dhcp4-change…).
+# system-sleep зовёт: $1=pre|post $2=suspend|hibernate.
+#
+# Почему нужен: таймер omavpn-guard.timer живёт на монотонных часах и на время
+# сна «замирает», а omavpn-autostart срабатывает только при входе в сессию.
+# 17.11.2026 после сна sing-box поднялся до появления default route, остался без
+# outbound («missing default interface»), TUN был — трафика не было.
+#
+# Скрипт обязан вернуть управление мгновенно: вся работа уходит в фон, ни одного
+# блокирующего запроса до выхода.
+
+LOG=@HOME_DIR@/.local/state/omavpn/net-hook.log
+SBLOG=@HOME_DIR@/.local/state/omavpn/singbox.log
+MARK=/run/omavpn-net.last
+U=@USER@
+UID_N=@UID@
+OMAVPN=@HOME_DIR@/.local/bin/omavpn
+PROBE="https://www.cloudflare.com/cdn-cgi/trace"
+
+log() {
+    logger -t omavpn-net -- "$*" 2>/dev/null
+    printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null
+}
+
+# omavpn — питон под пользователем; из root нужны его переменные сессии, иначе
+# не достучится до systemd --user и D-Bus.
+run_as_user() {
+    sudo -u "$U" XDG_RUNTIME_DIR="/run/user/$UID_N" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_N/bus" "$@"
+}
+
+# --- фоновый работник -------------------------------------------------------
+if [ "${1:-}" = "--worker" ]; then
+    now=$(date +%s)
+    log "старт: интерфейс=${2:-?} событие=${3:-?}"
+
+    # Сеть после сна появляется не сразу: ждём default route максимум 30 с.
+    i=0
+    while [ "$i" -lt 15 ]; do
+        ip route show default 2>/dev/null | grep -q . && break
+        sleep 2
+        i=$((i + 1))
+    done
+    if ! ip route show default 2>/dev/null | grep -q .; then
+        log "нет default route через 30 с — не трогаю"
+        exit 0
+    fi
+
+    # Анти-флап: не чаще одного восстановления в 60 с.
+    last=$(cat "$MARK" 2>/dev/null)
+    case "${last:-}" in ''|*[!0-9]*) last=0 ;; esac
+    if [ $(( now - last )) -lt 60 ]; then
+        log "пропуск: восстановление было $(( now - last )) с назад"
+        exit 0
+    fi
+
+    # Свежий признак «sing-box не нашёл default interface» = туннель собран
+    # мимо сети. Старые записи (лог не менялся 2 минуты) не считаем.
+    route_lost=0
+    if [ -f "$SBLOG" ]; then
+        mt=$(stat -c %Y "$SBLOG" 2>/dev/null || echo 0)
+        if [ $(( now - mt )) -le 120 ] && tail -n 40 "$SBLOG" 2>/dev/null \
+            | grep -q 'missing default interface'; then
+            route_lost=1
+        fi
+    fi
+
+    # Две пробы: SOCKS (xray+нода) и обычный запрос (путь через TUN, он и
+    # ломался 17.11). Восстановление — только если плохо хоть где-то.
+    socks=$(curl -4 -s -o /dev/null -w '%{http_code}' --max-time 8 \
+        --socks5-hostname 127.0.0.1:10808 "$PROBE" 2>/dev/null)
+    tun=$(curl -4 --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 8 \
+        "$PROBE" 2>/dev/null)
+    case "${socks:-000}" in 2??|3??) socks_ok=1 ;; *) socks_ok=0 ;; esac
+    case "${tun:-000}" in 2??|3??) tun_ok=1 ;; *) tun_ok=0 ;; esac
+
+    if [ "$socks_ok" = 1 ] && [ "$tun_ok" = 1 ] && [ "$route_lost" = 0 ]; then
+        log "в порядке: socks=$socks tun=$tun — ничего не перезапускаю"
+        exit 0
+    fi
+
+    printf '%s\n' "$now" >"$MARK" 2>/dev/null
+    log "восстановление: socks=$socks tun=$tun route_lost=$route_lost"
+    out=$(run_as_user "$OMAVPN" restart 2>&1)
+    rc=$?
+    log "omavpn restart: код $rc${out:+ — $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)}"
+    sleep 3
+    st=$(run_as_user "$OMAVPN" status 2>&1 | head -1)
+    log "после: ${st:-статус не получен}"
+    exit 0
+fi
+
+# --- режим триггера: решаем, надо ли, и сразу выходим ----------------------
+first="${1:-}"
+second="${2:-}"
+if [ "$first" = "post" ]; then
+    :                       # system-sleep, фаза post — работаем
+elif [ "$second" = "up" ] || [ "$second" = "dhcp4-change" ]; then
+    :                       # NM: интерфейс поднялся
+else
+    exit 0                  # pre, down, удаление адреса — не наш случай
+fi
+[ "$first" = "lo" ] && exit 0
+
+setsid "$0" --worker "$first" "$second" >>"$LOG" 2>&1 </dev/null &
+exit 0
