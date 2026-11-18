@@ -1122,16 +1122,19 @@ tgws_churn_state() {
     socks=$(ss -tanp 2>/dev/null | grep -E -- "$pattern" 2>/dev/null)
     cw=$(printf '%s\n' "$socks" | grep -c '^CLOSE-WAIT' 2>/dev/null || true)
     syn=$(printf '%s\n' "$socks" | grep -c '^SYN-SENT' 2>/dev/null || true)
-    # Ошибки: строки с «failed» за окно. Формат «2026-11-18 11:31:03 WARNING …»
-    # фиксированной ширины, поэтому сравнение строк совпадает с хронологией и
-    # `date -d` на каждую строку не нужен. Нет лога — ноль, а не ошибка.
+    # Ошибки: «failed» (пул Cloudflare не отвечает) и «no fallback available»
+    # (WS-пул пуст, TCP-fallback недоступен — соединение рвётся, а процесс жив).
+    # Формат «2026-11-18 11:31:03 WARNING …» фиксированной ширины, поэтому
+    # сравнение строк совпадает с хронологией и `date -d` на каждую строку не
+    # нужен. Нет лога — ноль, а не ошибка.
     if [ -f "$TG_LOG" ]; then
         cut=$(LC_ALL=C date -d "-$TG_CHURN_WINDOW seconds" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
         if [ -n "$cut" ]; then
             while IFS= read -r line; do
                 [ "${#line}" -ge 19 ] || continue
                 [[ "${line:0:19}" < "$cut" ]] && continue
-                [[ "${line,,}" == *failed* ]] && errs=$((errs + 1))
+                [[ "${line,,}" == *failed* || "${line,,}" == *"no fallback available"* ]] \
+                    && errs=$((errs + 1))
             done < <(tail -c "$TG_CHURN_TAIL" "$TG_LOG" 2>/dev/null)
         fi
     fi
