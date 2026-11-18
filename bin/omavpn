@@ -1166,6 +1166,10 @@ DEFAULT_SETTINGS = {
     "node_index": -1,
     "mode": "tun",
     "strict_route": False,
+    # Стек TUN sing-box. `system` — трафик считает ядро; `gvisor` (userspace
+    # Go-стек) был жёстко зашит до 3.1.0 и жёг ~26% CPU на шторме
+    # переподключений tg-ws-proxy при почти нулевом трафике. `mixed` → system.
+    "stack": "system",
     # Re:filter включён по умолчанию: список заблокированного в РФ и есть то,
     # ради чего туннель держат. Файлы кэша качает `refilter update` (и установщик).
     "refilter": True,
@@ -1212,13 +1216,34 @@ def settings() -> dict:
     # Наследие установок до 2.1.0: там TUN поднимался с mtu 9000 и стеком mixed
     # (рвалось ~20% TLS к YouTube, mixed ломал туннель). Правим при чтении и
     # ничего не пишем: файл настроек остаётся как есть, установка идемпотентна.
-    # Сборка конфига (build_singbox) и так берёт 1500/gvisor, но значения из
-    # старых settings.json не должны просочиться ни одному потребителю.
+    # Сборка конфига (build_singbox) берёт 1500 и стек из этих же настроек, но
+    # значения из старых settings.json не должны просочиться ни одному потребителю.
     if _num(s.get("mtu"), 0) == 9000:
         s["mtu"] = 1500
-    if str(s.get("stack") or "").strip().lower() == "mixed":
-        s["stack"] = "gvisor"
+    s["stack"] = singbox_stack(s.get("stack"))
     return s
+
+
+# Допустимые стеки TUN у sing-box. `system` — ядерный TCP/IP: трафик считает
+# ядро, и sing-box не крутит свой Go-стек на каждый пакет. `gvisor` — userspace
+# (так было до 3.1.0 жёстко зашито): на шторме переподключений он жёг ~26% CPU
+# при почти нулевом трафике. `mixed` — комбинация, трактуем как `system`.
+SINGBOX_STACKS = ("system", "gvisor")
+SINGBOX_STACK_ALIASES = {"": "system", "mixed": "system"}
+
+
+def singbox_stack(value) -> str:
+    """Стек TUN из настроек: system|gvisor (mixed и пусто → system).
+
+    Неизвестное значение — не повод падать: берём умолчание и говорим об этом,
+    иначе опечатка в settings.json роняла бы запуск VPN целиком.
+    """
+    text = str(value or "").strip().lower()
+    text = SINGBOX_STACK_ALIASES.get(text, text)
+    if text in SINGBOX_STACKS:
+        return text
+    warn(f"неизвестный стек TUN {value!r} — беру system")
+    return "system"
 
 
 def set_settings(**kw) -> dict:
@@ -2336,7 +2361,12 @@ def bootstrap_doh_ip() -> str:
     return ""
 
 
-def build_singbox(profile_index: int, strict: bool) -> dict:
+def build_singbox(profile_index: int, strict: bool, stack: str | None = None) -> dict:
+    # Стек TUN — из настроек, если не задан явно. Значение всегда проверенное:
+    # system|gvisor (mixed и пусто → system, см. singbox_stack).
+    if stack is None:
+        stack = singbox_stack(settings().get("stack"))
+    stack = singbox_stack(stack)
     ips, domains = server_endpoints(profile_index)
     # Re:filter: заблокированное в РФ добиваем в туннель. Наборы — только если
     # функция включена и файлы уже скачаны (иначе правила просто нет).
@@ -2435,7 +2465,7 @@ def build_singbox(profile_index: int, strict: bool) -> dict:
             "interface_name": TUN_IFACE,
             "address": [TUN_ADDR],
             "mtu": 1500,
-            "stack": "gvisor",
+            "stack": stack,
             "auto_route": True,
             # `_truthy` на входе: значение приходит из settings.json, где после
             # ручной правки может стоять строка — bool("false") == True поднял бы
@@ -2505,6 +2535,25 @@ def validate(cmd: list, path: Path, timeout: float = 30.0) -> str:
         return str(exc)
     if p.returncode != 0:
         return (p.stderr or p.stdout or "ошибка конфигурации").strip()
+    return ""
+
+
+def save_singbox_config(cfg: dict) -> str:
+    """Пишет singbox.json, только если конфиг принимается `sing-box check`.
+
+    Проверка идёт на временной копии: рабочий конфиг не портится, если бинарь
+    отверг новую сборку (например, стек system на неподходящем ядре или битое
+    правило после ручной правки). Возврат — текст ошибки, "" — файл записан.
+    """
+    tmp = SB_CFG.with_name(SB_CFG.name + ".check")
+    try:
+        save_json(tmp, cfg)
+        err = validate([str(SB_BIN), "check", "-c", str(tmp)], tmp)
+    finally:
+        tmp.unlink(missing_ok=True)
+    if err:
+        return err
+    save_json(SB_CFG, cfg)
     return ""
 
 
@@ -2926,8 +2975,9 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
     sb_cfg = None
     if mode == "tun":
         sb_cfg = build_singbox(profile_index, _truthy(s.get("strict_route", False)))
-        save_json(SB_CFG, sb_cfg)
-        err = validate([str(SB_BIN), "check", "-c", str(SB_CFG)], SB_CFG)
+        # Проверка на временной копии ДО записи: рабочий singbox.json не
+        # портится, если бинарь не принял сборку.
+        err = save_singbox_config(sb_cfg)
         if err:
             raise RuntimeError(f"конфиг sing-box отклонён: {err}")
 
@@ -2964,9 +3014,27 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
             # и при провале один раз перезапускаем sing-box (пауза — на случай,
             # что сеть доехала только что).
             sb_offset = SB_LOG.stat().st_size if SB_LOG.exists() else 0
+            stack_now = str((sb_cfg.get("inbounds") or [{}])[0].get("stack") or "")
+            stack_fallback = False
             for attempt in range(1, TUN_ATTEMPTS + 1):
                 sb_proc = spawn([str(SB_BIN), "run", "-c", str(SB_CFG)], SB_LOG, SB_PID)
                 if not wait_iface(TUN_IFACE, 8, sb_proc):
+                    # Стек system поднимает TUN через ядро и на части сборок ядра
+                    # не заводится вовсе (или процесс падает). Один раз пробуем
+                    # gvisor — до 3.1.0 он и был единственным — и пишем об этом в
+                    # лог. Зацикливать нельзя: следующий `on` снова начнёт с system.
+                    if stack_now == "system" and not stack_fallback:
+                        stack_fallback = True
+                        warn("TUN не поднялся со stack=system — повторяю с gvisor")
+                        stop_proc(SB_PID, "sing-box")
+                        sb_cfg = build_singbox(profile_index,
+                                               _truthy(s.get("strict_route", False)),
+                                               stack="gvisor")
+                        err = save_singbox_config(sb_cfg)
+                        if err:
+                            raise RuntimeError(f"конфиг sing-box отклонён: {err}")
+                        sb_offset = SB_LOG.stat().st_size if SB_LOG.exists() else 0
+                        continue
                     raise RuntimeError("TUN не поднялся: " + log_tail(SB_LOG))
                 lost = log_grew(SB_LOG, sb_offset, "missing default interface")
                 if not lost and _proxy_ok() and _tun_ok():
