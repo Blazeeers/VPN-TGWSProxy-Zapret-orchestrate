@@ -109,11 +109,9 @@ SUBSCRIPTION_FILE = CONF / "subscription"
 
 PROXY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "wireguard"}
 
-# Telegram Desktop и локальный MTProto/WS-прокси (tg-ws-proxy) идут через
-# туннель: в РФ прямой путь до серверов Telegram режут по медиа, и прокси
-# большую часть времени уходит в TCP-fallback с деградацией (18.11.2026:
-# «WS pool unavailable» 2367 раз против 408 попаданий). Через VPN и WS-пул,
-# и прямое TCP работают. Bot API (api.telegram.org) и раньше шёл в VPN.
+# Telegram Desktop и локальный MTProto/WS-прокси (tg-ws-proxy) не туннелируем —
+# идут напрямую. Bot API (api.telegram.org) при этом остаётся в VPN: прямой
+# доступ к нему у провайдера блокируется, а tg-ws-proxy его не обслуживает.
 TELEGRAM_PROCESSES = ["tg-ws-proxy", "TgWsProxy", "Telegram", "telegram-desktop"]
 
 # Tailscale. Трафик своего tailnet (CGNAT 100.64.0.0/10, включая MagicDNS
@@ -2505,7 +2503,7 @@ def build_singbox(profile_index: int, strict: bool, stack: str | None = None) ->
                 *forced_rule,
                 *ru_resolve,
                 {"domain_suffix": direct_domains(), "outbound": "direct"},
-                {"process_name": TELEGRAM_PROCESSES, "outbound": "proxy"},
+                {"process_name": TELEGRAM_PROCESSES, "outbound": "direct"},
                 *bypass,
                 # Процесс Xray (в т.ч. временный из `probe`) ходит к серверам
                 # подписки напрямую. Ставим это правило ДО Re:filter: иначе
