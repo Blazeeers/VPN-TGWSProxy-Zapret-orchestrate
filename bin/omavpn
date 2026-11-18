@@ -1166,10 +1166,11 @@ DEFAULT_SETTINGS = {
     "node_index": -1,
     "mode": "tun",
     "strict_route": False,
-    # Стек TUN sing-box. `system` — трафик считает ядро; `gvisor` (userspace
-    # Go-стек) был жёстко зашит до 3.1.0 и жёг ~26% CPU на шторме
-    # переподключений tg-ws-proxy при почти нулевом трафике. `mixed` → system.
-    "stack": "system",
+    # Стек TUN sing-box. Умолчание — `gvisor` (userspace Go-стек): он проверен
+    # в бою. `system` (ядерный TCP/IP) дешевле по CPU, но 18.11.2026 на этой
+    # машине дал «TUN поднят, трафик не идёт», поэтому он только явной опцией.
+    # `mixed` → gvisor.
+    "stack": "gvisor",
     # Re:filter включён по умолчанию: список заблокированного в РФ и есть то,
     # ради чего туннель держат. Файлы кэша качает `refilter update` (и установщик).
     "refilter": True,
@@ -1224,16 +1225,16 @@ def settings() -> dict:
     return s
 
 
-# Допустимые стеки TUN у sing-box. `system` — ядерный TCP/IP: трафик считает
-# ядро, и sing-box не крутит свой Go-стек на каждый пакет. `gvisor` — userspace
-# (так было до 3.1.0 жёстко зашито): на шторме переподключений он жёг ~26% CPU
-# при почти нулевом трафике. `mixed` — комбинация, трактуем как `system`.
+# Допустимые стеки TUN у sing-box. `gvisor` — userspace (проверенный путь:
+# так было до 3.1.0). `system` — ядерный TCP/IP: дешевле по CPU, но на части
+# сборок даёт «TUN поднят, трафик не идёт» — только явной опцией в настройках.
+# `mixed` исторически ломал туннель, трактуем как `gvisor`.
 SINGBOX_STACKS = ("system", "gvisor")
-SINGBOX_STACK_ALIASES = {"": "system", "mixed": "system"}
+SINGBOX_STACK_ALIASES = {"": "gvisor", "mixed": "gvisor"}
 
 
 def singbox_stack(value) -> str:
-    """Стек TUN из настроек: system|gvisor (mixed и пусто → system).
+    """Стек TUN из настроек: gvisor|system (mixed и пусто → gvisor).
 
     Неизвестное значение — не повод падать: берём умолчание и говорим об этом,
     иначе опечатка в settings.json роняла бы запуск VPN целиком.
@@ -1242,8 +1243,8 @@ def singbox_stack(value) -> str:
     text = SINGBOX_STACK_ALIASES.get(text, text)
     if text in SINGBOX_STACKS:
         return text
-    warn(f"неизвестный стек TUN {value!r} — беру system")
-    return "system"
+    warn(f"неизвестный стек TUN {value!r} — беру gvisor")
+    return "gvisor"
 
 
 def set_settings(**kw) -> dict:
@@ -2363,7 +2364,7 @@ def bootstrap_doh_ip() -> str:
 
 def build_singbox(profile_index: int, strict: bool, stack: str | None = None) -> dict:
     # Стек TUN — из настроек, если не задан явно. Значение всегда проверенное:
-    # system|gvisor (mixed и пусто → system, см. singbox_stack).
+    # gvisor|system (mixed и пусто → gvisor, см. singbox_stack).
     if stack is None:
         stack = singbox_stack(settings().get("stack"))
     stack = singbox_stack(stack)
@@ -3039,6 +3040,23 @@ def _cmd_on(profile_index: int | None, node_index: int | None, mode: str | None,
                 lost = log_grew(SB_LOG, sb_offset, "missing default interface")
                 if not lost and _proxy_ok() and _tun_ok():
                     break
+                # «TUN есть, трафика нет» на стеке system — это тоже провал
+                # стека, а не сети: 18.11.2026 ядерный стек поднял omavpn0, но
+                # пакеты через него не пошли, и проверка «интерфейс не создан»
+                # этого не ловила. Переключаемся на gvisor один раз.
+                if stack_now == "system" and not stack_fallback:
+                    stack_fallback = True
+                    warn("TUN поднят, но трафик не идёт со stack=system — "
+                         "повторяю с gvisor")
+                    stop_proc(SB_PID, "sing-box")
+                    sb_cfg = build_singbox(profile_index,
+                                           _truthy(s.get("strict_route", False)),
+                                           stack="gvisor")
+                    err = save_singbox_config(sb_cfg)
+                    if err:
+                        raise RuntimeError(f"конфиг sing-box отклонён: {err}")
+                    sb_offset = SB_LOG.stat().st_size if SB_LOG.exists() else 0
+                    continue
                 if attempt >= TUN_ATTEMPTS:
                     raise RuntimeError(
                         "TUN поднят, но трафик через него не идёт: " + log_tail(SB_LOG))
