@@ -38,6 +38,20 @@ TGWS_VERSION_FILE = os.path.join(HOME, ".local", "share", "tgwsproxy", "version"
 # `tg-ws-proxy.service`. Держим оба: иначе после обновления компонента юнит
 # «мёртв» для проверок и автозапуск не работает.
 TGWS_UNITS = ("tg-ws-proxy.service", "app-tg\\x2dws\\x2dproxy@autostart.service")
+# Накопление ресурсов tg-ws-proxy («churn»). Процесс живёт неделями и на мёртвом
+# пуле Cloudflare копит дескрипторы и сокеты в CLOSE-WAIT (peer соединение
+# закрыл — приложение свой конец нет). Пользовательская проба Telegram при этом
+# проходит: трафик уходит в H2-fallback, поэтому «Telegram работает» ничего не
+# говорит о самом процессе. Метрики дешёвые: /proc, `ss`, хвост лога; в сеть не
+# ходим, чтобы не повторять тот же шторм.
+TGWS_CHURN_WINDOW = 300                  # окно подсчёта ошибок, с (5 минут)
+TGWS_CHURN_TAIL = 1 << 20                # читаем хвост лога (файл ротируется на 5 МБ)
+TGWS_CHURN_LIMITS = {"fd": 300, "close_wait": 40, "syn_sent": 20,
+                     "errors_per_min": 20.0}
+# Состояния TCP, которые считаем и показываем: ESTAB — рабочие соединения,
+# CLOSE-WAIT — утечка дескрипторов, SYN-SENT — ретраи на мёртвые узлы,
+# FIN-WAIT — незакрытые полузакрытые соединения.
+TGWS_SOCKET_STATES = ("ESTAB", "CLOSE-WAIT", "SYN-SENT", "FIN-WAIT-1", "FIN-WAIT-2")
 UPDATES_MAX_AGE = 7 * 24 * 3600
 YOUTUBE_CACHE_AGE = 30 * 60
 RESCAN_REQUEST = os.path.join(HOME, ".cache", "zapret-autotune", "rescan.request")
@@ -478,14 +492,134 @@ def port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _tgws_pids() -> list[int]:
+    """PID'ы tg-ws-proxy (пусто — не запущен).
+
+    PyInstaller-сборка держит ДВА процесса с одним именем: загрузчик и рабочий.
+    Сокеты и дескрипторы живут у рабочего, поэтому считаем по всем сразу — иначе
+    метрика занижается ровно в том сценарии, ради которого она нужна.
+    """
+    pids = []
+    for line in run(["pgrep", "-x", "tg-ws-proxy"], timeout=3).splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
+    return pids
+
+
+def _tgws_fd_count(pids: list[int]) -> int:
+    """Сколько дескрипторов открыто у процесса (суммарно по его PID'ам)."""
+    total = 0
+    for pid in pids:
+        try:
+            total += len(os.listdir(f"/proc/{pid}/fd"))
+        except OSError:
+            continue          # процесс уже завершился — не повод падать
+    return total
+
+
+def _tgws_sockets(pids: list[int]) -> dict[str, int]:
+    """Счётчики TCP-состояний процесса из одного вызова `ss -tanp`.
+
+    PID ищем подстрокой `pid=<pid>,`: имя процесса в выводе `ss` может быть
+    обрезано, а у PyInstaller их два. Строка состояния — первое поле, поэтому
+    заголовок и прочие строки отсеиваются сами.
+    """
+    counts = {state: 0 for state in TGWS_SOCKET_STATES}
+    if not pids:
+        return counts
+    marks = tuple(f"pid={pid}," for pid in pids)
+    for line in run(["ss", "-tanp"], timeout=4).splitlines():
+        state = line.split(" ", 1)[0]
+        if state not in counts:
+            continue
+        if any(mark in line for mark in marks):
+            counts[state] += 1
+    return counts
+
+
+def _tgws_errors_per_min(log_path: str, window: float = TGWS_CHURN_WINDOW) -> tuple[float, int]:
+    """(ошибок в минуту, сколько строк с «failed») за последние `window` секунд.
+
+    Строки лога начинаются с «2026-11-18 11:31:03  WARNING …»: формат фиксированной
+    ширины с нулями, поэтому сравнение строк совпадает с хронологией и `date -d`
+    на каждую строку не нужен. Второй элемент — сырое число строк, оно помогает
+    отличить «20 в минуту» от «2000 в минуту» при разборе жалобы.
+    """
+    if not log_path or not os.path.exists(log_path):
+        return 0.0, 0
+    cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - window))
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - TGWS_CHURN_TAIL))
+            raw = handle.read()
+    except OSError:
+        return 0.0, 0
+    lines = 0
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if len(line) < 19 or line[:19] < cutoff:
+            continue
+        if "failed" in line.lower():
+            lines += 1
+    return round(lines * 60.0 / window, 1), lines
+
+
+def _tgws_churn(pids: list[int], log_path: str) -> dict:
+    """Метрики деградации и вердикт ok|degraded со списком сработавших условий."""
+    socks = _tgws_sockets(pids)
+    per_min, errors = _tgws_errors_per_min(log_path)
+    churn = {
+        "fd": _tgws_fd_count(pids),
+        "sockets": socks,
+        "close_wait": socks["CLOSE-WAIT"],
+        "syn_sent": socks["SYN-SENT"],
+        "errors": errors,
+        "errors_per_min": per_min,
+        "window": TGWS_CHURN_WINDOW,
+    }
+    limits = TGWS_CHURN_LIMITS
+    reasons = []
+    if churn["fd"] > limits["fd"]:
+        reasons.append(f"fd {churn['fd']} > {limits['fd']}")
+    if churn["close_wait"] > limits["close_wait"]:
+        reasons.append(f"close_wait {churn['close_wait']} > {limits['close_wait']}")
+    if churn["syn_sent"] > limits["syn_sent"]:
+        reasons.append(f"syn_sent {churn['syn_sent']} > {limits['syn_sent']}")
+    if churn["errors_per_min"] > limits["errors_per_min"]:
+        reasons.append(f"ошибок {churn['errors_per_min']}/мин > "
+                       f"{limits['errors_per_min']:g}/мин")
+    churn["verdict"] = "degraded" if reasons else "ok"
+    churn["reason"] = reasons
+    return churn
+
+
 def tgwsproxy_status() -> dict:
-    running = bool(run(["pgrep", "-x", "tg-ws-proxy"]))
+    pids = _tgws_pids()
     conf = os.path.join(HOME, ".config", "TgWsProxy", "config.json")
     port = 1443
+    cfproxy, h2, pool_size = False, False, 0
     cfg = _read_json(conf)
     if isinstance(cfg, dict):
         port = int(_num(cfg.get("port"), 1443)) or 1443
-    return {"running": running, "port": port, "listening": port_open(port)}
+        cfproxy = bool(cfg.get("cfproxy"))
+        h2 = bool(cfg.get("h2"))
+        pool_size = int(_num(cfg.get("pool_size"), 0))
+    # Путь к логу в конфиге не хранится: proxy.log лежит рядом с config.json.
+    log_path = os.path.join(os.path.dirname(conf), "proxy.log")
+    if not os.path.exists(log_path):
+        log_path = ""
+    return {
+        "running": bool(pids),
+        "pid": pids[0] if pids else 0,
+        "port": port,
+        "listening": port_open(port),
+        "cfproxy": cfproxy,
+        "h2": h2,
+        "pool_size": pool_size,
+        "churn": _tgws_churn(pids, log_path),
+    }
 
 
 def direct_status(app: str) -> dict:
@@ -956,10 +1090,17 @@ def health_items(app: str, cli: str) -> tuple[list, dict]:
     # --- tg-ws-proxy --------------------------------------------------------
     tg = tgwsproxy_status()
     data["tgwsproxy"] = tg
+    churn = tg.get("churn") or {}
+    detail = ("порт " + str(tg.get("port")) + " слушает") if tg.get("listening") \
+        else "не слушает"
+    # Деградацию (утечка сокетов, шторм ошибок) показываем в подписи, но
+    # состояние строки не трогаем: Telegram через H2-fallback работает, и
+    # «bad» заставил бы guard лечить то, что пользователю пока не мешает.
+    if churn.get("verdict") == "degraded":
+        detail += "; " + ", ".join(str(r) for r in (churn.get("reason") or []))
     items.append({"id": "tgwsproxy", "name": "tg-ws-proxy",
                   "state": "ok" if tg.get("listening") else "bad",
-                  "detail": ("порт " + str(tg.get("port")) + " слушает") if tg.get("listening")
-                            else "не слушает"})
+                  "detail": detail})
     return items, data
 
 

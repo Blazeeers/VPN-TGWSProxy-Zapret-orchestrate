@@ -104,6 +104,35 @@ YT_REASON_LEGACY="аудит: guard — обход не тянет"
 # health_ok_quiet зовётся пачкой, а полная проба — до 75 с.
 YT_PROBE_TTL=120
 
+# --- churn tg-ws-proxy -----------------------------------------------------
+# Прокси под Telegram живёт неделями и на мёртвом пуле Cloudflare копит
+# дескрипторы и сокеты в CLOSE-WAIT: peer соединение закрыл, приложение свой
+# конец — нет. Пользовательская проба при этом проходит (трафик уходит в
+# H2-fallback), поэтому `broken_services_quiet` деградацию не видит, и раньше
+# процесс доходил до сотен fd и тысяч ошибок в час. Метрики — те же, что в
+# bin/bypass-status; здесь считаются локально, чтобы не звать статус (он тянет
+# живые пробы и стоит секунды).
+TG_CONF="$HOME_DIR/.config/TgWsProxy/config.json"
+TG_LOG="$(dirname "$TG_CONF")/proxy.log"
+TG_CHURN_FD=300              # дескрипторов у процесса
+TG_CHURN_CLOSE_WAIT=40       # сокетов в CLOSE-WAIT (утечка)
+TG_CHURN_SYN_SENT=20         # соединений в SYN-SENT (ретраи на мёртвые узлы)
+TG_CHURN_ERRORS=20           # строк с «failed» в минуту
+TG_CHURN_WINDOW=300          # окно подсчёта ошибок, с
+TG_CHURN_TAIL=1048576        # читаем хвост лога (1 МиБ; файл ротируется на 5 МБ)
+TG_CHURN_COOLDOWN=1800       # базовый интервал между перезапусками, с
+TG_CHURN_BACKOFF_MAX=21600   # потолок паузы: 6 ч (1800 → 3600 → 7200 → 14400 → 21600)
+TG_CHURN_MAX_HOUR=3          # больше трёх перезапусков в час не делаем
+TG_CHURN_CF_WAIT=21600       # после выключения cfproxy не трогаем флаг 6 ч
+TG_CHURN_LAST="$STATE_DIR/tg-churn-last"        # когда перезапускали последний раз
+TG_CHURN_HISTORY="$STATE_DIR/tg-churn-history"  # метки всех перезапусков (для лимита в час)
+TG_CHURN_STREAK="$STATE_DIR/tg-churn-streak"    # перезапусков подряд без возврата в норму
+TG_CHURN_CF="$STATE_DIR/tg-churn-cfoff"         # до какого времени cfproxy не трогаем
+# 1 — tg-ws-proxy уже перезапускался в этом прогоне. Второй перезапуск ничего
+# не добавит, а Telegram не успеет переподключиться: churn-шаг и лечение
+# Telegram не должны дублировать друг друга.
+TG_RESTARTED=0
+
 # 1 — VPN трогать нельзя (нет cap_net_admin / нет sing-box в tun-режиме).
 # Ставится в cmd_check. При этом guard НЕ выходит: Telegram чинится локальным
 # прокси, перебор стратегий zapret идёт как обычно — раньше `return 1` до всей
@@ -1059,13 +1088,229 @@ yt_maybe_return() {
 # --- лечение ---------------------------------------------------------------
 
 restart_tg() {
+    if [ "${TG_RESTARTED:-0}" = 1 ]; then
+        # Прокси уже перезапускался в этом прогоне (шаг churn): второй раз не
+        # трогаем, только проверяем результат — иначе Telegram получал два
+        # обрыва подряд, а второй перезапуск не лечил ничего нового.
+        log "tg-ws-proxy уже перезапущен в этом прогоне — повторно не трогаю"
+        svc_telegram_ok
+        return $?
+    fi
     log "перезапускаю tg-ws-proxy"
+    TG_RESTARTED=1
     local unit
     unit=$(tg_unit)
     systemctl --user restart "$unit" >/dev/null 2>&1 \
         || systemctl --user enable --now "$unit" >/dev/null 2>&1
     sleep 5
     svc_telegram_ok
+}
+
+# Метрики деградации: «fd CLOSE-WAIT SYN-SENT ошибок/мин». Код 1 — прокси не
+# запущен, считать нечего. PyInstaller держит два процесса с одним именем
+# (загрузчик и рабочий), поэтому fd суммируем по всем, а сокеты ищем по любому
+# из PID'ов: у рабочего их десятки, у загрузчика — ни одного.
+tgws_churn_state() {
+    local pids p fd=0 pattern="" cut line errs=0 socks cw syn
+    pids=$(pgrep -x tg-ws-proxy 2>/dev/null | tr '\n' ' ')
+    [ -n "${pids// /}" ] || return 1
+    for p in $pids; do
+        fd=$(( fd + $(ls /proc/"$p"/fd 2>/dev/null | wc -l) ))
+        pattern="${pattern}${pattern:+|}pid=${p},"
+    done
+    # `pid=` в фильтре, а не имя процесса: имя в выводе ss может быть обрезано.
+    socks=$(ss -tanp 2>/dev/null | grep -E -- "$pattern" 2>/dev/null)
+    cw=$(printf '%s\n' "$socks" | grep -c '^CLOSE-WAIT' 2>/dev/null || true)
+    syn=$(printf '%s\n' "$socks" | grep -c '^SYN-SENT' 2>/dev/null || true)
+    # Ошибки: строки с «failed» за окно. Формат «2026-11-18 11:31:03 WARNING …»
+    # фиксированной ширины, поэтому сравнение строк совпадает с хронологией и
+    # `date -d` на каждую строку не нужен. Нет лога — ноль, а не ошибка.
+    if [ -f "$TG_LOG" ]; then
+        cut=$(LC_ALL=C date -d "-$TG_CHURN_WINDOW seconds" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+        if [ -n "$cut" ]; then
+            while IFS= read -r line; do
+                [ "${#line}" -ge 19 ] || continue
+                [[ "${line:0:19}" < "$cut" ]] && continue
+                [[ "${line,,}" == *failed* ]] && errs=$((errs + 1))
+            done < <(tail -c "$TG_CHURN_TAIL" "$TG_LOG" 2>/dev/null)
+        fi
+    fi
+    printf '%s %s %s %s\n' "$fd" "${cw:-0}" "${syn:-0}" $(( errs * 60 / TG_CHURN_WINDOW ))
+}
+
+# Причины деградации одной строкой; пусто — метрики в норме.
+tgws_churn_reasons() { # $1 fd, $2 close_wait, $3 syn_sent, $4 ошибок/мин
+    local reasons=""
+    [ "${1:-0}" -gt "$TG_CHURN_FD" ] && reasons="$reasons fd=$1>$TG_CHURN_FD"
+    [ "${2:-0}" -gt "$TG_CHURN_CLOSE_WAIT" ] && reasons="$reasons close-wait=$2>$TG_CHURN_CLOSE_WAIT"
+    [ "${3:-0}" -gt "$TG_CHURN_SYN_SENT" ] && reasons="$reasons syn-sent=$3>$TG_CHURN_SYN_SENT"
+    [ "${4:-0}" -gt "$TG_CHURN_ERRORS" ] && reasons="$reasons ошибок=$4/мин>$TG_CHURN_ERRORS"
+    printf '%s' "${reasons# }"
+}
+
+tgws_churn_streak() {
+    local s
+    s=$(cat "$TG_CHURN_STREAK" 2>/dev/null || echo 0)
+    case "$s" in *[!0-9]*|"") echo 0 ;; *) echo "$s" ;; esac
+}
+
+# Пауза перед следующим перезапуском: 1800 с и дальше вдвое, потолок — 6 ч.
+# Счётчик растёт, пока метрики не вернутся в норму: одна и та же поломка не
+# должна перезапускать прокси каждые полчаса бесконечно.
+tgws_churn_wait() { # $1 — сколько перезапусков подряд уже сделано
+    local s=${1:-0} shift_by delay
+    [ "$s" -gt 0 ] || s=1
+    shift_by=$(( s - 1 ))
+    [ "$shift_by" -gt 4 ] && shift_by=4
+    delay=$(( TG_CHURN_COOLDOWN << shift_by ))
+    [ "$delay" -gt "$TG_CHURN_BACKOFF_MAX" ] && delay=$TG_CHURN_BACKOFF_MAX
+    echo "$delay"
+}
+
+tgws_churn_hour_count() {
+    local cutoff cnt ts
+    cutoff=$(( $(now) - 3600 ))
+    cnt=0
+    [ -f "$TG_CHURN_HISTORY" ] || { echo 0; return; }
+    while read -r ts; do
+        [ -n "$ts" ] || continue
+        [ "$ts" -ge "$cutoff" ] 2>/dev/null && cnt=$((cnt + 1))
+    done <"$TG_CHURN_HISTORY"
+    echo "$cnt"
+}
+
+# Отметка «перезапуск сделан»: счётчик подряд, метка времени и история за час.
+tgws_churn_note() {
+    local s
+    s=$(( $(tgws_churn_streak) + 1 ))
+    [ "$s" -gt 6 ] && s=6
+    printf '%s\n' "$s" >"$TG_CHURN_STREAK" 2>/dev/null
+    date +%s >>"$TG_CHURN_HISTORY" 2>/dev/null
+    tail -n 20 "$TG_CHURN_HISTORY" >"$TG_CHURN_HISTORY.tmp" 2>/dev/null \
+        && mv "$TG_CHURN_HISTORY.tmp" "$TG_CHURN_HISTORY" 2>/dev/null
+    date +%s >"$TG_CHURN_LAST" 2>/dev/null
+}
+
+# Метрики в норме: счётчик подряд-деградаций сбрасываем (пауза снова базовая).
+tgws_churn_ok() {
+    [ "$(tgws_churn_streak)" = 0 ] && return 0
+    printf '0\n' >"$TG_CHURN_STREAK" 2>/dev/null
+    log "tg-ws-proxy пришёл в норму — счётчик перезапусков сброшен"
+}
+
+# Перезапуск прокси с запасным путём: systemd, при отказе — pkill + start.
+tgws_restart() {
+    local unit
+    unit=$(tg_unit)
+    TG_RESTARTED=1
+    if systemctl --user restart "$unit" >/dev/null 2>&1; then
+        sleep 5
+        return 0
+    fi
+    log "systemctl restart $unit не удался — перезапускаю через pkill"
+    pkill -x tg-ws-proxy >/dev/null 2>&1
+    sleep 1
+    systemctl --user start "$unit" >/dev/null 2>&1 || return 1
+    sleep 4
+    return 0
+}
+
+tgws_cfproxy_on() {
+    [ -f "$TG_CONF" ] || return 1
+    [ "$(jq -r '.cfproxy // false' "$TG_CONF" 2>/dev/null)" = "true" ]
+}
+
+# Можно ли трогать флаг cfproxy: после своего выключения не трогаем 6 ч, чтобы
+# не спорить с человеком, который вернул его руками.
+tgws_cf_allowed() {
+    local next
+    [ -f "$TG_CHURN_CF" ] || return 0
+    next=$(cat "$TG_CHURN_CF" 2>/dev/null || echo 0)
+    case "$next" in *[!0-9]*|"") return 0 ;; esac
+    [ "$(now)" -ge "$next" ]
+}
+
+# cfproxy=false с бэкапом конфига. Мёртвый пул Cloudflare — источник шторма:
+# каждый запрос идёт в неотвечающий узел, повторяется и оставляет сокеты.
+# Правим копию и проверяем jq, чтобы не оставить Telegram без прокси вовсе.
+tgws_cf_disable() {
+    local bak
+    bak="$TG_CONF.bak-$(date '+%Y%m%d-%H%M%S')"
+    cp -p "$TG_CONF" "$bak" 2>/dev/null \
+        || { log "не удалось сделать бэкап $TG_CONF — cfproxy не трогаю"; return 1; }
+    if jq '.cfproxy = false' "$TG_CONF" >"$TG_CONF.tmp" 2>/dev/null \
+        && jq -e '.cfproxy == false' "$TG_CONF.tmp" >/dev/null 2>&1; then
+        mv "$TG_CONF.tmp" "$TG_CONF" 2>/dev/null \
+            && chmod 600 "$TG_CONF" 2>/dev/null
+        printf '%s\n' "$(( $(now) + TG_CHURN_CF_WAIT ))" >"$TG_CHURN_CF" 2>/dev/null
+        log "cfproxy выключен (бэкап $bak): пул Cloudflare мёртв, а каждый ретрай в него — лишний сокет"
+        return 0
+    fi
+    rm -f "$TG_CONF.tmp" 2>/dev/null
+    log "не удалось выставить cfproxy=false — конфиг не меняю (бэкап $bak)"
+    return 1
+}
+
+# Шаг лечения «churn»: процесс жив и формально работает, но копит ресурсы.
+# Зовётся из cmd_check до лечения Telegram, поэтому срабатывает и в прогоне,
+# где `broken_services_quiet` пуст (Telegram уходит в H2-fallback).
+# Возврат: 0 — метрики в норме или мера применена, 1 — деградация осталась.
+tgws_churn_fix() {
+    local state fd cw syn per_min reasons last hour wait_sec after
+
+    tg_installed || return 0
+    guard_expired && { log "дедлайн прогона — churn-шаг отложен"; return 1; }
+    state=$(tgws_churn_state) || return 0        # прокси не запущен — не наше дело
+    read -r fd cw syn per_min <<<"$state"
+
+    reasons=$(tgws_churn_reasons "$fd" "$cw" "$syn" "$per_min")
+    if [ -z "$reasons" ]; then
+        tgws_churn_ok
+        return 0
+    fi
+    log "tg-ws-proxy деградирует: $reasons (fd $fd, ошибок $per_min/мин за $((TG_CHURN_WINDOW / 60)) мин)"
+
+    last=$(cat "$TG_CHURN_LAST" 2>/dev/null || echo 0)
+    case "$last" in *[!0-9]*|"") last=0 ;; esac
+    wait_sec=$(tgws_churn_wait "$(tgws_churn_streak)")
+    if [ "$last" -gt 0 ] && [ $(( $(now) - last )) -lt "$wait_sec" ]; then
+        log "перезапуск tg-ws-proxy на паузе ещё $(( (wait_sec - $(now) + last) / 60 )) мин (бэкофф $((wait_sec / 60)) мин)"
+        return 1
+    fi
+
+    hour=$(tgws_churn_hour_count)
+
+    # Два перезапуска за час не помогли — виноват не процесс, а мёртвый пул
+    # Cloudflare: выключаем cfproxy (Telegram остаётся на H2/прямом WS).
+    if [ "$hour" -ge 2 ] && tgws_cfproxy_on; then
+        if ! tgws_cf_allowed; then
+            log "cfproxy включали после нашего выключения — до $(date -d "@$(cat "$TG_CHURN_CF" 2>/dev/null)" '+%F %T' 2>/dev/null) флаг не трогаю"
+        elif tgws_cf_disable; then
+            tgws_restart || log "прокси после смены cfproxy не перезапустился"
+            tgws_churn_note
+            notify "tg-ws-proxy: отключил пул Cloudflare (cfproxy) — перезапуски не помогали. Вернуть: cfproxy=true в ~/.config/TgWsProxy/config.json"
+            after=$(tgws_churn_state 2>/dev/null || echo "? ? ? ?")
+            log "после выключения cfproxy: fd/close-wait/syn-sent/ошибки = $after (ошибки считаются за окно, часть — до перезапуска)"
+            return 0
+        fi
+    fi
+
+    if [ "$hour" -ge "$TG_CHURN_MAX_HOUR" ]; then
+        log "перезапусков tg-ws-proxy за час уже $hour (лимит $TG_CHURN_MAX_HOUR) — оставляю как есть"
+        notify "tg-ws-proxy повторно деградирует: $reasons. Перезапуски не помогают — нужен разбор руками."
+        return 1
+    fi
+
+    tgws_churn_note
+    log "перезапускаю tg-ws-proxy (перезапусков за час: $((hour + 1)))"
+    notify "tg-ws-proxy накапливал ресурсы ($reasons): перезапустил"
+    if ! tgws_restart; then
+        log "tg-ws-proxy не перезапустился (systemctl и pkill не помогли)"
+        return 1
+    fi
+    after=$(tgws_churn_state 2>/dev/null || echo "? ? ? ?")
+    log "после перезапуска: fd/close-wait/syn-sent/ошибки = $after (ошибки — за окно $((TG_CHURN_WINDOW / 60)) мин, часть до перезапуска)"
+    return 0
 }
 
 # Разбор ответа `omavpn --json heal`. Раньше вывод уходил в /dev/null, и шаг
@@ -1420,6 +1665,13 @@ cmd_check() {
             vpn_up || log "VPN не поднялся"
         fi
     fi
+
+    # Накопление ресурсов tg-ws-proxy. Стоит ДО проверки сломанных сервисов:
+    # деградация видна только по счётчикам (fd, CLOSE-WAIT, ошибки в логе), а
+    # проба Telegram при этом проходит — трафик уходит в H2-fallback, и раньше
+    # процесс доходил до сотен fd, оставаясь «рабочим». guard_expired проверяется
+    # внутри шага, второй раз здесь не нужен.
+    tgws_churn_fix
 
     # Авто-возврат YouTube на обход: если наши оверрайды группы стоят, а обход
     # снова тянет — снять их. Стоит до проверки сломанных сервисов: возврат нужен
