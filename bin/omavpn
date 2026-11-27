@@ -577,15 +577,38 @@ def _youtube_own_reason(reason) -> bool:
     return (text.startswith(YOUTUBE_REASON_PREFIX)
             or text.startswith(YOUTUBE_LEGACY_REASON))
 
-# Проба обхода: три точки, которые вместе дают «настоящий контент», а не просто
+# Проба обхода: точки, которые вместе дают «настоящий контент», а не просто
 # код ответа — тот же набор доказательств, что у svc_youtube_ok в omavpn-guard.
 # Одна проба ≈ 1 с на живой сети и до timeout на мёртвой, поэтому таймаут общий
 # на точку, а не на всю проверку.
 YOUTUBE_PROBE_TIMEOUT = 6.0
 YOUTUBE_PAGE_URL = "https://www.youtube.com/"
 YOUTUBE_ICON_URL = "https://www.youtube.com/favicon.ico"
+# Аварийная точка: только когда медиа-пробу сделать нечем (нет yt-dlp или он
+# дважды не дал ссылку). Как доказательство живости обхода она негодна:
+# 27.11.2026 (сеть DachaWIFI) redirector отвечал 204, страница и фавикон — 200,
+# а кусок настоящего потока с `rr1---sn-*.googlevideo.com` не приходил вовсе
+# (curl: 0 байт за 12 с, read timeout) — видео не играло, а `youtube check`
+# объявлял обход здоровым, и guard возвращал группу на мёртвый direct.
 YOUTUBE_CDN_URL = "https://redirector.googlevideo.com/generate_204"
 YOUTUBE_PAGE_MARKERS = ("ytimg", "youtube")
+
+# Медиа-проба: живость обхода решает не код ответа, а реально скачанный кусок
+# видео. Приём взят из /usr/local/bin/zapret-autotune (yt_extract_url +
+# yt_video_check): ссылку на поток даёт yt-dlp, качаем её curl'ом с физического
+# интерфейса, порог — 150 КБ за 10 с (обрыв и заглушка недобирают).
+YT_MEDIA_PAGE = "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+# Big Buck Bunny: dQw4w9WgXcQ отдаётся с троттлингом и давал ложные провалы.
+# Выбор формата — не `-f worst`: в yt-dlp 2026.08 «худшим» стал сториборд (mhtml),
+# ссылки на поток он не даёт вовсе, а `worstvideo` без фильтра протокола отдаёт
+# HLS-манифест (m3u8) — плейлист, а не байты. Нужен настоящий videoplayback.
+YT_MEDIA_FORMAT = "worstvideo[protocol^=https]/worstaudio[protocol^=https]/worst"
+YT_MEDIA_CACHEFILE = STATE / "youtube_media.json"
+YT_MEDIA_TTL = 1800.0            # 30 минут: сама ссылка живёт часами, а yt-dlp — 3-5 с
+YT_MEDIA_EXTRACT_TIMEOUT = 12.0  # дольше не ждём: guard спрашивает пробу раз в 10 мин
+YT_MEDIA_CURL_TIMEOUT = 10.0
+YT_MEDIA_SAMPLE = 262144         # просим первые 256 КБ
+YT_MEDIA_MIN_BYTES = 153600      # 150 КБ: меньше — не поток, а обрыв или заглушка
 
 
 def youtube_group_domains() -> list:
@@ -689,6 +712,129 @@ def youtube_group_state(over: dict | None = None) -> dict:
             "ours": sorted(ours & set(group)), "zapret_active": zapret_on}
 
 
+def _yt_media_state() -> dict:
+    """Кэш ссылки на поток: {"url": ..., "ts": ..., "fails": ...}."""
+    data = load_json(YT_MEDIA_CACHEFILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _yt_media_cached() -> str:
+    """Ссылка из кэша, если ей меньше YT_MEDIA_TTL (иначе "" — берём свежую)."""
+    data = _yt_media_state()
+    url = str(data.get("url") or "")
+    try:
+        ts = float(data.get("ts") or 0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    if url.startswith("https://") and time.time() - ts < YT_MEDIA_TTL:
+        return url
+    return ""
+
+
+def _yt_media_refresh(fails: int = 0) -> str:
+    """Добыть ссылку через yt-dlp и записать в кэш ("" — не вышло).
+
+    yt-dlp — единственный способ узнать адрес медиахоста: имя `rr1---sn-*`
+    не угадать, а redirector.googlevideo.com медиахостом не является и отвечает
+    даже там, где поток не идёт. Ссылка кэшируется, чтобы не платить 3-5 с
+    python-процесса на каждой пробе. Счётчик `fails` переживает вызовы: без него
+    машина без рабочего yt-dlp ждала бы таймаут каждые 10 минут.
+    """
+    binary = shutil.which("yt-dlp")
+    url = ""
+    if binary:
+        out = _run_out([binary, "-q", "--no-warnings", "--no-cache-dir",
+                        "-f", YT_MEDIA_FORMAT, "-g", YT_MEDIA_PAGE],
+                       YT_MEDIA_EXTRACT_TIMEOUT)
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("https://"):
+                url = line
+                break
+    save_json(YT_MEDIA_CACHEFILE,
+              {"url": url, "ts": time.time() if url else 0,
+               "fails": 0 if url else fails + 1})
+    return url
+
+
+def _yt_media_download(url: str, iface: str,
+                       timeout: float = YT_MEDIA_CURL_TIMEOUT) -> dict:
+    """Первые YT_MEDIA_SAMPLE байт потока: код, размер, локальный адрес.
+
+    `--interface` — то же, что в `_probe_http`: это SO_BINDTODEVICE. При поднятом
+    TUN запрос иначе ушёл бы в туннель (и мерил бы VPN), `local_ip` подтверждает,
+    что проба действительно шла с физического интерфейса.
+    """
+    cmd = ["curl", "-4", "-sL", "-o", "/dev/null", "--max-time", str(timeout),
+           "-r", f"0-{YT_MEDIA_SAMPLE - 1}",
+           "-w", "%{http_code}\t%{size_download}\t%{local_ip}"]
+    if iface:
+        cmd += ["--interface", iface]
+    cmd.append(url)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout + 4)
+    except (OSError, subprocess.SubprocessError):
+        return {"code": 0, "size": 0, "local_ip": ""}
+    fields = (proc.stdout or b"").decode("utf-8", "replace").split("\t")
+    try:
+        code = int(fields[0])
+        size = int(float(fields[1]))
+    except (ValueError, IndexError):
+        code, size = 0, 0
+    return {"code": code, "size": size,
+            "local_ip": fields[2].strip() if len(fields) > 2 else ""}
+
+
+def _yt_media_probe(iface: str) -> dict:
+    """Качается ли настоящее видео с googlevideo — главное доказательство обхода.
+
+    Поля результата: `ok` — поток реально пошёл; `skip` — судить по медиа
+    нельзя (yt-dlp нет или дважды не дал ссылку), вызывающий откатывается на
+    redirector; `code`/`size`/`local_ip` — для checks и проверки «мимо TUN»;
+    `why` — человеческая причина для reason/checks.
+    """
+    cached = _yt_media_cached()
+    if cached:
+        url = cached
+    else:
+        state = _yt_media_state()
+        fails = state.get("fails")
+        fails = fails if isinstance(fails, int) and fails > 0 else 0
+        if not shutil.which("yt-dlp"):
+            return {"ok": False, "skip": True, "code": 0, "size": 0,
+                    "local_ip": "", "why": "yt-dlp не установлен"}
+        if fails >= 2:
+            return {"ok": False, "skip": True, "code": 0, "size": 0,
+                    "local_ip": "", "why": "yt-dlp дважды не дал ссылку на видео"}
+        url = _yt_media_refresh(fails)
+        if not url:
+            return {"ok": False, "skip": True, "code": 0, "size": 0,
+                    "local_ip": "",
+                    "why": f"yt-dlp не дал ссылку на видео (сбой {fails + 1} из 2)"}
+
+    got = _yt_media_download(url, iface)
+    ok = got["code"] in (200, 206) and got["size"] >= YT_MEDIA_MIN_BYTES
+    if not ok and got["code"] in (403, 410):
+        # Ссылка подписана под адрес той стороны, с которой её выпросили (yt-dlp
+        # ходит через туннель), и могла протухнуть. Код ответа есть — значит
+        # медиахост жив, а виновата ссылка. Пере-извлекаем один раз.
+        url = _yt_media_refresh(0)
+        if url:
+            got = _yt_media_download(url, iface)
+            ok = got["code"] in (200, 206) and got["size"] >= YT_MEDIA_MIN_BYTES
+        if not ok:
+            return {"ok": False, "skip": True, "code": got["code"],
+                    "size": got["size"], "local_ip": got["local_ip"],
+                    "why": f"медиа-ссылка отклонена (HTTP {got['code']})"}
+    elif not ok and cached:
+        # Кэш мог протухнуть: не пере-извлекаем внутри пробы (это ещё 12 с и
+        # риск упереться в таймаут guard'а), а забываем ссылку — следующая
+        # проба возьмёт свежую.
+        save_json(YT_MEDIA_CACHEFILE, {"url": "", "ts": 0, "fails": 0})
+    return {"ok": ok, "skip": False, "code": got["code"], "size": got["size"],
+            "local_ip": got["local_ip"], "why": ""}
+
+
 def youtube_direct_ok(timeout: float = YOUTUBE_PROBE_TIMEOUT) -> dict:
     """Пропускает ли zapret YouTube на этой сети — по живой пробе, а не по флагам.
 
@@ -746,13 +892,28 @@ def youtube_direct_ok(timeout: float = YOUTUBE_PROBE_TIMEOUT) -> dict:
 
     page = _probe_http(YOUTUBE_PAGE_URL, timeout, iface, keep_body=True)
     icon = _probe_http(YOUTUBE_ICON_URL, timeout, iface)
-    cdn = _probe_http(YOUTUBE_CDN_URL, timeout, iface)
+    media = _yt_media_probe(iface)
+    if media["skip"]:
+        # Аварийный путь: медиа-пробу сделать нечем. Код ответа redirector'а —
+        # слабое доказательство, но «вечный bad» на машине без yt-dlp хуже:
+        # guard держал бы YouTube в туннеле без надежды на возврат. Причина
+        # отката уходит в checks/reason, чтобы ложное «обход работает» можно
+        # было объяснить по `youtube check --json`.
+        cdn = _probe_http(YOUTUBE_CDN_URL, timeout, iface)
+        cdn_ok = cdn["code"] in (200, 204)
+        cdn_note = f"redirector HTTP {cdn['code']} (страховка: {media['why']})"
+    else:
+        cdn = media
+        cdn_ok = media["ok"]
+        cdn_note = (f"видео HTTP {media['code']} · {media['size'] // 1024} КБ из "
+                    f"{YT_MEDIA_MIN_BYTES // 1024}"
+                    + (f" · {media['local_ip']}" if media["local_ip"] else "")
+                    + (" · поток идёт" if cdn_ok else " · потока нет"))
 
     body = str(page["body"]).lower()
     page_ok = page["code"] in (200, 301, 302) and any(m in body for m in YOUTUBE_PAGE_MARKERS)
     icon_ok = (icon["code"] == 200 and str(icon["ctype"]).startswith("image/")
                and icon["size"] > 500)
-    cdn_ok = cdn["code"] in (200, 204)
 
     # Проба считалась прямой, если TUN не мешал (текущий путь direct: трафик идёт
     # по правилам sing-box в direct-outbound, где zapret и применяется) или curl
@@ -768,7 +929,11 @@ def youtube_direct_ok(timeout: float = YOUTUBE_PROBE_TIMEOUT) -> dict:
     elif not icon_ok:
         reason = "превью/фавикон не отдаются"
     elif not cdn_ok:
-        reason = "CDN googlevideo не отвечает"
+        if media["skip"]:
+            reason = f"CDN googlevideo не отвечает ({media['why']})"
+        else:
+            reason = (f"медиа googlevideo не качается (HTTP {media['code']}, "
+                      f"{media['size'] // 1024} КБ из {YT_MEDIA_MIN_BYTES // 1024})")
     else:
         reason = ""
     if not probed and not reason:
@@ -788,7 +953,9 @@ def youtube_direct_ok(timeout: float = YOUTUBE_PROBE_TIMEOUT) -> dict:
                         + (f" · {page['local_ip']}" if page["local_ip"] else "")
                         + (" · контент есть" if page_ok else " · контента нет"),
                 "icon": f"HTTP {icon['code']} {icon['ctype']} {icon['size']} Б",
-                "cdn": f"HTTP {cdn['code']}",
+                # Ключ тот же, что был у redirector'а: его разбирают глазами по
+                # `youtube check --json`, а суть — состояние CDN googlevideo.
+                "cdn": cdn_note,
             }}
 
 

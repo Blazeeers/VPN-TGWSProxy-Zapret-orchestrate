@@ -87,7 +87,7 @@ ROUTE_T=20          # таймаут `omavpn --json route list`, с (в --status
 # omavpn) + до 4 с запаса на каждый (TLS, редиректы, чтение тела) = 30 с, плюс
 # старт python и systemctl. 45 с было впритык: timeout убивал проверку на
 # середине, и проба вечно отвечала unknown.
-YT_T=75             # таймаут `omavpn --json youtube check`, с (3×(6+4) + запас)
+YT_T=100            # таймаут `omavpn --json youtube check`, с (медиа-проба: извлечение+закачка+403-ретрай)
 YT_CONFIRM_GAP=10   # пауза между двумя подтверждающими пробами возврата, с
 # Возвраты YouTube — свой лимит: общий (COOLDOWN/switches_last_hour) про лечение
 # VPN, и три возврата выедали его целиком.
