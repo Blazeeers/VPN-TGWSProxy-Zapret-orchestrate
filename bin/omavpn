@@ -18,6 +18,7 @@ import copy
 import fcntl
 import fnmatch
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -27,6 +28,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -113,6 +115,23 @@ PROXY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "wire
 # идут напрямую. Bot API (api.telegram.org) при этом остаётся в VPN: прямой
 # доступ к нему у провайдера блокируется, а tg-ws-proxy его не обслуживает.
 TELEGRAM_PROCESSES = ["tg-ws-proxy", "TgWsProxy", "Telegram", "telegram-desktop"]
+
+# Куда эти процессы идут — решает проба, а не константа. Дома прямой путь к DC
+# работает и дешевле туннеля; в сетях, где провайдер режет Telegram (OVR_Wi-Fi5,
+# 27.11.2026), DC молчит SYN-таймаутом, и жёсткое `direct` давало «подключён»
+# без сообщений даже при поднятом VPN. Путь можно закрепить руками:
+# `omavpn telegram direct|proxy`, файл — process_overrides.json.
+TELEGRAM_OVERRIDES_FILE = CONF / "process_overrides.json"
+TELEGRAM_PROBE_FILE = STATE / "telegram_probe.json"
+TELEGRAM_PATHS = ("auto", "direct", "proxy")
+# Адреса DC, по которым судим о прямом пути: по одному на каждую из пяти, плюс
+# web-вход DC2/DC4 (149.154.167.220) — именно к нему подключается tg-ws-proxy
+# (dc_ip в его конфиге). Режет провайдер не всё сразу: на блокирующей сети из
+# шести отвечает один-два адреса, поэтому решение — по большинству.
+TELEGRAM_DC_IPS = ("149.154.175.50", "149.154.167.51", "149.154.175.100",
+                   "149.154.167.91", "149.154.171.5", "149.154.167.220")
+TELEGRAM_PROBE_TIMEOUT = 1.2   # на адрес; адреса проверяются параллельно
+TELEGRAM_PROBE_TTL = 300.0     # сколько секунд доверять замеру (в той же сети)
 
 # Tailscale. Трафик своего tailnet (CGNAT 100.64.0.0/10, включая MagicDNS
 # 100.100.100.100) не заводим в туннель: иначе VPN перехватывает его, демон
@@ -235,6 +254,12 @@ DEFAULT_DIRECT_DOMAINS = [
     # и youtubei.googleapis.com — в ALWAYS_PROXY_DOMAINS: напрямую недоступны.
 ]
 DIRECT_DOMAINS_FILE = CONF / "direct_domains.txt"
+# Адреса, которые всегда идут напрямую: релеи Valve (Remote Play, CS2, Dota),
+# домашний ПК по статическому IP и т.п. Формат — по одной сети в строке,
+# `#` — комментарий. Читается только при сборке конфига: 20.11.2026 оказалось,
+# что файл существовал, но генератор его не читал, и правки в нём ничего не
+# делали.
+DIRECT_CIDRS_FILE = CONF / "direct_cidrs.txt"
 # Ручные оверрайды маршрута домена:
 #   {"<домен>": {"path": "proxy"|"direct", "reason": "...", "ts": 1792645769}}
 # Ставятся командой `omavpn route set` (и автоматически — аудитом маршрутов).
@@ -2362,12 +2387,269 @@ def bootstrap_doh_ip() -> str:
     return ""
 
 
+def direct_cidrs() -> list:
+    """Сети из ~/.config/omavpn/direct_cidrs.txt — идут мимо туннеля.
+
+    Нужны там, где важен не домен, а адрес: релеи Valve для Remote Play/CS2/Dota
+    ходят по UDP и через туннель не проходят. Кривые строки пропускаем молча:
+    конфиг не должен падать из-за опечатки в списке.
+    """
+    try:
+        text = DIRECT_CIDRS_FILE.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return []
+    result: list[str] = []
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            net = ipaddress.ip_network(line, strict=False)
+        except ValueError:
+            warn(f"direct_cidrs.txt: пропускаю «{line}» — не адрес и не подсеть")
+            continue
+        text_net = str(net)
+        if text_net not in result:
+            result.append(text_net)
+    return result
+
+
+def process_overrides() -> dict:
+    """Оверрайды маршрута процессов из ~/.config/omavpn/process_overrides.json.
+
+    Формат: {"telegram": {"path": "auto"|"direct"|"proxy", "reason": "...", "ts": 1}}.
+    Битый файл не повод падать — как и у route_overrides: предупреждаем и считаем,
+    что оверрайдов нет (тогда решает проба).
+    """
+    try:
+        raw = TELEGRAM_OVERRIDES_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        warn(f"не читается {TELEGRAM_OVERRIDES_FILE}: {exc} — оверрайды процессов игнорирую")
+        return {}
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        warn(f"битый JSON в {TELEGRAM_OVERRIDES_FILE} ({exc}) — оверрайды процессов игнорирую")
+        return {}
+    if not isinstance(data, dict):
+        warn(f"{TELEGRAM_OVERRIDES_FILE}: ожидался объект «процесс → оверрайд» — игнорирую")
+        return {}
+    result: dict = {}
+    for key, value in data.items():
+        if isinstance(value, str):  # короткая форма: {"telegram": "proxy"}
+            value = {"path": value}
+        if not isinstance(value, dict):
+            warn(f"{TELEGRAM_OVERRIDES_FILE}: оверрайд {key} не объект — пропускаю")
+            continue
+        path = str(value.get("path") or "").strip().lower()
+        if path not in TELEGRAM_PATHS:
+            warn(f"{TELEGRAM_OVERRIDES_FILE}: у {key} неизвестный путь {path!r} — пропускаю")
+            continue
+        result[str(key)] = {"path": path,
+                            "reason": str(value.get("reason") or "").strip(),
+                            "ts": _num(value.get("ts"), 0)}
+    return result
+
+
+def telegram_setting() -> str:
+    """Ручная настройка пути Telegram: auto (по умолчанию), direct или proxy."""
+    return (process_overrides().get("telegram") or {}).get("path") or "auto"
+
+
+def _tcp_probe(ip: str, port: int = 443, iface: str = "",
+               timeout: float = TELEGRAM_PROBE_TIMEOUT) -> bool | None:
+    """Проходит ли TCP-коннект к адресу. None — проверить не удалось.
+
+    `iface` — SO_BINDTODEVICE: при поднятом TUN обычный коннект ушёл бы в
+    туннель (final = proxy) и измерил бы VPN, а не прямой путь. TLS-обмен не
+    проверяем намеренно: у DC1/DC3/DC5 нет TLS на 443 (там MTProto), и рукопожатие
+    проваливалось бы и на здоровой сети. SYN-таймаут — тот самый признак, которым
+    провайдер режет Telegram.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        if iface:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET,
+                                getattr(socket, "SO_BINDTODEVICE", 25),
+                                iface.encode() + b"\0")
+            except OSError:
+                return None
+        sock.connect((ip, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _probe_many(ips, iface: str, timeout: float) -> dict:
+    """Параллельные TCP-пробы: 6 адресов × 1.2 с подряд — это 7 с на каждый
+    запуск VPN, а решение нужно при каждой сборке конфига."""
+    results: dict = {}
+
+    def run(ip: str) -> None:
+        results[ip] = _tcp_probe(ip, 443, iface, timeout)
+
+    threads = [threading.Thread(target=run, args=(ip,), daemon=True) for ip in ips]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout + 1.5)
+    return results
+
+
+def telegram_probe(force: bool = False,
+                   timeout: float = TELEGRAM_PROBE_TIMEOUT) -> dict:
+    """Жив ли прямой путь к DC Telegram — проба мимо TUN, с кэшем на сеть.
+
+    При поднятом TUN пробы идут с SO_BINDTODEVICE через физический интерфейс,
+    иначе они мерили бы VPN. Кэш (net_key + TTL) нужен потому, что сборка
+    конфига бывает по нескольку раз за одно лечение, а смена сети меняет ключ и
+    заставляет перепроверить сразу.
+    """
+    net = net_key()
+    iface = _wan_iface()
+    tun_up = Path(f"/sys/class/net/{TUN_IFACE}").exists()
+    if not force:
+        cached = load_json(TELEGRAM_PROBE_FILE, {})
+        if (isinstance(cached, dict) and cached.get("probed")
+                and str(cached.get("net") or "") == net
+                and time.time() - _num(cached.get("ts"), 0) < TELEGRAM_PROBE_TTL):
+            return {**cached, "cached": True}
+    if tun_up and not iface:
+        # Без физического интерфейса проба ушла бы в туннель: честнее «не знаю»,
+        # чем ложное «прямой путь жив» (по нему Telegram остался бы без связи).
+        return {"probed": False, "direct_ok": False, "iface": "", "net": net,
+                "ts": time.time(), "endpoints": {},
+                "reason": "нет физического интерфейса для пробы мимо TUN"}
+
+    results = _probe_many(TELEGRAM_DC_IPS, iface if tun_up else "", timeout)
+    unknown = [ip for ip, ok in results.items() if ok is None]
+    if unknown:
+        return {"probed": False, "direct_ok": False, "iface": iface, "net": net,
+                "ts": time.time(), "endpoints": results,
+                "reason": "часть проб не удалась технически — судить не берусь"}
+    alive = [ip for ip, ok in results.items() if ok]
+    dead = [ip for ip, ok in results.items() if not ok]
+    direct_ok = len(alive) * 2 > len(TELEGRAM_DC_IPS)   # строгое большинство
+    result = {"probed": True, "direct_ok": direct_ok, "iface": iface, "net": net,
+              "ts": time.time(), "endpoints": results,
+              "alive": alive, "dead": dead, "cached": False,
+              "reason": "" if direct_ok else
+              f"прямой путь к DC не проходит ({len(alive)} из {len(TELEGRAM_DC_IPS)})"}
+    save_json(TELEGRAM_PROBE_FILE, result)
+    return result
+
+
+def telegram_outbound(force: bool = False) -> dict:
+    """Куда направить процессы Telegram: {"outbound", "source", "reason", "probe"}.
+
+    Приоритет — ручной оверрайд, иначе живая проба. Если пробу сделать нельзя,
+    остаётся прежнее поведение (direct): молча уводить весь Telegram в туннель
+    по догадке нельзя — домашний сценарий с tg-ws-proxy так и задуман.
+    """
+    setting = telegram_setting()
+    if setting in ("direct", "proxy"):
+        entry = process_overrides().get("telegram") or {}
+        return {"outbound": setting, "source": "override",
+                "reason": entry.get("reason", ""), "probe": None}
+    probe = telegram_probe(force=force)
+    if not probe.get("probed"):
+        return {"outbound": "direct", "source": "unknown",
+                "reason": probe.get("reason", ""), "probe": probe}
+    return {"outbound": "direct" if probe.get("direct_ok") else "proxy",
+            "source": "probe", "reason": probe.get("reason", ""), "probe": probe}
+
+
+def current_telegram_outbound() -> str:
+    """Что стоит в действующем singbox.json для процессов Telegram ("" — нет правила)."""
+    cfg = load_json(SB_CFG, {})
+    try:
+        for rule in (cfg.get("route") or {}).get("rules") or []:
+            if rule.get("process_name") == TELEGRAM_PROCESSES:
+                return str(rule.get("outbound") or "")
+    except AttributeError:
+        return ""
+    return ""
+
+
+def telegram_set(path: str, reason: str = "", restart: bool = True) -> dict:
+    """Закрепить путь Telegram (или вернуть auto) и применить его при смене."""
+    if path not in TELEGRAM_PATHS:
+        raise RuntimeError(f"неизвестный путь: {path!r} (нужно auto, direct или proxy)")
+    raw = load_json(TELEGRAM_OVERRIDES_FILE, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    raw["telegram"] = {"path": path, "reason": reason.strip(), "ts": int(time.time())}
+    save_json(TELEGRAM_OVERRIDES_FILE, raw)
+    # auto — всегда свежая проба: команду зовут именно чтобы перепроверить сеть.
+    decision = telegram_outbound(force=True)
+    before = current_telegram_outbound()
+    changed = bool(before) and before != decision["outbound"]
+    restarted = False
+    note = ""
+    if changed and restart and is_on():
+        with ctrl_lock():
+            cmd_off(quiet=True)
+            cmd_on(None, None, None)
+        restarted = True
+    elif changed:
+        note = "применится при следующем включении VPN"
+    else:
+        note = "изменений нет"
+    return {"ok": True, "setting": path, "path": decision["outbound"],
+            "source": decision["source"], "reason": decision.get("reason", ""),
+            "probe": decision.get("probe"), "was": before,
+            "changed": changed, "restarted": restarted, "note": note,
+            "file": str(TELEGRAM_OVERRIDES_FILE)}
+
+
+def telegram_path_field() -> dict:
+    """Поле `telegram_path` для --json status: без сети и без проб.
+
+    `omavpn status` опрашивает виджет панели; проба DC стоит до 7 с, поэтому в
+    статус идёт только настройка и последний сохранённый замер.
+    """
+    probe = load_json(TELEGRAM_PROBE_FILE, {})
+    if not isinstance(probe, dict):
+        probe = {}
+    return {"setting": telegram_setting(),
+            "now": current_telegram_outbound(),
+            "direct_ok": bool(probe.get("direct_ok")),
+            "probed": bool(probe.get("probed")),
+            "ts": _num(probe.get("ts"), 0),
+            "source": "override" if telegram_setting() != "auto" else "probe"}
+
+
+def telegram_path_field_safe() -> dict:
+    """`telegram_path` для статуса: статус обещан валидным даже на битых файлах."""
+    try:
+        return telegram_path_field()
+    except Exception as exc:  # noqa: BLE001
+        warn(f"telegram_path: {type(exc).__name__}: {exc}")
+        return {"setting": "auto", "now": "", "direct_ok": False,
+                "probed": False, "ts": 0, "source": "error"}
+
+
 def build_singbox(profile_index: int, strict: bool, stack: str | None = None) -> dict:
     # Стек TUN — из настроек, если не задан явно. Значение всегда проверенное:
     # gvisor|system (mixed и пусто → gvisor, см. singbox_stack).
     if stack is None:
         stack = singbox_stack(settings().get("stack"))
     stack = singbox_stack(stack)
+    # Telegram: direct, пока прямой путь к DC жив (домашний сценарий с
+    # tg-ws-proxy), иначе процессы уходят в туннель — иначе в сети, которая режет
+    # Telegram, они висят «подключён» с мёртвыми сокетами мимо VPN.
+    tg_out = telegram_outbound()
+    if tg_out["outbound"] == "proxy":
+        warn("Telegram: " + (tg_out["reason"] or "прямой путь к DC не проходит")
+             + " — процессы Telegram идут через VPN")
     ips, domains = server_endpoints(profile_index)
     # Re:filter: заблокированное в РФ добиваем в туннель. Наборы — только если
     # функция включена и файлы уже скачаны (иначе правила просто нет).
@@ -2500,10 +2782,15 @@ def build_singbox(profile_index: int, strict: bool, stack: str | None = None) ->
                             + ([f"{bootstrap_ip}/32"] if bootstrap_ip else []),
                  "outbound": "direct"},
                 {"ip_is_private": True, "outbound": "direct"},
+                # Адреса из direct_cidrs.txt: релеи Valve и прочее, что в
+                # туннеле не работает (UDP Remote Play). Стоит до Re:filter,
+                # чтобы список заблокированного не затянул их обратно.
+                *([{"ip_cidr": direct_cidrs(), "outbound": "direct"}]
+                  if direct_cidrs() else []),
                 *forced_rule,
                 *ru_resolve,
                 {"domain_suffix": direct_domains(), "outbound": "direct"},
-                {"process_name": TELEGRAM_PROCESSES, "outbound": "direct"},
+                {"process_name": TELEGRAM_PROCESSES, "outbound": tg_out["outbound"]},
                 *bypass,
                 # Процесс Xray (в т.ч. временный из `probe`) ходит к серверам
                 # подписки напрямую. Ставим это правило ДО Re:filter: иначе
@@ -3379,6 +3666,8 @@ def status() -> dict:
         # Куда идёт YouTube и почему — без сети (см. youtube_path_field).
         # Ключ добавлен, существующие не менялись: панель читает JSON по именам.
         "youtube_path": youtube_path_field_safe(),
+        # Куда идут процессы Telegram и почему — без сети (см. telegram_path_field).
+        "telegram_path": telegram_path_field_safe(),
     }
 
 
@@ -4386,6 +4675,19 @@ def main(argv: list) -> int:
         ytp.add_argument("--no-restart", action="store_true",
                          help="не перезапускать VPN (правило применится при следующем on)")
 
+    # Telegram: путь процессов (direct/tunnel) — ручной оверрайд поверх пробы.
+    stg = sub.add_parser("telegram", help="Telegram: куда идут его процессы (прямо или через VPN)")
+    tgsub = stg.add_subparsers(dest="telegram_cmd")
+    _add_json(tgsub.add_parser("status", help="текущий путь Telegram и последний замер DC"))
+    for name, hlp in (
+            ("auto", "решать пробой: прямой путь к DC жив — direct, иначе туннель"),
+            ("direct", "всегда напрямую (домашний сценарий с tg-ws-proxy)"),
+            ("proxy", "всегда через VPN (сеть режет Telegram)")):
+        tp = _add_json(tgsub.add_parser(name, help=hlp))
+        tp.add_argument("--reason", default="", help="почему так (сохраняется в оверрайде)")
+        tp.add_argument("--no-restart", action="store_true",
+                        help="не перезапускать VPN (правило применится при следующем on)")
+
     args = p.parse_args(argv)
     JSON_OUT = args.json or getattr(args, "route_json", False) \
         or getattr(args, "sub_json", False)
@@ -4587,6 +4889,26 @@ def main(argv: list) -> int:
                 if JSON_OUT:
                     fail("youtube: не указана подкоманда (check | proxy | direct)", 2)
                 syt.print_help()
+                return 0
+        elif args.cmd == "telegram":
+            if args.telegram_cmd == "status":
+                # Проба ДО telegram_path_field: поле читает кэш с диска, и без
+                # этого в выводе был бы прошлый замер, а не только что снятый.
+                probe = telegram_probe()
+                res = {"ok": True, **telegram_path_field(), "probe": probe}
+                out = (f"путь: {res.get('now') or '—'} · настройка: {res['setting']}"
+                       f" · прямой путь {'жив' if res['direct_ok'] else 'не проходит'}")
+                if probe.get("dead"):
+                    out += "\nмёртвые DC: " + " ".join(probe["dead"])
+                emit(res, out)
+            elif args.telegram_cmd in TELEGRAM_PATHS:
+                res = telegram_set(args.telegram_cmd, args.reason, not args.no_restart)
+                note = " · перезапущено" if res["restarted"] else " · " + res["note"]
+                emit(res, f"Telegram → {res['path']} ({res['source']}){note}")
+            else:
+                if JSON_OUT:
+                    fail("telegram: не указана подкоманда (status | auto | direct | proxy)", 2)
+                stg.print_help()
                 return 0
         elif args.cmd == "best":
             res = probe_best(args.probes_quick, args.timeout_quick, args.probes_final,
